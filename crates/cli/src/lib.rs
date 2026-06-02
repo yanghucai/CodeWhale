@@ -34,6 +34,7 @@ enum ProviderArg {
     Novita,
     Fireworks,
     Siliconflow,
+    Arcee,
     Moonshot,
     Sglang,
     Vllm,
@@ -54,6 +55,7 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Novita => ProviderKind::Novita,
             ProviderArg::Fireworks => ProviderKind::Fireworks,
             ProviderArg::Siliconflow => ProviderKind::Siliconflow,
+            ProviderArg::Arcee => ProviderKind::Arcee,
             ProviderArg::Moonshot => ProviderKind::Moonshot,
             ProviderArg::Sglang => ProviderKind::Sglang,
             ProviderArg::Vllm => ProviderKind::Vllm,
@@ -742,6 +744,7 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
         ProviderKind::Novita => "novita",
         ProviderKind::Fireworks => "fireworks",
         ProviderKind::Siliconflow => "siliconflow",
+        ProviderKind::Arcee => "arcee",
         ProviderKind::Moonshot => "moonshot",
         ProviderKind::Sglang => "sglang",
         ProviderKind::Vllm => "vllm",
@@ -750,7 +753,7 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
 }
 
 /// Provider order used by the `auth list` and `auth status` outputs.
-const PROVIDER_LIST: [ProviderKind; 15] = [
+const PROVIDER_LIST: [ProviderKind; 16] = [
     ProviderKind::Deepseek,
     ProviderKind::NvidiaNim,
     ProviderKind::Openai,
@@ -762,6 +765,7 @@ const PROVIDER_LIST: [ProviderKind; 15] = [
     ProviderKind::Novita,
     ProviderKind::Fireworks,
     ProviderKind::Siliconflow,
+    ProviderKind::Arcee,
     ProviderKind::Moonshot,
     ProviderKind::Sglang,
     ProviderKind::Vllm,
@@ -819,6 +823,7 @@ fn provider_env_vars(provider: ProviderKind) -> &'static [&'static str] {
         ProviderKind::NvidiaNim => &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY", "DEEPSEEK_API_KEY"],
         ProviderKind::Fireworks => &["FIREWORKS_API_KEY"],
         ProviderKind::Siliconflow => &["SILICONFLOW_API_KEY"],
+        ProviderKind::Arcee => &["ARCEE_API_KEY"],
         ProviderKind::Moonshot => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         ProviderKind::Sglang => &["SGLANG_API_KEY"],
         ProviderKind::Vllm => &["VLLM_API_KEY"],
@@ -1511,13 +1516,14 @@ fn build_tui_command(
             | ProviderKind::Novita
             | ProviderKind::Fireworks
             | ProviderKind::Siliconflow
+            | ProviderKind::Arcee
             | ProviderKind::Moonshot
             | ProviderKind::Sglang
             | ProviderKind::Vllm
             | ProviderKind::Ollama
     ) {
         bail!(
-            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, AtlasCloud, Wanjie Ark, OpenRouter, Xiaomi MiMo, Novita, Fireworks, SiliconFlow, Moonshot/Kimi, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `codewhale model ...` for provider registry inspection.",
+            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, AtlasCloud, Wanjie Ark, OpenRouter, Xiaomi MiMo, Novita, Fireworks, SiliconFlow, Arcee AI, Moonshot/Kimi, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `codewhale model ...` for provider registry inspection.",
             resolved_runtime.provider.as_str()
         );
     }
@@ -2224,6 +2230,18 @@ mod tests {
             Some(Commands::Auth(AuthArgs {
                 command: AuthCommand::Set {
                     provider: ProviderArg::Siliconflow,
+                    api_key: None,
+                    api_key_stdin: false,
+                }
+            }))
+        ));
+
+        let cli = parse_ok(&["deepseek", "auth", "set", "--provider", "arcee"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::Set {
+                    provider: ProviderArg::Arcee,
                     api_key: None,
                     api_key_stdin: false,
                 }
@@ -2976,6 +2994,7 @@ mod tests {
                 "siliconflow",
                 &["SILICONFLOW_API_KEY"],
             ),
+            (ProviderKind::Arcee, "arcee", &["ARCEE_API_KEY"]),
             (ProviderKind::Sglang, "sglang", &["SGLANG_API_KEY"]),
             (ProviderKind::Vllm, "vllm", &["VLLM_API_KEY"]),
             (ProviderKind::Ollama, "ollama", &["OLLAMA_API_KEY"]),
