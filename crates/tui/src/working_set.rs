@@ -1563,7 +1563,9 @@ mod tests {
     #[test]
     fn workspace_completions_honor_configured_walk_depth() {
         let tmp = TempDir::new().unwrap();
-        let deep_dir = tmp.path().join("a/b/c/d/e/f/g/h");
+        // Sits at component depth 12, past the default walk depth (10) but
+        // within the explicit deeper walk (16) below.
+        let deep_dir = tmp.path().join("a/b/c/d/e/f/g/h/i/j/k");
         std::fs::create_dir_all(&deep_dir).unwrap();
         std::fs::write(deep_dir.join("target.txt"), "target").unwrap();
 
