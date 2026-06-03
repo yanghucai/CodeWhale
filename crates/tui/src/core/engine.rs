@@ -1679,16 +1679,35 @@ impl Engine {
             .as_ref()
             .map(|client| client.base_url().to_string());
 
-        // Main turn loop
-        let (status, error) = self
-            .handle_deepseek_turn(
-                &mut turn,
-                tool_registry.as_ref(),
-                tools,
-                mode,
-                force_update_plan_first,
-            )
-            .await;
+        // Main turn loop. Catch panics here so an internal error surfaces as a
+        // failed TurnComplete instead of unwinding through `engine.run()` and
+        // killing the whole engine-event-loop task — which left the UI stuck
+        // on "working" forever with the engine silently dead (#2583, #1269).
+        use futures_util::FutureExt as _;
+        let turn_result = std::panic::AssertUnwindSafe(self.handle_deepseek_turn(
+            &mut turn,
+            tool_registry.as_ref(),
+            tools,
+            mode,
+            force_update_plan_first,
+        ))
+        .catch_unwind()
+        .await;
+        let (status, error) = match turn_result {
+            Ok(outcome) => outcome,
+            Err(panic) => {
+                let detail = crate::utils::panic_message(&*panic);
+                crate::utils::record_caught_panic("engine-event-loop", &detail);
+                (
+                    TurnOutcomeStatus::Failed,
+                    Some(format!(
+                        "The engine hit an internal error and stopped this turn: {detail}. \
+                         Your session is intact — send your message again to retry. \
+                         A crash report was saved to ~/.codewhale/crashes/."
+                    )),
+                )
+            }
+        };
 
         // Update session usage
         self.session.total_usage.add(&turn.usage);
