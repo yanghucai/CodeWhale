@@ -52,3 +52,21 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.11", features = ["v4"] }
+
+# Internal workspace members. Their version is implied by each path
+# target's Cargo.toml, which already uses `version.workspace = true`
+# pointing at `[workspace.package].version` above. A release only
+# edits that one field — the entries below pick up the new version
+# automatically.
+codewhale-agent = { path = "crates/agent" }
+codewhale-app-server = { path = "crates/app-server" }
+codewhale-config = { path = "crates/config" }
+codewhale-core = { path = "crates/core" }
+codewhale-execpolicy = { path = "crates/execpolicy" }
+codewhale-hooks = { path = "crates/hooks" }
+codewhale-mcp = { path = "crates/mcp" }
+codewhale-protocol = { path = "crates/protocol" }
+codewhale-release = { path = "crates/release" }
+codewhale-secrets = { path = "crates/secrets" }
+codewhale-state = { path = "crates/state" }
+codewhale-tools = { path = "crates/tools" }
