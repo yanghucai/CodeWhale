@@ -618,10 +618,7 @@ fn arcee_waf_safe_text_parts(content: &str) -> Option<Vec<Value>> {
     split_any.then_some(parts)
 }
 
-fn next_arcee_waf_trigger<'a>(
-    content: &'a str,
-    cursor: usize,
-) -> Option<(usize, &'a str, &'a str, &'a str)> {
+fn next_arcee_waf_trigger(content: &str, cursor: usize) -> Option<(usize, &str, &str, &str)> {
     ARCEE_WAF_TEXT_SPLIT_TRIGGERS
         .iter()
         .filter_map(|(trigger, left, right)| {

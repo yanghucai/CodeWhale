@@ -456,14 +456,12 @@ fn collapse_whitespace(input: &str) -> String {
 
 fn truncate_for_error(input: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(input.len().min(max_chars + 32));
-    let mut count = 0usize;
-    for ch in input.chars() {
+    for (count, ch) in input.chars().enumerate() {
         if count >= max_chars {
             out.push_str("...");
             return out;
         }
         out.push(ch);
-        count += 1;
     }
     out
 }

@@ -4985,6 +4985,10 @@ async fn drain_web_config_events(
 /// `~/.deepseek/settings.toml` so it survives a restart, push the change to
 /// the running engine via `Op::SetModel`/`Op::SetCompaction`, and surface
 /// a one-line status describing what changed.
+// The model/effort transition needs both the previous and next model+effort
+// plus the engine, app, and config handles; bundling them into a struct here
+// would only obscure a straightforward orchestration step.
+#[allow(clippy::too_many_arguments)]
 async fn apply_model_picker_choice(
     app: &mut App,
     engine_handle: &mut EngineHandle,

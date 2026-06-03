@@ -5069,7 +5069,8 @@ mod tests {
     fn warns_when_allow_shell_nested_under_general_section() {
         // #2589: the reporter's config nested top-level keys under sections that
         // do not exist, so they were silently dropped and shell tools vanished.
-        let raw = "[general]\nallow_shell = true\n\n[sandbox]\nsandbox_mode = \"danger-full-access\"\n";
+        let raw =
+            "[general]\nallow_shell = true\n\n[sandbox]\nsandbox_mode = \"danger-full-access\"\n";
         let warning =
             warn_on_misplaced_top_level_keys(raw).expect("misplaced keys should produce a warning");
         assert!(warning.contains("general.allow_shell"));
