@@ -585,6 +585,105 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
 }
 
 #[test]
+fn arcee_provider_policy_defers_risky_tools_keeps_read_only_and_tool_search() {
+    let always_load = HashSet::new();
+    let mut catalog = vec![
+        api_tool("read_file"),
+        api_tool("list_dir"),
+        api_tool("git_status"),
+        api_tool("git_diff"),
+        api_tool("grep_files"),
+        api_tool("file_search"),
+        api_tool("update_plan"),
+        api_tool("checklist_write"),
+        api_tool("exec_shell"),
+        api_tool("apply_patch"),
+        api_tool("write_file"),
+        api_tool("edit_file"),
+        api_tool("fetch_url"),
+        api_tool("web_search"),
+        api_tool("tool_search_tool_regex"),
+        api_tool("tool_search_tool_bm25"),
+    ];
+
+    apply_provider_tool_policy(&mut catalog, ApiProvider::Arcee, &always_load);
+
+    let defer = |name: &str| {
+        catalog
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.defer_loading)
+    };
+
+    // Benign read-only first-turn set stays active so the opening Arcee
+    // request clears Cloudflare's WAF.
+    for active in [
+        "read_file",
+        "list_dir",
+        "git_status",
+        "git_diff",
+        "grep_files",
+        "file_search",
+        "update_plan",
+        "checklist_write",
+    ] {
+        assert_eq!(defer(active), Some(false), "{active} should stay active");
+    }
+    // Tool-search stays active so the deferred tail remains discoverable.
+    assert_eq!(defer("tool_search_tool_regex"), Some(false));
+    assert_eq!(defer("tool_search_tool_bm25"), Some(false));
+    // WAF-risky / mutating tools are deferred on the first Arcee turn.
+    for deferred in [
+        "exec_shell",
+        "apply_patch",
+        "write_file",
+        "edit_file",
+        "fetch_url",
+        "web_search",
+    ] {
+        assert_eq!(defer(deferred), Some(true), "{deferred} should be deferred");
+    }
+
+    let active = initial_active_tools(&catalog);
+    assert!(active.contains("read_file"));
+    assert!(active.contains("tool_search_tool_regex"));
+    assert!(!active.contains("exec_shell"));
+    assert!(!active.contains("apply_patch"));
+}
+
+#[test]
+fn provider_tool_policy_is_noop_for_non_waf_providers() {
+    let always_load = HashSet::new();
+    let mut catalog = vec![api_tool("exec_shell"), api_tool("read_file")];
+
+    // DeepSeek has no reduced first-turn surface: the policy must leave the
+    // default deferral flags untouched (here: still unset).
+    apply_provider_tool_policy(&mut catalog, ApiProvider::Deepseek, &always_load);
+
+    assert!(catalog.iter().all(|tool| tool.defer_loading.is_none()));
+}
+
+#[test]
+fn arcee_provider_policy_honors_always_load_override() {
+    let mut always_load = HashSet::new();
+    always_load.insert("exec_shell".to_string());
+    let mut catalog = vec![api_tool("exec_shell"), api_tool("apply_patch")];
+
+    apply_provider_tool_policy(&mut catalog, ApiProvider::Arcee, &always_load);
+
+    let defer = |name: &str| {
+        catalog
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.defer_loading)
+    };
+    // A user-pinned always_load tool stays active even on Arcee.
+    assert_eq!(defer("exec_shell"), Some(false));
+    // Other risky tools remain deferred.
+    assert_eq!(defer("apply_patch"), Some(true));
+}
+
+#[test]
 fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let registry = engine
@@ -684,7 +783,6 @@ fn print_agent_tool_catalog_metrics() {
         .with_plan_tool(new_shared_plan_state())
         .with_review_tool(None, DEFAULT_TEXT_MODEL.to_string())
         .with_rlm_tool(None, DEFAULT_TEXT_MODEL.to_string())
-        .with_recall_archive_tool()
         .with_notify_tool()
         .with_subagent_tools(manager, runtime)
         .build(context);
@@ -1172,8 +1270,6 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
     assert!(registry.contains("task_list"));
     assert!(registry.contains("task_read"));
     assert!(registry.contains("handle_read"));
-    assert!(registry.contains("recall_archive"));
-
     let plan_state_tools = [
         "checklist_add",
         "checklist_update",
@@ -1330,26 +1426,6 @@ fn plan_mode_toggle_preserves_catalog_byte_stability() {
         Some(&"deferred_search"),
         "deferred tool must be appended at the tail"
     );
-}
-
-#[test]
-fn parent_turn_registry_includes_recall_archive_for_investigative_modes() {
-    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
-
-    for mode in [AppMode::Plan, AppMode::Agent, AppMode::Yolo] {
-        let registry = engine
-            .build_turn_tool_registry_builder(
-                mode,
-                engine.config.todos.clone(),
-                engine.config.plan_state.clone(),
-            )
-            .build(engine.build_tool_context(mode, false));
-
-        assert!(
-            registry.contains("recall_archive"),
-            "parent {mode:?} registry should expose recall_archive"
-        );
-    }
 }
 
 #[test]

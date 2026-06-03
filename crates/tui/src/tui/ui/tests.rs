@@ -2104,7 +2104,7 @@ async fn provider_switch_clears_turn_cache_history() {
     // serialize with other tests that mutate the same env vars.
     // Wrap the lock inside a guard struct so clippy's
     // `await_holding_lock` doesn't fire on the `.await` below; the
-    // pattern matches `tools::recall_archive::HomeGuard`.
+    // pattern matches other tests that guard HOME / USERPROFILE mutations.
     struct HomeGuard {
         _tmp: tempfile::TempDir,
         prev_home: Option<std::ffi::OsString>,
@@ -2195,6 +2195,95 @@ async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
     assert_eq!(app.api_provider, ApiProvider::Deepseek);
     assert!(!app.model_ids_passthrough);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
+}
+
+#[tokio::test]
+async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::XiaomiMimo;
+    app.model = "mimo-v2.5-pro".to_string();
+    app.model_ids_passthrough = true;
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("xiaomi-mimo".to_string()),
+        api_key: Some("deepseek-key".to_string()),
+        base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
+        default_text_model: Some("mimo-v2.5-pro".to_string()),
+        providers: Some(ProvidersConfig {
+            xiaomi_mimo: ProviderConfig {
+                api_key: Some("mimo-key".to_string()),
+                model: Some("mimo-v2.5-pro".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Deepseek,
+        None,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert!(!app.model_ids_passthrough);
+    assert_eq!(app.model, DEFAULT_TEXT_MODEL);
+    assert_eq!(config.provider.as_deref(), Some("deepseek"));
+    assert_eq!(config.base_url, None);
+}
+
+#[tokio::test]
+async fn provider_switch_model_override_updates_target_provider_model_slot() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::XiaomiMimo;
+    app.model = "mimo-v2.5-pro".to_string();
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("xiaomi-mimo".to_string()),
+        api_key: Some("deepseek-key".to_string()),
+        default_text_model: Some("mimo-v2.5-pro".to_string()),
+        providers: Some(ProvidersConfig {
+            xiaomi_mimo: ProviderConfig {
+                api_key: Some("mimo-key".to_string()),
+                model: Some("mimo-v2.5-pro".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Deepseek,
+        Some("deepseek-v4-flash".to_string()),
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.model, "deepseek-v4-flash");
+    assert_eq!(
+        config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.deepseek.model.as_deref()),
+        Some("deepseek-v4-flash")
+    );
+    assert_eq!(
+        config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.xiaomi_mimo.model.as_deref()),
+        Some("mimo-v2.5-pro")
+    );
 }
 
 #[tokio::test]
@@ -2605,6 +2694,62 @@ fn turn_liveness_recovers_stalled_in_progress_turn() {
     let toast = app.status_toasts.back().expect("stall toast");
     assert_eq!(toast.level, StatusToastLevel::Error);
     assert!(toast.text.contains("Turn stalled"));
+}
+
+#[test]
+fn engine_event_disconnect_recovers_live_turn_immediately() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.runtime_turn_id = Some("turn_dead".to_string());
+    app.turn_started_at = Some(Instant::now());
+    app.dispatch_started_at = Some(Instant::now());
+    app.user_scrolled_during_stream = true;
+    let thinking_idx = crate::tui::streaming_thinking::ensure_active_entry(&mut app);
+    crate::tui::streaming_thinking::append(&mut app, thinking_idx, "partial reasoning");
+    app.push_pending_steer(crate::tui::app::QueuedMessage::new(
+        "please continue after recovery".to_string(),
+        None,
+    ));
+
+    let recovered = recover_engine_event_disconnect(&mut app);
+
+    assert!(recovered);
+    assert!(!app.is_loading);
+    assert!(app.runtime_turn_status.is_none());
+    assert!(app.runtime_turn_id.is_none());
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.turn_started_at.is_none());
+    assert!(app.streaming_thinking_active_entry.is_none());
+    assert!(!app.user_scrolled_during_stream);
+    assert_eq!(app.queued_message_count(), 1);
+    assert_eq!(
+        app.queued_messages
+            .front()
+            .map(crate::tui::app::QueuedMessage::content),
+        Some("please continue after recovery".to_string())
+    );
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::Error { message, .. }
+                if message.contains("Engine stopped before completing the turn")
+        )),
+        "disconnect recovery should add a visible transcript error"
+    );
+    let toast = app.status_toasts.back().expect("disconnect toast");
+    assert_eq!(toast.level, StatusToastLevel::Error);
+}
+
+#[test]
+fn engine_event_disconnect_while_idle_is_noop() {
+    let mut app = create_test_app();
+
+    let recovered = recover_engine_event_disconnect(&mut app);
+
+    assert!(!recovered);
+    assert!(app.history.is_empty());
+    assert!(app.status_toasts.is_empty());
 }
 
 #[test]
@@ -3480,8 +3625,8 @@ fn should_auto_compact_before_send_respects_threshold_and_setting() {
     app.auto_compact = false;
     assert!(!should_auto_compact_before_send(&app));
 
-    // Small estimated context + auto_compact ON → does NOT trigger,
-    // regardless of what `last_prompt_tokens` reports. This matches the
+    // Small estimated context + auto_compact ON can trigger once the
+    // configured percent threshold is crossed. This still matches the
     // #115 fix: the estimate is the primary signal, not the engine's
     // turn-cumulative reported value (which used to rule the displayed
     // % and could spuriously trigger / suppress auto-compact).
@@ -3490,12 +3635,12 @@ fn should_auto_compact_before_send_respects_threshold_and_setting() {
     app.auto_compact_threshold_percent = 10.0;
     app.session.last_prompt_tokens = Some(10_000);
     let (used, _, percent) =
-        context_usage_snapshot(&app).expect("floor context snapshot should be available");
+        context_usage_snapshot(&app).expect("context snapshot should be available");
     assert!(
-        used < crate::compaction::MINIMUM_AUTO_COMPACTION_TOKENS as i64 && percent >= 10.0,
-        "test fixture should cross percent threshold but stay below the 500K floor; used={used} percent={percent:.2}"
+        used > 0 && percent >= 10.0,
+        "test fixture should cross percent threshold; used={used} percent={percent:.2}"
     );
-    assert!(!should_auto_compact_before_send(&app));
+    assert!(should_auto_compact_before_send(&app));
 }
 
 #[test]
@@ -4673,6 +4818,26 @@ fn active_rlm_task_entries_surface_foreground_rlm_work() {
 }
 
 #[test]
+fn active_reasoning_task_entries_surface_reasoning_only_turns() {
+    let mut app = create_test_app();
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(2));
+    let mut active = ActiveCell::new();
+    active.push_thinking(HistoryCell::Thinking {
+        content: "reasoning text".to_string(),
+        streaming: true,
+        duration_secs: None,
+    });
+    app.active_cell = Some(active);
+
+    let entries = active_reasoning_task_entries(&app);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, "reasoning-1");
+    assert_eq!(entries[0].status, "running");
+    assert_eq!(entries[0].prompt_summary, "model reasoning");
+    assert!(entries[0].duration_ms.unwrap_or_default() >= 2000);
+}
+
+#[test]
 fn alt_nav_modifiers_require_alt_and_exclude_ctrl_super() {
     // v0.8.30 — transcript-nav shortcuts (`Alt+[`, `Alt+]`, etc.) require
     // Alt, allow Shift for capital-letter forms, and block Ctrl/Super so
@@ -5311,12 +5476,15 @@ async fn model_picker_persists_model_and_reasoning_effort() {
     let mut app = create_test_app();
     app.set_model_selection("auto".to_string());
     app.reasoning_effort = ReasoningEffort::Auto;
-    let engine = mock_engine_handle();
+    let mut engine = mock_engine_handle();
+    let mut config = Config::default();
 
     apply_model_picker_choice(
         &mut app,
-        &engine.handle,
+        &mut engine.handle,
+        &mut config,
         "deepseek-v4-pro".to_string(),
+        None,
         ReasoningEffort::High,
         "auto".to_string(),
         ReasoningEffort::Auto,

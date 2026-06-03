@@ -40,7 +40,7 @@ use crate::client::{
     inspect_prompt_for_request,
 };
 use crate::commands;
-use crate::compaction::{MINIMUM_AUTO_COMPACTION_TOKENS, estimate_input_tokens_conservative};
+use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
     ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, ProviderConfig, ProvidersConfig, StatusItem,
     UpdateConfig, save_provider_auth_mode_for,
@@ -751,7 +751,6 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         max_subagents: app.max_subagents,
         features: config.features(),
         compaction: app.compaction_config(),
-        cycle: app.cycle_config(),
         capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(config),
         todos: app.todos.clone(),
         plan_state: app.plan_state.clone(),
@@ -858,6 +857,7 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     .map(task_summary_to_panel_entry)
     .collect();
 
+    entries.extend(active_reasoning_task_entries(app));
     entries.extend(active_rlm_task_entries(app));
 
     if let Some(shell_mgr) = app.runtime_services.shell_manager.as_ref()
@@ -877,6 +877,32 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     }
 
     app.task_panel = entries;
+}
+
+fn active_reasoning_task_entries(app: &App) -> Vec<TaskPanelEntry> {
+    let Some(active) = app.active_cell.as_ref() else {
+        return Vec::new();
+    };
+    let duration_ms = app
+        .turn_started_at
+        .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+
+    active
+        .entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| match entry {
+            HistoryCell::Thinking {
+                streaming: true, ..
+            } => Some(TaskPanelEntry {
+                id: format!("reasoning-{}", idx + 1),
+                status: "running".to_string(),
+                prompt_summary: "model reasoning".to_string(),
+                duration_ms,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
@@ -1150,7 +1176,18 @@ async fn run_event_loop(
         let mut queued_to_send: Option<QueuedMessage> = None;
         {
             let mut rx = engine_handle.rx_event.write().await;
-            while let Ok(event) = rx.try_recv() {
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        if recover_engine_event_disconnect(app) {
+                            received_engine_event = true;
+                            transcript_batch_updated = true;
+                        }
+                        break;
+                    }
+                };
                 received_engine_event = true;
                 if app.suppress_stream_events_until_turn_complete {
                     if matches!(event, EngineEvent::TurnStarted { .. }) {
@@ -1883,21 +1920,6 @@ async fn run_event_loop(
                     EngineEvent::PurgeFailed { message } => {
                         app.is_purging = false;
                         app.status_message = Some(message);
-                    }
-                    EngineEvent::CycleAdvanced { from, to, briefing } => {
-                        // Mirror the engine-side counter on the UI app state
-                        // so the sidebar / slash commands stay in sync, and
-                        // record the briefing so `/cycle <n>` can show it.
-                        app.cycle_count = to;
-                        let briefing_tokens = briefing.token_estimate;
-                        app.cycle_briefings.push(briefing);
-                        let separator = format!(
-                            "─── cycle {from} → {to}  (briefing: {briefing_tokens} tokens) ───"
-                        );
-                        app.add_message(HistoryCell::System { content: separator });
-                        app.status_message = Some(format!(
-                            "↻ context refreshed (cycle {from} → {to}, briefing: {briefing_tokens} tokens carried)"
-                        ));
                     }
                     EngineEvent::CoherenceState { state, .. } => {
                         app.coherence_state = state;
@@ -4205,6 +4227,55 @@ fn reconcile_turn_liveness(app: &mut App, now: Instant, has_running_agents: bool
     false
 }
 
+fn recover_engine_event_disconnect(app: &mut App) -> bool {
+    let had_live_work = app.is_loading
+        || app.is_compacting
+        || app.is_purging
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || app.streaming_message_index.is_some()
+        || app.streaming_thinking_active_entry.is_some()
+        || app
+            .active_cell
+            .as_ref()
+            .is_some_and(|cell| !cell.is_empty());
+
+    if !had_live_work {
+        return false;
+    }
+
+    streaming_thinking::finalize_current(app);
+    app.finalize_streaming_assistant_as_interrupted();
+    app.finalize_active_cell_as_interrupted();
+    app.streaming_state.reset();
+    app.streaming_message_index = None;
+    app.streaming_thinking_active_entry = None;
+    app.is_loading = false;
+    app.is_compacting = false;
+    app.is_purging = false;
+    app.turn_started_at = None;
+    app.turn_last_activity_at = None;
+    app.runtime_turn_status = None;
+    app.runtime_turn_id = None;
+    app.dispatch_started_at = None;
+    app.user_scrolled_during_stream = false;
+
+    for msg in app.drain_pending_steers() {
+        app.queue_message(msg);
+    }
+
+    app.add_message(HistoryCell::Error {
+        message: "Engine stopped before completing the turn. Check ~/.codewhale/crashes and retry."
+            .to_string(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    });
+    app.push_status_toast(
+        "Engine stopped before completing the turn.",
+        StatusToastLevel::Error,
+        None,
+    );
+    true
+}
+
 fn record_turn_activity(app: &mut App, event: &EngineEvent, now: Instant) {
     if matches!(event, EngineEvent::TurnStarted { .. }) {
         app.turn_last_activity_at = Some(now);
@@ -4916,8 +4987,10 @@ async fn drain_web_config_events(
 /// a one-line status describing what changed.
 async fn apply_model_picker_choice(
     app: &mut App,
-    engine_handle: &EngineHandle,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
     model: String,
+    target_provider: Option<ApiProvider>,
     mut effort: crate::tui::app::ReasoningEffort,
     previous_model: String,
     previous_effort: crate::tui::app::ReasoningEffort,
@@ -4926,6 +4999,25 @@ async fn apply_model_picker_choice(
     if model_is_auto {
         effort = ReasoningEffort::Auto;
     }
+    if let Some(target_provider) = target_provider
+        && target_provider != app.api_provider
+        && !model_is_auto
+    {
+        switch_provider(
+            app,
+            engine_handle,
+            config,
+            target_provider,
+            Some(model.clone()),
+        )
+        .await;
+        if app.api_provider != target_provider {
+            return;
+        }
+        apply_picker_effort_choice(app, engine_handle, effort, previous_effort).await;
+        return;
+    }
+
     let model_changed = model != previous_model || app.auto_model != model_is_auto;
     let effort_changed = effort != previous_effort;
     if !model_changed && !effort_changed {
@@ -4938,6 +5030,8 @@ async fn apply_model_picker_choice(
 
     if model_changed {
         app.set_model_selection(model.clone());
+        app.provider_models
+            .insert(app.api_provider.as_str().to_string(), model.clone());
         app.clear_model_scoped_telemetry();
     }
     if effort_changed {
@@ -4954,7 +5048,12 @@ async fn apply_model_picker_choice(
     let persist_result = (|| -> anyhow::Result<()> {
         let mut settings = crate::settings::Settings::load()?;
         if model_changed {
-            settings.set("default_model", &model)?;
+            if matches!(
+                app.api_provider,
+                ApiProvider::Deepseek | ApiProvider::DeepseekCN
+            ) {
+                settings.set("default_model", &model)?;
+            }
             settings.set_model_for_provider(app.api_provider.as_str(), &model);
         }
         if effort_changed {
@@ -5001,6 +5100,42 @@ async fn apply_model_picker_choice(
     app.status_message = Some(summary);
 }
 
+async fn apply_picker_effort_choice(
+    app: &mut App,
+    engine_handle: &EngineHandle,
+    effort: ReasoningEffort,
+    previous_effort: ReasoningEffort,
+) {
+    if effort == previous_effort {
+        return;
+    }
+
+    app.reasoning_effort = effort;
+    app.last_effective_reasoning_effort = None;
+    app.update_model_compaction_budget();
+
+    let persist_warning = (|| -> anyhow::Result<()> {
+        let mut settings = crate::settings::Settings::load()?;
+        settings.set("reasoning_effort", effort.as_setting())?;
+        settings.save()
+    })()
+    .err()
+    .map(|err| format!(" (not persisted: {err})"));
+
+    apply_model_and_compaction_update(engine_handle, app.compaction_config(), app.mode).await;
+
+    let mut summary = format!(
+        "Thinking: {} → {} · model {}",
+        previous_effort.short_label(),
+        effort.short_label(),
+        app.model_display_label()
+    );
+    if let Some(warning) = persist_warning {
+        summary.push_str(&warning);
+    }
+    app.status_message = Some(summary);
+}
+
 /// Apply a `/provider` switch by mutating the in-memory config, validating
 /// that credentials exist for the new provider, then respawning the engine
 /// so the API client picks up the new base URL/key. When `model_override`
@@ -5018,6 +5153,7 @@ async fn switch_provider(
     let previous_provider_str = config.provider.clone();
     let previous_base_url = config.base_url.clone();
     let previous_default_text_model = config.default_text_model.clone();
+    let previous_providers = config.providers.clone();
 
     config.provider = Some(target.as_str().to_string());
     if matches!(target, ApiProvider::NvidiaNim)
@@ -5029,23 +5165,24 @@ async fn switch_provider(
     {
         config.base_url = Some(DEFAULT_NVIDIA_NIM_BASE_URL.to_string());
     }
-    if matches!(target, ApiProvider::Deepseek)
+    if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
         && config
             .base_url
             .as_deref()
-            .map(|base| base.contains("integrate.api.nvidia.com"))
+            .map(root_base_url_belongs_to_non_deepseek_provider)
             .unwrap_or(false)
     {
         config.base_url = None;
     }
     if let Some(ref model) = model_override {
-        config.default_text_model = Some(model.clone());
+        config.provider_config_for_mut(target).model = Some(model.clone());
     }
 
     if let Err(err) = DeepSeekClient::new(config) {
         config.provider = previous_provider_str;
         config.base_url = previous_base_url;
         config.default_text_model = previous_default_text_model;
+        config.providers = previous_providers;
         app.add_message(HistoryCell::System {
             content: format!(
                 "Failed to switch provider to {}: {err}\nProvider unchanged ({}).",
@@ -5061,6 +5198,10 @@ async fn switch_provider(
     app.api_provider = target;
     app.model_ids_passthrough = config.model_ids_pass_through();
     app.set_model_selection(new_model.clone());
+    if model_override.is_some() {
+        app.provider_models
+            .insert(target.as_str().to_string(), new_model.clone());
+    }
     app.update_model_compaction_budget();
     if cache_scope_changed {
         app.clear_model_scoped_telemetry();
@@ -5105,8 +5246,35 @@ async fn switch_provider(
     // Persist the provider choice so it survives restarts.
     if let Ok(mut settings) = crate::settings::Settings::load() {
         settings.default_provider = Some(target.as_str().to_string());
+        if model_override.is_some() {
+            settings.set_model_for_provider(target.as_str(), &new_model);
+            if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+                let _ = settings.set("default_model", &new_model);
+            }
+        }
         let _ = settings.save();
     }
+}
+
+fn root_base_url_belongs_to_non_deepseek_provider(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    [
+        "integrate.api.nvidia.com",
+        "api.openai.com",
+        "api.atlascloud.ai",
+        "maas-openapi.wanjiedata.com",
+        "volces.com",
+        "openrouter.ai",
+        "xiaomimimo.com",
+        "novita.ai",
+        "fireworks.ai",
+        "siliconflow",
+        "arcee.ai",
+        "moonshot.ai",
+        "api.kimi.com",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn sync_config_provider_from_app(config: &mut Config, app: &App) {
@@ -6388,6 +6556,10 @@ fn render(f: &mut Frame, app: &mut App) {
             sidebar_area = Some(split[1]);
         }
 
+        // Record the sidebar rect (or its absence) every frame so mouse
+        // hit-testing can route scroll events correctly.
+        app.viewport.last_sidebar_area = sidebar_area;
+
         let chat_widget = ChatWidget::new(app, chat_area);
         let buf = f.buffer_mut();
         chat_widget.render(chat_area, buf);
@@ -6404,8 +6576,10 @@ fn render(f: &mut Frame, app: &mut App) {
                 let x = mouse_col
                     .saturating_add(2)
                     .min(size.width.saturating_sub(text_width));
+                // Sit one row BELOW the cursor so the tooltip never paints over
+                // the row above the hovered line (which read as corruption).
                 let y = mouse_row
-                    .saturating_sub(1)
+                    .saturating_add(1)
                     .min(size.height.saturating_sub(tooltip_height));
                 if text_width > 0 && tooltip_height > 0 {
                     let tooltip_area = Rect {
@@ -6414,10 +6588,12 @@ fn render(f: &mut Frame, app: &mut App) {
                         width: text_width,
                         height: tooltip_height,
                     };
+                    // Neutral elevated-surface styling so the tooltip reads as a
+                    // tooltip, not a warning highlight (was STATUS_WARNING).
                     let tooltip = ratatui::widgets::Paragraph::new(tooltip_text.as_str()).style(
                         Style::default()
-                            .bg(palette::STATUS_WARNING)
-                            .fg(palette::TEXT_MUTED),
+                            .bg(palette::SURFACE_ELEVATED)
+                            .fg(palette::TEXT_PRIMARY),
                     );
                     f.render_widget(tooltip, tooltip_area);
                 }
@@ -6898,6 +7074,7 @@ async fn handle_view_events(
             }
             ViewEvent::ModelPickerApplied {
                 model,
+                provider,
                 effort,
                 previous_model,
                 previous_effort,
@@ -6905,7 +7082,9 @@ async fn handle_view_events(
                 apply_model_picker_choice(
                     app,
                     engine_handle,
+                    config,
                     model,
+                    provider,
                     effort,
                     previous_model,
                     previous_effort,
@@ -7997,11 +8176,8 @@ fn maybe_warn_context_pressure(app: &mut App) {
         return;
     }
 
-    let below_auto_floor = used < MINIMUM_AUTO_COMPACTION_TOKENS as i64;
     let recommendation = if !app.auto_compact {
         "Consider enabling auto_compact or use /compact."
-    } else if below_auto_floor {
-        "Auto-compaction is enabled but waits for the 500K token floor."
     } else if percent >= configured_threshold {
         "Auto-compaction will run before the next send."
     } else {
@@ -8032,10 +8208,7 @@ fn should_auto_compact_before_send(app: &App) -> bool {
         return false;
     }
     context_usage_snapshot(app)
-        .map(|(used, _, pct)| {
-            used >= MINIMUM_AUTO_COMPACTION_TOKENS as i64
-                && pct >= app.auto_compact_threshold_percent.clamp(10.0, 100.0)
-        })
+        .map(|(_, _, pct)| pct >= app.auto_compact_threshold_percent.clamp(10.0, 100.0))
         .unwrap_or(false)
 }
 

@@ -263,8 +263,6 @@ pub enum MessageId {
     CmdConfigDescription,
     CmdContextDescription,
     CmdCostDescription,
-    CmdCycleDescription,
-    CmdCyclesDescription,
     CmdDiffDescription,
     CmdEditDescription,
     CmdExitDescription,
@@ -305,7 +303,6 @@ pub enum MessageId {
     CmdQueueMissingIndex,
     CmdQueueIndexPositive,
     CmdQueueIndexMin,
-    CmdRecallDescription,
     CmdRelayDescription,
     CmdRenameDescription,
     CmdRestoreDescription,
@@ -546,8 +543,6 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdConfigDescription,
     MessageId::CmdContextDescription,
     MessageId::CmdCostDescription,
-    MessageId::CmdCycleDescription,
-    MessageId::CmdCyclesDescription,
     MessageId::CmdDiffDescription,
     MessageId::CmdEditDescription,
     MessageId::CmdExitDescription,
@@ -586,7 +581,6 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdQueueMissingIndex,
     MessageId::CmdQueueIndexPositive,
     MessageId::CmdQueueIndexMin,
-    MessageId::CmdRecallDescription,
     MessageId::CmdRelayDescription,
     MessageId::CmdRenameDescription,
     MessageId::CmdRestoreDescription,
@@ -1024,17 +1018,13 @@ fn english(id: MessageId) -> &'static str {
         }
         MessageId::CmdBalanceDescription => "Check the active provider account balance",
         MessageId::CmdClearDescription => "Clear conversation history",
-        MessageId::CmdCompactDescription => {
-            "Trigger context compaction to free up space (legacy; v0.6.6 prefers cycle restart)"
-        }
+        MessageId::CmdCompactDescription => "Trigger context compaction to free up space",
         MessageId::CmdPurgeDescription => {
             "Let the agent surgically prune conversation history to free context space"
         }
         MessageId::CmdConfigDescription => "Open interactive configuration editor",
         MessageId::CmdContextDescription => "Open compact session context inspector",
         MessageId::CmdCostDescription => "Show session cost breakdown",
-        MessageId::CmdCycleDescription => "Show the carry-forward briefing for a specific cycle",
-        MessageId::CmdCyclesDescription => "List checkpoint-restart cycle handoffs in this session",
         MessageId::CmdDiffDescription => "Show file changes since session start",
         MessageId::CmdEditDescription => "Revise and resubmit the last message",
         MessageId::CmdExitDescription => "Exit the application",
@@ -1089,7 +1079,6 @@ fn english(id: MessageId) -> &'static str {
         }
         MessageId::CmdQueueIndexPositive => "Index must be a positive number",
         MessageId::CmdQueueIndexMin => "Index must be >= 1",
-        MessageId::CmdRecallDescription => "Search prior cycle archives (BM25 over message text)",
         MessageId::CmdRelayDescription => "Create a session relay (接力) for a fresh thread",
         MessageId::CmdRenameDescription => "Rename the current session",
         MessageId::CmdRestoreDescription => {
@@ -1448,19 +1437,13 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
             "Kiểm tra số dư tài khoản của nhà cung cấp dịch vụ đang hoạt động"
         }
         MessageId::CmdClearDescription => "Xóa lịch sử trò chuyện",
-        MessageId::CmdCompactDescription => {
-            "Kích hoạt nén ngữ cảnh để giải phóng không gian (cũ; v0.6.6 ưu tiên khởi động lại chu kỳ)"
-        }
+        MessageId::CmdCompactDescription => "Kích hoạt nén ngữ cảnh để giải phóng không gian",
         MessageId::CmdPurgeDescription => {
             "Cho agent cắt gọn lịch sử trò chuyện để giải phóng ngữ cảnh"
         }
         MessageId::CmdConfigDescription => "Mở trình chỉnh sửa cấu hình tương tác",
         MessageId::CmdContextDescription => "Mở trình kiểm tra ngữ cảnh phiên thu gọn",
         MessageId::CmdCostDescription => "Hiển thị chi tiết chi phí của phiên làm việc",
-        MessageId::CmdCycleDescription => "Hiển thị báo cáo chuyển tiếp cho một chu kỳ cụ thể",
-        MessageId::CmdCyclesDescription => {
-            "Liệt kê các lần bàn giao chu kỳ checkpoint-restart trong phiên này"
-        }
         MessageId::CmdDiffDescription => "Hiển thị các thay đổi của tệp kể từ khi bắt đầu phiên",
         MessageId::CmdEditDescription => "Chỉnh sửa và gửi lại tin nhắn gần nhất",
         MessageId::CmdExitDescription => "Thoát ứng dụng",
@@ -1521,9 +1504,6 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdQueueIndexPositive => "Chỉ mục phải là số dương",
         MessageId::CmdQueueIndexMin => "Chỉ mục phải >= 1",
-        MessageId::CmdRecallDescription => {
-            "Tìm kiếm kho lưu trữ chu kỳ trước (BM25 trên văn bản tin nhắn)"
-        }
         MessageId::CmdRelayDescription => "Tạo một phiên tiếp sức cho một luồng mới",
         MessageId::CmdRenameDescription => "Đổi tên phiên làm việc hiện tại",
         MessageId::CmdRestoreDescription => {
@@ -1912,19 +1892,13 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdBalanceDescription => "アクティブなプロバイダーのアカウント残高を確認",
         MessageId::CmdClearDescription => "会話履歴をクリア",
-        MessageId::CmdCompactDescription => {
-            "コンテキスト圧縮で容量を確保（旧式：v0.6.6 以降はサイクル再起動を推奨）"
-        }
+        MessageId::CmdCompactDescription => "コンテキスト圧縮で容量を確保",
         MessageId::CmdPurgeDescription => {
             "エージェントに会話履歴を分析させ、不要なメッセージを削除・要約"
         }
         MessageId::CmdConfigDescription => "インタラクティブな設定エディタを開く",
         MessageId::CmdContextDescription => "コンパクトなセッションコンテキスト検査ツールを開く",
         MessageId::CmdCostDescription => "セッションのコスト内訳を表示",
-        MessageId::CmdCycleDescription => "指定したサイクルの引き継ぎブリーフィングを表示",
-        MessageId::CmdCyclesDescription => {
-            "セッション内のチェックポイント再起動サイクルの引き継ぎを一覧表示"
-        }
         MessageId::CmdDiffDescription => "セッション開始以降のファイル変更を表示",
         MessageId::CmdEditDescription => "最後のメッセージを編集して再送信",
         MessageId::CmdExitDescription => "アプリを終了",
@@ -1983,9 +1957,6 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdQueueIndexPositive => "インデックスは正の数値である必要があります",
         MessageId::CmdQueueIndexMin => "インデックスは 1 以上である必要があります",
-        MessageId::CmdRecallDescription => {
-            "過去のサイクルアーカイブを検索（メッセージ本文への BM25 検索）"
-        }
         MessageId::CmdRelayDescription => "新しいスレッド用のセッションリレー（接力）を作成",
         MessageId::CmdRenameDescription => "現在のセッションの名前を変更",
         MessageId::CmdRestoreDescription => {
@@ -2323,15 +2294,11 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdBalanceDescription => "查看当前提供商账户余额",
         MessageId::CmdClearDescription => "清除对话历史",
-        MessageId::CmdCompactDescription => {
-            "触发上下文压缩以释放空间（旧版命令；v0.6.6 起建议改用循环重启）"
-        }
+        MessageId::CmdCompactDescription => "触发上下文压缩以释放空间",
         MessageId::CmdPurgeDescription => "让 Agent 分析对话历史，精确保留有用信息并移除冗余内容",
         MessageId::CmdConfigDescription => "打开交互式配置编辑器",
         MessageId::CmdContextDescription => "打开紧凑会话上下文检查器",
         MessageId::CmdCostDescription => "显示本次会话的费用明细",
-        MessageId::CmdCycleDescription => "显示指定循环的延续简报",
-        MessageId::CmdCyclesDescription => "列出本次会话中的检查点重启循环交接",
         MessageId::CmdDiffDescription => "显示会话开始以来的文件变更",
         MessageId::CmdEditDescription => "修改并重新提交最后一条消息",
         MessageId::CmdExitDescription => "退出应用",
@@ -2380,7 +2347,6 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::CmdQueueMissingIndex => "缺少索引。用法: /queue edit <n> 或 /queue drop <n>",
         MessageId::CmdQueueIndexPositive => "索引必须为正数",
         MessageId::CmdQueueIndexMin => "索引必须 >= 1",
-        MessageId::CmdRecallDescription => "搜索此前的循环归档（基于消息文本的 BM25 检索）",
         MessageId::CmdRelayDescription => "为新线程创建会话接力摘要",
         MessageId::CmdRenameDescription => "重命名当前会话",
         MessageId::CmdRestoreDescription => {
@@ -2690,21 +2656,13 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdBalanceDescription => "Verificar o saldo da conta do provedor ativo",
         MessageId::CmdClearDescription => "Limpar o histórico da conversa",
-        MessageId::CmdCompactDescription => {
-            "Compactar o contexto para liberar espaço (legado; a v0.6.6 prefere o reinício de ciclo)"
-        }
+        MessageId::CmdCompactDescription => "Compactar o contexto para liberar espaço",
         MessageId::CmdPurgeDescription => {
             "Deixe o agente podar cirurgicamente o histórico para liberar espaço de contexto"
         }
         MessageId::CmdConfigDescription => "Abrir o editor interativo de configuração",
         MessageId::CmdContextDescription => "Abrir o inspetor compacto de contexto da sessão",
         MessageId::CmdCostDescription => "Exibir o detalhamento de custo da sessão",
-        MessageId::CmdCycleDescription => {
-            "Exibir o briefing de continuidade de um ciclo específico"
-        }
-        MessageId::CmdCyclesDescription => {
-            "Listar as transferências dos ciclos checkpoint-restart desta sessão"
-        }
         MessageId::CmdDiffDescription => "Mostrar alterações em arquivos desde o início da sessão",
         MessageId::CmdEditDescription => "Revisar e reenviar a última mensagem",
         MessageId::CmdExitDescription => "Sair do aplicativo",
@@ -2765,9 +2723,6 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdQueueIndexPositive => "O índice deve ser um número positivo",
         MessageId::CmdQueueIndexMin => "O índice deve ser >= 1",
-        MessageId::CmdRecallDescription => {
-            "Buscar arquivos de ciclos anteriores (BM25 sobre o texto das mensagens)"
-        }
         MessageId::CmdRelayDescription => "Criar um relay da sessão para um novo thread",
         MessageId::CmdRenameDescription => "Renomear a sessão atual",
         MessageId::CmdRestoreDescription => {
@@ -3133,21 +3088,13 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdBalanceDescription => "Consultar el saldo de la cuenta del proveedor activo",
         MessageId::CmdClearDescription => "Limpiar el historial de la conversación",
-        MessageId::CmdCompactDescription => {
-            "Compactar el contexto para liberar espacio (heredado; v0.6.6 prefiere reinicio de ciclo)"
-        }
+        MessageId::CmdCompactDescription => "Compactar el contexto para liberar espacio",
         MessageId::CmdPurgeDescription => {
             "Permite al agente eliminar quirúrgicamente historial innecesario para liberar espacio de contexto"
         }
         MessageId::CmdConfigDescription => "Abrir el editor interactivo de configuración",
         MessageId::CmdContextDescription => "Abrir el inspector compacto de contexto de la sesión",
         MessageId::CmdCostDescription => "Mostrar el desglose de costo de la sesión",
-        MessageId::CmdCycleDescription => {
-            "Mostrar el resumen de continuidad de un ciclo específico"
-        }
-        MessageId::CmdCyclesDescription => {
-            "Listar las transferencias de checkpoint-restart de esta sesión"
-        }
         MessageId::CmdDiffDescription => "Mostrar cambios en archivos desde el inicio de la sesión",
         MessageId::CmdEditDescription => "Revisar y reenviar el último mensaje",
         MessageId::CmdExitDescription => "Salir de la aplicación",
@@ -3216,9 +3163,6 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdQueueIndexPositive => "El índice debe ser un número positivo",
         MessageId::CmdQueueIndexMin => "El índice debe ser >= 1",
-        MessageId::CmdRecallDescription => {
-            "Buscar archivos de ciclos anteriores (BM25 sobre el texto de los mensajes)"
-        }
         MessageId::CmdRelayDescription => "Crear un relay de sesión (接力) para un hilo nuevo",
         MessageId::CmdRenameDescription => "Renombrar la sesión actual",
         MessageId::CmdRestoreDescription => {

@@ -56,8 +56,11 @@ pub const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
 pub const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
 pub const OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL: &str =
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
+pub const OPENROUTER_QWEN_3_6_FLASH_MODEL: &str = "qwen/qwen3.6-flash";
 pub const OPENROUTER_QWEN_3_6_35B_A3B_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+pub const OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL: &str = "qwen/qwen3.6-max-preview";
 pub const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
+pub const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
 pub const OPENROUTER_TENCENT_HY3_PREVIEW_MODEL: &str = "tencent/hy3-preview";
 pub const OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL: &str = "xiaomi/mimo-v2.5-pro";
 pub const OPENROUTER_XIAOMI_MIMO_V2_5_MODEL: &str = "xiaomi/mimo-v2.5";
@@ -66,8 +69,11 @@ pub const RECENT_OPENROUTER_LARGE_MODELS: &[&str] = &[
     OPENROUTER_MINIMAX_M3_MODEL,
     OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL,
     OPENROUTER_XIAOMI_MIMO_V2_5_MODEL,
+    OPENROUTER_QWEN_3_6_FLASH_MODEL,
     OPENROUTER_QWEN_3_6_35B_A3B_MODEL,
+    OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL,
     OPENROUTER_QWEN_3_6_27B_MODEL,
+    OPENROUTER_QWEN_3_6_PLUS_MODEL,
     OPENROUTER_KIMI_K2_6_MODEL,
     OPENROUTER_GLM_5_1_MODEL,
     OPENROUTER_TENCENT_HY3_PREVIEW_MODEL,
@@ -78,6 +84,8 @@ pub const RECENT_OPENROUTER_LARGE_MODELS: &[&str] = &[
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_XIAOMI_MIMO_MODEL: &str = "mimo-v2.5-pro";
 pub const DEFAULT_XIAOMI_MIMO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
+pub const XIAOMI_MIMO_V2_5_OMNI_MODEL: &str = "mimo-v2.5";
+pub const XIAOMI_MIMO_ASR_MODEL: &str = "mimo-v2.5-asr";
 pub const XIAOMI_MIMO_TTS_MODEL: &str = "mimo-v2.5-tts";
 pub const XIAOMI_MIMO_TTS_VOICE_DESIGN_MODEL: &str = "mimo-v2.5-tts-voicedesign";
 pub const XIAOMI_MIMO_TTS_VOICE_CLONE_MODEL: &str = "mimo-v2.5-tts-voiceclone";
@@ -90,8 +98,9 @@ pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference
 pub const DEFAULT_SILICONFLOW_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SILICONFLOW_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.com/v1";
-pub const DEFAULT_ARCEE_MODEL: &str = "trinity-mini";
+pub const DEFAULT_ARCEE_MODEL: &str = "trinity-large-thinking";
 pub const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
+pub const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
 pub const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
 pub const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.6";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
@@ -328,9 +337,10 @@ pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> Provi
         return ProviderCapability {
             provider,
             resolved_model: resolved_model.to_string(),
-            context_window: 1_000_000,
-            max_output: 128_000,
-            thinking_supported: true,
+            context_window: crate::models::context_window_for_model(resolved_model)
+                .unwrap_or(crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS),
+            max_output: crate::models::max_output_tokens_for_model(resolved_model).unwrap_or(4096),
+            thinking_supported: crate::models::model_supports_reasoning(resolved_model),
             cache_telemetry_supported: false,
             request_payload_mode: RequestPayloadMode::ChatCompletions,
             alias_deprecation: None,
@@ -544,8 +554,18 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         | "qwen3.6-35b-a3b"
         | "qwen-3.6-35b-a3b"
         | "qwen3-6-35b-a3b" => Some(OPENROUTER_QWEN_3_6_35B_A3B_MODEL),
+        OPENROUTER_QWEN_3_6_FLASH_MODEL | "qwen3.6-flash" | "qwen-3.6-flash" => {
+            Some(OPENROUTER_QWEN_3_6_FLASH_MODEL)
+        }
+        OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL
+        | "qwen3.6-max-preview"
+        | "qwen-3.6-max-preview"
+        | "qwen-max-preview" => Some(OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL),
         OPENROUTER_QWEN_3_6_27B_MODEL | "qwen3.6-27b" | "qwen-3.6-27b" | "qwen3-6-27b" => {
             Some(OPENROUTER_QWEN_3_6_27B_MODEL)
+        }
+        OPENROUTER_QWEN_3_6_PLUS_MODEL | "qwen3.6-plus" | "qwen-3.6-plus" => {
+            Some(OPENROUTER_QWEN_3_6_PLUS_MODEL)
         }
         OPENROUTER_TENCENT_HY3_PREVIEW_MODEL | "hy3-preview" | "tencent-hy3-preview" => {
             Some(OPENROUTER_TENCENT_HY3_PREVIEW_MODEL)
@@ -573,8 +593,22 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
         | "mimo-v2-5-pro"
         | "xiaomi-mimo-v2.5-pro"
         | "xiaomi-mimo-v2-5-pro" => Some(DEFAULT_XIAOMI_MIMO_MODEL),
-        "mimo-v2.5" | "mimo-v25" | "mimo-v2-5" | "xiaomi-mimo-v2.5" | "xiaomi-mimo-v2-5" => {
-            Some("mimo-v2.5")
+        "omni"
+        | "mimo-omni"
+        | "v2.5-omni"
+        | "v25-omni"
+        | "mimo-v2.5"
+        | "mimo-v25"
+        | "mimo-v2-5"
+        | "mimo-v2.5-omni"
+        | "mimo-v25-omni"
+        | "mimo-v2-5-omni"
+        | "xiaomi-mimo-v2.5"
+        | "xiaomi-mimo-v2-5"
+        | "xiaomi-mimo-v2.5-omni"
+        | "xiaomi-mimo-v2-5-omni" => Some(XIAOMI_MIMO_V2_5_OMNI_MODEL),
+        "asr" | "mimo-asr" | "mimo-v2.5-asr" | "speech-to-text" | "transcribe" => {
+            Some(XIAOMI_MIMO_ASR_MODEL)
         }
         "mimo-tts" | "mimo-v25-tts" | "mimo-v2.5-tts" | "tts" | "speech" => {
             Some(XIAOMI_MIMO_TTS_MODEL)
@@ -600,9 +634,10 @@ fn canonical_arcee_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
     match normalized.as_str() {
-        "trinity" | "arcee-trinity" | "arcee-trinity-mini" | DEFAULT_ARCEE_MODEL => {
+        "trinity" | "arcee-trinity" | "trinity-large-thinking" | "arcee-trinity-large-thinking" => {
             Some(DEFAULT_ARCEE_MODEL)
         }
+        "arcee-trinity-mini" | ARCEE_TRINITY_MINI_MODEL => Some(ARCEE_TRINITY_MINI_MODEL),
         "arcee-trinity-large-preview" | ARCEE_TRINITY_LARGE_PREVIEW_MODEL => {
             Some(ARCEE_TRINITY_LARGE_PREVIEW_MODEL)
         }
@@ -692,14 +727,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
             models.extend_from_slice(RECENT_OPENROUTER_LARGE_MODELS);
             models
         }
-        ApiProvider::XiaomiMimo => vec![
-            DEFAULT_XIAOMI_MIMO_MODEL,
-            "mimo-v2.5",
-            XIAOMI_MIMO_TTS_MODEL,
-            XIAOMI_MIMO_TTS_VOICE_DESIGN_MODEL,
-            XIAOMI_MIMO_TTS_VOICE_CLONE_MODEL,
-            XIAOMI_MIMO_V2_TTS_MODEL,
-        ],
+        ApiProvider::XiaomiMimo => vec![DEFAULT_XIAOMI_MIMO_MODEL, XIAOMI_MIMO_V2_5_OMNI_MODEL],
         ApiProvider::Novita => vec![DEFAULT_NOVITA_MODEL, DEFAULT_NOVITA_FLASH_MODEL],
         ApiProvider::Fireworks => vec![DEFAULT_FIREWORKS_MODEL],
         ApiProvider::Siliconflow => {
@@ -1347,9 +1375,6 @@ pub struct ContextConfig {
     pub l2_threshold: Option<usize>,
     #[serde(default)]
     pub l3_threshold: Option<usize>,
-    /// Hard cycle boundary. Default: 768000.
-    #[serde(default)]
-    pub cycle_threshold: Option<usize>,
     /// Model used for seam/briefing work. Default: "deepseek-v4-flash".
     #[serde(default)]
     pub seam_model: Option<String>,
@@ -1798,7 +1823,7 @@ pub struct ProvidersConfig {
     pub volcengine: ProviderConfig,
     #[serde(default)]
     pub openrouter: ProviderConfig,
-    #[serde(default)]
+    #[serde(default, alias = "xiaomi", alias = "mimo", alias = "xiaomimimo")]
     pub xiaomi_mimo: ProviderConfig,
     #[serde(default)]
     pub novita: ProviderConfig,
@@ -2123,6 +2148,29 @@ impl Config {
         })
     }
 
+    pub(crate) fn provider_config_for_mut(&mut self, provider: ApiProvider) -> &mut ProviderConfig {
+        let providers = self.providers.get_or_insert_with(ProvidersConfig::default);
+        match provider {
+            ApiProvider::Deepseek => &mut providers.deepseek,
+            ApiProvider::DeepseekCN => &mut providers.deepseek_cn,
+            ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
+            ApiProvider::Openai => &mut providers.openai,
+            ApiProvider::Atlascloud => &mut providers.atlascloud,
+            ApiProvider::WanjieArk => &mut providers.wanjie_ark,
+            ApiProvider::Openrouter => &mut providers.openrouter,
+            ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
+            ApiProvider::Novita => &mut providers.novita,
+            ApiProvider::Fireworks => &mut providers.fireworks,
+            ApiProvider::Siliconflow => &mut providers.siliconflow,
+            ApiProvider::Arcee => &mut providers.arcee,
+            ApiProvider::Moonshot => &mut providers.moonshot,
+            ApiProvider::Sglang => &mut providers.sglang,
+            ApiProvider::Vllm => &mut providers.vllm,
+            ApiProvider::Ollama => &mut providers.ollama,
+            ApiProvider::Volcengine => &mut providers.volcengine,
+        }
+    }
+
     pub(crate) fn provider_config(&self) -> Option<&ProviderConfig> {
         self.provider_config_for(self.api_provider())
     }
@@ -2181,15 +2229,24 @@ impl Config {
             return DEFAULT_KIMI_CODE_MODEL.to_string();
         }
         if let Some(model) = self.default_text_model.as_deref()
+            && model.trim().eq_ignore_ascii_case("auto")
+        {
+            return "auto".to_string();
+        }
+        if provider == ApiProvider::XiaomiMimo
+            && let Some(model) = self.default_text_model.as_deref()
+            && let Some(canonical) = canonical_xiaomi_mimo_model_id(model)
+        {
+            return canonical.to_string();
+        }
+        if provider == ApiProvider::XiaomiMimo {
+            return DEFAULT_XIAOMI_MIMO_MODEL.to_string();
+        }
+        if let Some(model) = self.default_text_model.as_deref()
             && (provider_passes_model_through(provider)
                 || self.active_provider_preserves_custom_base_url_model())
         {
             return model.trim().to_string();
-        }
-        if let Some(model) = self.default_text_model.as_deref()
-            && model.trim().eq_ignore_ascii_case("auto")
-        {
-            return "auto".to_string();
         }
         if let Some(model) = self.default_text_model.as_deref()
             && let Some(normalized) = normalize_model_name_for_provider(provider, model)
@@ -3993,10 +4050,6 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
                 .context
                 .l3_threshold
                 .or(base.context.l3_threshold),
-            cycle_threshold: override_cfg
-                .context
-                .cycle_threshold
-                .or(base.context.cycle_threshold),
             seam_model: override_cfg.context.seam_model.or(base.context.seam_model),
         },
         subagents: override_cfg.subagents.or(base.subagents),
@@ -6697,7 +6750,10 @@ api_key = "old-openrouter-key"
                 "trinity-large-thinking",
                 OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL,
             ),
+            ("qwen3.6-flash", OPENROUTER_QWEN_3_6_FLASH_MODEL),
             ("qwen3.6-35b-a3b", OPENROUTER_QWEN_3_6_35B_A3B_MODEL),
+            ("qwen3.6-max-preview", OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL),
+            ("qwen3.6-plus", OPENROUTER_QWEN_3_6_PLUS_MODEL),
             ("mimo-v2.5-pro", OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL),
             ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
             ("minimax-m3", OPENROUTER_MINIMAX_M3_MODEL),
@@ -6716,7 +6772,10 @@ api_key = "old-openrouter-key"
         for (alias, expected) in [
             ("trinity", DEFAULT_ARCEE_MODEL),
             ("arcee-trinity", DEFAULT_ARCEE_MODEL),
-            ("arcee-trinity-mini", DEFAULT_ARCEE_MODEL),
+            ("trinity-large-thinking", DEFAULT_ARCEE_MODEL),
+            ("arcee-trinity-large-thinking", DEFAULT_ARCEE_MODEL),
+            ("arcee-trinity-mini", ARCEE_TRINITY_MINI_MODEL),
+            ("trinity-mini", ARCEE_TRINITY_MINI_MODEL),
             (
                 "arcee-trinity-large-preview",
                 ARCEE_TRINITY_LARGE_PREVIEW_MODEL,
@@ -6731,7 +6790,11 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
-    fn normalize_xiaomi_mimo_tts_aliases_for_provider() {
+    fn normalize_xiaomi_mimo_aliases_for_provider() {
+        assert_eq!(
+            normalize_model_name_for_provider(ApiProvider::XiaomiMimo, "omni").as_deref(),
+            Some("mimo-v2.5")
+        );
         assert_eq!(
             normalize_model_name_for_provider(ApiProvider::XiaomiMimo, "tts").as_deref(),
             Some("mimo-v2.5-tts")
@@ -6747,17 +6810,27 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
-    fn model_completion_names_for_xiaomi_mimo_include_tts_models() {
+    fn model_completion_names_for_xiaomi_mimo_include_chat_models() {
         let models = model_completion_names_for_provider(ApiProvider::XiaomiMimo);
-        for expected in [
-            "mimo-v2.5-pro",
-            "mimo-v2.5",
+        for expected in ["mimo-v2.5-pro", "mimo-v2.5"] {
+            assert!(models.contains(&expected), "missing {expected}");
+        }
+        for deprecated in ["mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"] {
+            assert!(
+                !models.contains(&deprecated),
+                "{deprecated} is deprecated and should not be promoted"
+            );
+        }
+        for speech_model in [
             "mimo-v2.5-tts",
             "mimo-v2.5-tts-voicedesign",
             "mimo-v2.5-tts-voiceclone",
             "mimo-v2-tts",
         ] {
-            assert!(models.contains(&expected), "missing {expected}");
+            assert!(
+                !models.contains(&speech_model),
+                "{speech_model} belongs in speech/TTS selection, not /model"
+            );
         }
     }
 
@@ -6779,7 +6852,11 @@ api_key = "old-openrouter-key"
             OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL,
             OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL,
             OPENROUTER_MINIMAX_M3_MODEL,
+            OPENROUTER_QWEN_3_6_FLASH_MODEL,
             OPENROUTER_QWEN_3_6_35B_A3B_MODEL,
+            OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL,
+            OPENROUTER_QWEN_3_6_27B_MODEL,
+            OPENROUTER_QWEN_3_6_PLUS_MODEL,
             OPENROUTER_GEMMA_4_31B_MODEL,
         ] {
             assert!(models.contains(&expected), "missing {expected}");
@@ -6818,7 +6895,6 @@ api_key = "old-openrouter-key"
         let config = Config::default();
         assert!(!config.context.enabled.unwrap_or(false));
         assert_eq!(config.context.l1_threshold.unwrap_or(192_000), 192_000);
-        assert_eq!(config.context.cycle_threshold.unwrap_or(768_000), 768_000);
         assert_eq!(
             config
                 .context
@@ -6859,7 +6935,6 @@ api_key = "old-openrouter-key"
             l1_threshold = 111
             l2_threshold = 222
             l3_threshold = 333
-            cycle_threshold = 444
             "#,
         )?;
 
@@ -7232,6 +7307,45 @@ http_headers = { "X-Model-Provider-Id" = "from-file" }
         assert_eq!(config.api_provider(), ApiProvider::XiaomiMimo);
         assert_eq!(config.default_model(), DEFAULT_XIAOMI_MIMO_MODEL);
         assert_eq!(config.deepseek_base_url(), DEFAULT_XIAOMI_MIMO_BASE_URL);
+        Ok(())
+    }
+
+    #[test]
+    fn xiaomi_mimo_provider_ignores_non_mimo_root_default_model() -> Result<()> {
+        let config = Config {
+            provider: Some("xiaomi-mimo".to_string()),
+            default_text_model: Some(DEFAULT_OPENROUTER_MODEL.to_string()),
+            ..Default::default()
+        };
+
+        config.validate()?;
+        assert_eq!(config.api_provider(), ApiProvider::XiaomiMimo);
+        assert_eq!(config.default_model(), DEFAULT_XIAOMI_MIMO_MODEL);
+        Ok(())
+    }
+
+    #[test]
+    fn xiaomi_provider_alias_table_maps_to_mimo_config() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+provider = "xiaomi-mimo"
+default_text_model = "deepseek/deepseek-v4-pro"
+
+[providers.xiaomi]
+api_key = "mimo-table-key"
+base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
+model = "mimo-v2.5-pro"
+"#,
+        )?;
+
+        config.validate()?;
+        assert_eq!(config.api_provider(), ApiProvider::XiaomiMimo);
+        assert_eq!(config.deepseek_api_key()?, "mimo-table-key");
+        assert_eq!(
+            config.deepseek_base_url(),
+            "https://token-plan-sgp.xiaomimimo.com/v1"
+        );
+        assert_eq!(config.default_model(), DEFAULT_XIAOMI_MIMO_MODEL);
         Ok(())
     }
 
@@ -8964,6 +9078,11 @@ model = "deepseek-ai/deepseek-v4-pro"
                 262_144,
                 262_144,
             ),
+            (OPENROUTER_QWEN_3_6_FLASH_MODEL, 1_000_000, 65_536),
+            (OPENROUTER_QWEN_3_6_35B_A3B_MODEL, 262_144, 262_140),
+            (OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL, 262_144, 65_536),
+            (OPENROUTER_QWEN_3_6_27B_MODEL, 262_144, 262_140),
+            (OPENROUTER_QWEN_3_6_PLUS_MODEL, 1_000_000, 65_536),
             (OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL, 1_000_000, 131_072),
             (OPENROUTER_MINIMAX_M3_MODEL, 1_000_000, 524_288),
         ] {
@@ -8982,10 +9101,25 @@ model = "deepseek-ai/deepseek-v4-pro"
 
     #[test]
     fn provider_capability_arcee_direct_models_use_api_docs_shape() {
-        for model in [DEFAULT_ARCEE_MODEL, ARCEE_TRINITY_LARGE_PREVIEW_MODEL] {
+        let thinking_cap = provider_capability(ApiProvider::Arcee, DEFAULT_ARCEE_MODEL);
+        assert_eq!(thinking_cap.context_window, 262_144);
+        assert_eq!(thinking_cap.max_output, 262_144);
+        assert!(thinking_cap.thinking_supported);
+        assert!(!thinking_cap.cache_telemetry_supported);
+        assert_eq!(
+            thinking_cap.request_payload_mode,
+            RequestPayloadMode::ChatCompletions
+        );
+
+        for model in [ARCEE_TRINITY_LARGE_PREVIEW_MODEL, ARCEE_TRINITY_MINI_MODEL] {
             let cap = provider_capability(ApiProvider::Arcee, model);
 
-            assert_eq!(cap.context_window, 128_000);
+            let expected_window = if model == ARCEE_TRINITY_LARGE_PREVIEW_MODEL {
+                262_144
+            } else {
+                128_000
+            };
+            assert_eq!(cap.context_window, expected_window);
             assert_eq!(cap.max_output, 4096);
             assert!(!cap.thinking_supported);
             assert!(!cap.cache_telemetry_supported);
@@ -9000,7 +9134,7 @@ model = "deepseek-ai/deepseek-v4-pro"
     fn provider_capability_xiaomi_mimo_has_thinking_no_cache() {
         let cap = provider_capability(ApiProvider::XiaomiMimo, DEFAULT_XIAOMI_MIMO_MODEL);
         assert_eq!(cap.context_window, 1_000_000);
-        assert_eq!(cap.max_output, 128_000);
+        assert_eq!(cap.max_output, 131_072);
         assert!(cap.thinking_supported);
         assert!(!cap.cache_telemetry_supported);
         assert_eq!(

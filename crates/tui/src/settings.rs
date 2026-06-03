@@ -322,17 +322,13 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // v0.8.11: default flipped to `false` to stop the engine from
-            // routinely rewriting the prompt prefix, which breaks DeepSeek
-            // V4's prefix cache (~90% discount on cached prefix tokens) and
-            // ends up costing more than the compaction itself saves. With
-            // V4's 1M-token window the user has plenty of headroom to run
-            // long sessions without auto-trimming, and the explicit
-            // `/compact` slash command + `auto_compact = on` opt-in remain
-            // available for users / agents that decide compaction is
-            // worth the cache hit on their workload (#664).
+            // Keep the persisted fallback `false`; startup code may enable
+            // auto-compaction by model window when the user has not saved an
+            // explicit preference. V4-class 1M-token models stay opt-in to
+            // preserve prefix-cache behavior, while 256K-class models default
+            // on at the configured percent threshold.
             auto_compact: false,
-            auto_compact_threshold_percent: 70.0,
+            auto_compact_threshold_percent: 80.0,
             calm_mode: false,
             low_motion: false,
             fancy_animations: true,
@@ -426,6 +422,23 @@ impl Settings {
         };
         settings.apply_env_overrides();
         Ok(settings)
+    }
+
+    /// Whether the user explicitly persisted an `auto_compact` preference.
+    /// When absent, callers may choose a model-aware default.
+    pub fn auto_compact_explicitly_configured() -> bool {
+        let Ok(path) = Self::path() else {
+            return false;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+            return false;
+        };
+        value
+            .as_table()
+            .is_some_and(|table| table.contains_key("auto_compact"))
     }
 
     /// Apply environment-driven overlays after disk load. Used for
@@ -826,7 +839,7 @@ impl Settings {
             ),
             (
                 "auto_compact_threshold_percent",
-                "Auto-compact trigger threshold percent when auto_compact is on: 10-100 (default 70)",
+                "Auto-compact trigger threshold percent when auto_compact is on: 10-100 (default 80)",
             ),
             ("calm_mode", "Calmer UI defaults: on/off"),
             (
@@ -1222,7 +1235,7 @@ mod tests {
         // flipped so the cache-friendly path is the one users get
         // without configuring anything (#664).
         assert!(!settings.auto_compact);
-        assert_eq!(settings.auto_compact_threshold_percent, 70.0);
+        assert_eq!(settings.auto_compact_threshold_percent, 80.0);
     }
 
     #[test]

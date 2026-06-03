@@ -17,10 +17,12 @@ use crate::config::{
 };
 use crate::config_ui::ConfigUiMode;
 use crate::core::coherence::CoherenceState;
-use crate::cycle_manager::{CycleBriefing, CycleConfig};
 use crate::hooks::{HookContext, HookEvent, HookExecutor, HookResult};
 use crate::localization::{Locale, MessageId, resolve_locale, tr};
-use crate::models::{Message, SystemPrompt, Tool, compaction_threshold_for_model_and_effort};
+use crate::models::{
+    Message, SystemPrompt, Tool, auto_compact_default_for_model,
+    compaction_threshold_for_model_at_percent,
+};
 use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::session_manager::SessionContextReference;
@@ -606,7 +608,7 @@ fn looks_like_raw_mouse_report_fragment(run: &[char]) -> bool {
 ///   first BEL (`\x07`), `\x1b\\`, lone `\\`, or the next `\x1b]8;`
 ///   block — terminator characters are optional because crossterm may
 ///   have already consumed them.
-/// - **Kitty CSI**: `(\x1b?) [ (? | > | =) ... u` — the `?`/`>`/`=`
+/// - **Kitty CSI**: `(\x1b?) [ (? | > | < | =) ... u` — the
 ///   private-parameter prefix is what distinguishes a Kitty response
 ///   from a user-typed `[…u` (which is exceedingly rare and would
 ///   need an explicit private-parameter byte to be a real CSI).
@@ -711,8 +713,8 @@ fn match_osc8_fragment(chars: &[char], start: usize) -> Option<usize> {
 }
 
 /// If a Kitty keyboard protocol CSI fragment starts at `chars[start]`,
-/// return its end index (exclusive). Shape: `(ESC)? [ (? | > | =)
-/// [0-9;:]* u`. The private-parameter byte (`?`, `>`, `=`) is what
+/// return its end index (exclusive). Shape: `(ESC)? [ (? | > | < | =)
+/// [0-9;:]* u`. The private-parameter byte (`?`, `>`, `<`, `=`) is what
 /// keeps this distinct from text the user might plausibly type.
 fn match_kitty_csi_fragment(chars: &[char], start: usize) -> Option<usize> {
     let after_csi = if chars.get(start) == Some(&'\x1b') && chars.get(start + 1) == Some(&'[') {
@@ -724,7 +726,7 @@ fn match_kitty_csi_fragment(chars: &[char], start: usize) -> Option<usize> {
     };
 
     let priv_byte = chars.get(after_csi)?;
-    if !matches!(priv_byte, '?' | '>' | '=') {
+    if !matches!(priv_byte, '?' | '>' | '<' | '=') {
         return None;
     }
 
@@ -979,6 +981,10 @@ pub struct ViewportState {
     pub transcript_scrollbar_dragging: bool,
     pub last_transcript_area: Option<Rect>,
     pub last_composer_area: Option<Rect>,
+    /// Outer rect of the right-hand sidebar (when visible), stored at render
+    /// time so mouse hit-testing can keep scroll events over the sidebar from
+    /// leaking into the transcript viewport.
+    pub last_sidebar_area: Option<Rect>,
     pub last_transcript_top: usize,
     pub last_transcript_visible: usize,
     pub last_transcript_total: usize,
@@ -1007,6 +1013,7 @@ impl Default for ViewportState {
             transcript_scrollbar_dragging: false,
             last_transcript_area: None,
             last_composer_area: None,
+            last_sidebar_area: None,
             last_transcript_top: 0,
             last_transcript_visible: 0,
             last_transcript_total: 0,
@@ -1175,6 +1182,9 @@ pub struct App {
     /// Last status text already promoted from `status_message` into toast state.
     pub last_status_message_seen: Option<String>,
     pub model: String,
+    /// Persisted model selections by provider name. Loaded from settings so
+    /// `/model` and the picker can surface saved provider-specific choices.
+    pub provider_models: HashMap<String, String>,
     /// When true, the model is auto-selected based on request complexity
     /// rather than using a fixed model. The `/model auto` command sets this.
     /// `dispatch_user_message` calls `auto_model_heuristic` to resolve the
@@ -1237,6 +1247,7 @@ pub struct App {
     #[allow(dead_code)]
     pub system_prompt: Option<SystemPrompt>,
     pub auto_compact: bool,
+    pub auto_compact_user_configured: bool,
     pub auto_compact_threshold_percent: f64,
     pub calm_mode: bool,
     pub low_motion: bool,
@@ -1536,14 +1547,6 @@ pub struct App {
     /// states. See [`App::arm_quit`] / [`App::quit_is_armed`].
     pub quit_armed_until: Option<Instant>,
 
-    /// Number of checkpoint-restart cycles crossed in this session
-    /// (issue #124). Mirrors `Session.cycle_count` on the engine side.
-    pub cycle_count: u32,
-
-    /// Briefings produced at past cycle boundaries, in chronological order.
-    /// Used by `/cycles` and `/cycle <n>` slash commands.
-    pub cycle_briefings: Vec<CycleBriefing>,
-
     // === Prefix-Cache Stability Tracking ===
     /// Number of times the prefix (system prompt + tool specs) has changed.
     pub prefix_change_count: u64,
@@ -1557,10 +1560,6 @@ pub struct App {
     /// Updated per-turn via PrefixCacheChange events; surfaced by
     /// `/cache stats` for cache-hit debugging.
     pub last_pinned_prefix_hash: Option<String>,
-
-    /// Active cycle configuration (token threshold, briefing cap, per-model
-    /// overrides). Loaded from config and forwarded to the engine.
-    pub cycle: CycleConfig,
 
     // === Transcript filtering (#397) ===
     /// Transcript cells the user has collapsed (hidden from view).
@@ -1753,8 +1752,15 @@ impl App {
         let settings = Settings::load().unwrap_or_else(|_| Settings::default());
         let mut provider = config.api_provider();
 
-        // Let settings override the config provider so runtime switches survive restarts.
-        if let Some(ref provider_str) = settings.default_provider
+        // Let settings preserve runtime switches only when config/CLI did not
+        // explicitly select a provider. A configured provider must not be
+        // pushed back to a stale saved setting on restart.
+        if config
+            .provider
+            .as_deref()
+            .and_then(ApiProvider::parse)
+            .is_none()
+            && let Some(ref provider_str) = settings.default_provider
             && let Some(parsed) = ApiProvider::parse(provider_str)
         {
             provider = parsed;
@@ -1770,7 +1776,8 @@ impl App {
         let api_key_env_only =
             crate::config::active_provider_uses_env_only_api_key(&effective_auth_config);
         let was_onboarded = crate::tui::onboarding::is_onboarded();
-        let auto_compact = settings.auto_compact;
+        let settings_auto_compact = settings.auto_compact;
+        let auto_compact_user_configured = Settings::auto_compact_explicitly_configured();
         let auto_compact_threshold_percent = settings.auto_compact_threshold_percent;
         let calm_mode = settings.calm_mode;
         let low_motion = settings.low_motion;
@@ -1808,10 +1815,10 @@ impl App {
         {
             ui_theme = ui_theme.with_background_color(background);
         }
-        let model = settings
-            .provider_models
-            .as_ref()
-            .and_then(|m| m.get(provider.as_str()).cloned())
+        let provider_models = settings.provider_models.clone().unwrap_or_default();
+        let model = provider_models
+            .get(provider.as_str())
+            .cloned()
             .or_else(|| {
                 // default_model is a DeepSeek-centric setting; other providers
                 // get their model from config.toml / env (e.g. OPENAI_MODEL).
@@ -1832,8 +1839,15 @@ impl App {
         } else {
             model.as_str()
         };
-        let compact_threshold =
-            compaction_threshold_for_model_and_effort(threshold_model, configured_reasoning_effort);
+        let compact_threshold = compaction_threshold_for_model_at_percent(
+            threshold_model,
+            auto_compact_threshold_percent,
+        );
+        let auto_compact = if auto_compact_user_configured {
+            settings_auto_compact
+        } else {
+            auto_compact_default_for_model(threshold_model)
+        };
         let reasoning_effort = if auto_model {
             ReasoningEffort::Auto
         } else {
@@ -1950,6 +1964,7 @@ impl App {
             sticky_status: None,
             last_status_message_seen: None,
             model,
+            provider_models,
             auto_model,
             last_effective_model: None,
             api_provider: provider,
@@ -1970,6 +1985,7 @@ impl App {
             bracketed_paste_seen: false,
             system_prompt: None,
             auto_compact,
+            auto_compact_user_configured,
             auto_compact_threshold_percent,
             calm_mode,
             low_motion,
@@ -2109,14 +2125,11 @@ impl App {
             last_submitted_prompt: None,
             auto_submit_initial_input,
             quit_armed_until: None,
-            cycle_count: 0,
-            cycle_briefings: Vec::new(),
             prefix_change_count: 0,
             prefix_checks_total: 0,
             prefix_stability_pct: None,
             last_prefix_change_desc: None,
             last_pinned_prefix_hash: None,
-            cycle: CycleConfig::default(),
             collapsed_cells: HashSet::new(),
             folded_thinking: HashSet::new(),
             collapsed_cell_map: Vec::new(),
@@ -4708,7 +4721,10 @@ impl App {
     pub fn update_model_compaction_budget(&mut self) {
         let model = self.effective_model_for_budget().to_string();
         self.compact_threshold =
-            compaction_threshold_for_model_and_effort(&model, self.reasoning_effort.api_value());
+            compaction_threshold_for_model_at_percent(&model, self.auto_compact_threshold_percent);
+        if !self.auto_compact_user_configured {
+            self.auto_compact = auto_compact_default_for_model(&model);
+        }
     }
 
     pub fn set_model_selection(&mut self, model: String) {
@@ -4779,12 +4795,6 @@ impl App {
             model: self.effective_model_for_budget().to_string(),
             ..Default::default()
         }
-    }
-
-    /// Forward the active cycle configuration to the engine. Cloned so the
-    /// engine has its own copy to mutate per-session.
-    pub fn cycle_config(&self) -> CycleConfig {
-        self.cycle.clone()
     }
 }
 
@@ -5117,6 +5127,78 @@ mod tests {
     }
 
     #[test]
+    fn explicit_config_provider_wins_over_saved_default_provider() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "default_provider = \"deepseek\"\ndefault_model = \"deepseek-v4-pro\"\n",
+        )
+        .expect("settings");
+        let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+
+        let config = Config {
+            provider: Some("xiaomi-mimo".to_string()),
+            providers: Some(ProvidersConfig {
+                xiaomi_mimo: ProviderConfig {
+                    api_key: Some("mimo-config-key".to_string()),
+                    model: Some("mimo-v2.5-pro".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let mut options = test_options(false);
+        options.model = "mimo-v2.5-pro".to_string();
+        let app = App::new(options, &config);
+
+        assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+        assert_eq!(app.model, "mimo-v2.5-pro");
+        assert!(
+            !app.onboarding_needs_api_key,
+            "Xiaomi MiMo provider config key should satisfy startup auth"
+        );
+    }
+
+    #[test]
+    fn app_new_defaults_auto_compact_on_for_256k_class_models_when_unset() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+
+        let mut options = test_options(false);
+        options.model = "trinity-large-thinking".to_string();
+        let app = App::new(options, &Config::default());
+
+        assert!(app.auto_compact);
+        assert!(!app.auto_compact_user_configured);
+        assert_eq!(app.auto_compact_threshold_percent, 80.0);
+        assert_eq!(app.compact_threshold, 209_715);
+    }
+
+    #[test]
+    fn app_new_respects_explicit_auto_compact_false_for_256k_class_models() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(tmp.path().join("settings.toml"), "auto_compact = false\n")
+            .expect("settings");
+        let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+
+        let mut options = test_options(false);
+        options.model = "trinity-large-thinking".to_string();
+        let app = App::new(options, &Config::default());
+
+        assert!(!app.auto_compact);
+        assert!(app.auto_compact_user_configured);
+        assert_eq!(app.compact_threshold, 209_715);
+    }
+
+    #[test]
     fn sidebar_focus_accepts_work_and_maps_legacy_trackers_to_work() {
         assert_eq!(SidebarFocus::from_setting("auto"), SidebarFocus::Auto);
         assert_eq!(SidebarFocus::from_setting("work"), SidebarFocus::Work);
@@ -5328,9 +5410,9 @@ mod tests {
         app.insert_str("ready ");
 
         // Kitty keyboard protocol responses look like `\x1b[?1u`,
-        // `\x1b[>1u`, or `\x1b[?u`. With the ESC consumed, the tail
-        // shape is `[?…u` or `[>…u`.
-        app.insert_str("[?1u[>1u[?u");
+        // `\x1b[>1u`, `\x1b[<1u`, or `\x1b[?u`. With the ESC consumed,
+        // the tail shape is `[?…u`, `[>…u`, or `[<…u`.
+        app.insert_str("[?1u[>1u[<1u[?u");
 
         assert_eq!(app.input, "ready ");
         assert_eq!(app.cursor_position, "ready ".chars().count());
@@ -6079,14 +6161,31 @@ mod tests {
     #[test]
     fn test_update_model_compaction_budget() {
         let mut app = App::new(test_options(false), &Config::default());
+        // Pin the inputs so the budget math is deterministic and does not
+        // depend on the developer's local `auto_compact_threshold_percent`
+        // setting (App::new loads real settings) or on auto-model resolution.
+        app.auto_model = false;
+        app.auto_compact_threshold_percent = 80.0;
+
+        // A large-context model earns a proportionally larger compaction
+        // budget; an unknown model falls back to the fixed default threshold.
+        app.model = "deepseek-v4-pro".to_string();
+        app.update_model_compaction_budget();
+        let large_window_threshold = app.compact_threshold;
+
         app.model = "unknown-test-model".to_string();
         app.update_model_compaction_budget();
-        let initial_threshold = app.compact_threshold;
-        app.model = "deepseek-v3.2-128k".to_string();
-        app.update_model_compaction_budget();
-        // Threshold may have changed based on model
-        // Explicit 128k DeepSeek model IDs have a higher threshold than unknown models.
-        assert!(app.compact_threshold >= initial_threshold);
+        let unknown_threshold = app.compact_threshold;
+
+        assert!(
+            unknown_threshold > 0,
+            "unknown model must still get a positive budget"
+        );
+        assert!(
+            large_window_threshold > unknown_threshold,
+            "a large-context model ({large_window_threshold}) should budget more \
+             than an unknown model ({unknown_threshold})"
+        );
     }
 
     #[test]

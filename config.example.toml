@@ -45,13 +45,14 @@ base_url = "https://api.deepseek.com/beta"
 #   deepseek-ai/deepseek-v4-flash   — default AtlasCloud model ID
 #   deepseek-reasoner               — default Wanjie Ark model ID
 #   mimo-v2.5-pro                   — default Xiaomi MiMo model ID
-#   mimo-v2.5-tts                   ? Xiaomi MiMo speech/TTS model ID
-#   mimo-v2.5-tts-voicedesign       ? Xiaomi MiMo voice-design TTS model ID
-#   mimo-v2.5-tts-voiceclone        ? Xiaomi MiMo voice-clone TTS model ID
+#   mimo-v2.5                       — Xiaomi MiMo V2.5 Omni model ID
+#   mimo-v2.5-tts                   — Xiaomi MiMo speech/TTS model ID
+#   mimo-v2.5-tts-voicedesign       — Xiaomi MiMo voice-design TTS model ID
+#   mimo-v2.5-tts-voiceclone        — Xiaomi MiMo voice-clone TTS model ID
 #   accounts/fireworks/models/deepseek-v4-pro — Fireworks AI Pro model ID
 #   deepseek-ai/DeepSeek-V4-Pro      — SiliconFlow hosted Pro model ID
 #   deepseek-ai/DeepSeek-V4-Flash    — SiliconFlow hosted Flash model ID
-#   trinity-mini                     — default direct Arcee AI API model ID
+#   trinity-large-thinking           — default direct Arcee AI API model ID
 #   trinity-large-preview            — direct Arcee AI API model ID
 #   deepseek-ai/DeepSeek-V4-Pro      — SGLang self-hosted Pro model ID
 #   deepseek-ai/DeepSeek-V4-Flash    — SGLang self-hosted Flash model ID
@@ -304,7 +305,8 @@ max_subagents = 10 # optional (1-20)
 # base_url = "https://openrouter.ai/api/v1"
 # model = "deepseek/deepseek-v4-pro"
 # Recent large model IDs also accepted here include arcee-ai/trinity-large-thinking,
-# xiaomi/mimo-v2.5-pro, qwen/qwen3.6-35b-a3b,
+# xiaomi/mimo-v2.5-pro, qwen/qwen3.6-flash, qwen/qwen3.6-35b-a3b,
+# qwen/qwen3.6-max-preview, qwen/qwen3.6-27b, qwen/qwen3.6-plus,
 # google/gemma-4-31b-it, z-ai/glm-5.1, moonshotai/kimi-k2.6, and
 # nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free.
 
@@ -313,6 +315,7 @@ max_subagents = 10 # optional (1-20)
 # api_key = "YOUR_XIAOMI_KEY"
 # base_url = "https://api.xiaomimimo.com/v1"
 # model = "mimo-v2.5-pro"              # chat/reasoning
+# Chat model IDs: mimo-v2.5-pro, mimo-v2.5
 # TTS aliases are also accepted by `codewhale speech`: tts, voice-design, voice-clone
 # TTS model IDs: mimo-v2.5-tts, mimo-v2.5-tts-voicedesign, mimo-v2.5-tts-voiceclone, mimo-v2-tts
 
@@ -338,7 +341,7 @@ max_subagents = 10 # optional (1-20)
 [providers.arcee]
 # api_key = "YOUR_ARCEE_API_KEY"
 # base_url = "https://api.arcee.ai/api/v1"
-# model = "trinity-mini"                    # or trinity-large-preview
+# model = "trinity-large-thinking"          # or trinity-large-preview
 
 # Moonshot/Kimi OpenAI-compatible endpoint (https://platform.moonshot.ai)
 [providers.moonshot]
@@ -510,7 +513,7 @@ exponential_base = 2.0
 # ─────────────────────────────────────────────────────────────────────────────────
 # Auto-compaction is a saved UI setting edited with `/config` (`auto_compact`).
 # The optional saved threshold setting is `auto_compact_threshold_percent`
-# (default 70, still gated by the 500K-token floor). There is no config-file
+# (default 80). There is no config-file
 # `[compaction]` table yet; runtime compaction budgets are chosen by the TUI
 # from the active model/context window.
 
@@ -524,9 +527,6 @@ verbatim_window_turns = 16
 l1_threshold = 192000
 l2_threshold = 384000
 l3_threshold = 576000
-# Hard cycle reserves the normal 262144-token internal turn budget plus 1024
-# safety tokens, separate from V4's official 384000 max-output metadata.
-cycle_threshold = 768000
 seam_model = "deepseek-v4-flash"
 
 # ─────────────────────────────────────────────────────────────────────────────────

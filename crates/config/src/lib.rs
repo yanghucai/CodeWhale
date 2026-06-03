@@ -38,12 +38,17 @@ const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
 const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
 const OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL: &str =
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
+const OPENROUTER_QWEN_3_6_FLASH_MODEL: &str = "qwen/qwen3.6-flash";
 const OPENROUTER_QWEN_3_6_35B_A3B_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL: &str = "qwen/qwen3.6-max-preview";
 const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
+const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
 const OPENROUTER_TENCENT_HY3_PREVIEW_MODEL: &str = "tencent/hy3-preview";
 const OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL: &str = "xiaomi/mimo-v2.5-pro";
 const OPENROUTER_XIAOMI_MIMO_V2_5_MODEL: &str = "xiaomi/mimo-v2.5";
 const DEFAULT_XIAOMI_MIMO_MODEL: &str = "mimo-v2.5-pro";
+const XIAOMI_MIMO_V2_5_OMNI_MODEL: &str = "mimo-v2.5";
+const XIAOMI_MIMO_ASR_MODEL: &str = "mimo-v2.5-asr";
 const XIAOMI_MIMO_TTS_MODEL: &str = "mimo-v2.5-tts";
 const XIAOMI_MIMO_TTS_VOICE_DESIGN_MODEL: &str = "mimo-v2.5-tts-voicedesign";
 const XIAOMI_MIMO_TTS_VOICE_CLONE_MODEL: &str = "mimo-v2.5-tts-voiceclone";
@@ -53,8 +58,9 @@ const DEFAULT_NOVITA_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
 const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/deepseek-v4-pro";
 const DEFAULT_SILICONFLOW_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 const DEFAULT_SILICONFLOW_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_ARCEE_MODEL: &str = "trinity-mini";
+const DEFAULT_ARCEE_MODEL: &str = "trinity-large-thinking";
 const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
+const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
 const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.6";
 const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
@@ -193,7 +199,7 @@ pub struct ProvidersToml {
     pub volcengine: ProviderConfigToml,
     #[serde(default)]
     pub openrouter: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, alias = "xiaomi", alias = "mimo", alias = "xiaomimimo")]
     pub xiaomi_mimo: ProviderConfigToml,
     #[serde(default)]
     pub novita: ProviderConfigToml,
@@ -1559,8 +1565,12 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             ProviderKind::Siliconflow,
             "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-v3",
         ) => DEFAULT_SILICONFLOW_FLASH_MODEL.to_string(),
-        (ProviderKind::Arcee, "trinity" | "arcee-trinity" | "arcee-trinity-mini") => {
-            DEFAULT_ARCEE_MODEL.to_string()
+        (
+            ProviderKind::Arcee,
+            "trinity" | "arcee-trinity" | "trinity-large-thinking" | "arcee-trinity-large-thinking",
+        ) => DEFAULT_ARCEE_MODEL.to_string(),
+        (ProviderKind::Arcee, "trinity-mini" | "arcee-trinity-mini") => {
+            ARCEE_TRINITY_MINI_MODEL.to_string()
         }
         (ProviderKind::Arcee, "arcee-trinity-large-preview") => {
             ARCEE_TRINITY_LARGE_PREVIEW_MODEL.to_string()
@@ -1595,8 +1605,22 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
         | "mimo-v2-5-pro"
         | "xiaomi-mimo-v2.5-pro"
         | "xiaomi-mimo-v2-5-pro" => Some(DEFAULT_XIAOMI_MIMO_MODEL),
-        "mimo-v2.5" | "mimo-v25" | "mimo-v2-5" | "xiaomi-mimo-v2.5" | "xiaomi-mimo-v2-5" => {
-            Some("mimo-v2.5")
+        "omni"
+        | "mimo-omni"
+        | "v2.5-omni"
+        | "v25-omni"
+        | "mimo-v2.5"
+        | "mimo-v25"
+        | "mimo-v2-5"
+        | "mimo-v2.5-omni"
+        | "mimo-v25-omni"
+        | "mimo-v2-5-omni"
+        | "xiaomi-mimo-v2.5"
+        | "xiaomi-mimo-v2-5"
+        | "xiaomi-mimo-v2.5-omni"
+        | "xiaomi-mimo-v2-5-omni" => Some(XIAOMI_MIMO_V2_5_OMNI_MODEL),
+        "asr" | "mimo-asr" | "mimo-v2.5-asr" | "speech-to-text" | "transcribe" => {
+            Some(XIAOMI_MIMO_ASR_MODEL)
         }
         "mimo-tts" | "mimo-v25-tts" | "mimo-v2.5-tts" | "tts" | "speech" => {
             Some(XIAOMI_MIMO_TTS_MODEL)
@@ -1646,8 +1670,18 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         | "qwen3.6-35b-a3b"
         | "qwen-3.6-35b-a3b"
         | "qwen3-6-35b-a3b" => Some(OPENROUTER_QWEN_3_6_35B_A3B_MODEL),
+        OPENROUTER_QWEN_3_6_FLASH_MODEL | "qwen3.6-flash" | "qwen-3.6-flash" => {
+            Some(OPENROUTER_QWEN_3_6_FLASH_MODEL)
+        }
+        OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL
+        | "qwen3.6-max-preview"
+        | "qwen-3.6-max-preview"
+        | "qwen-max-preview" => Some(OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL),
         OPENROUTER_QWEN_3_6_27B_MODEL | "qwen3.6-27b" | "qwen-3.6-27b" | "qwen3-6-27b" => {
             Some(OPENROUTER_QWEN_3_6_27B_MODEL)
+        }
+        OPENROUTER_QWEN_3_6_PLUS_MODEL | "qwen3.6-plus" | "qwen-3.6-plus" => {
+            Some(OPENROUTER_QWEN_3_6_PLUS_MODEL)
         }
         OPENROUTER_TENCENT_HY3_PREVIEW_MODEL | "hy3-preview" | "tencent-hy3-preview" => {
             Some(OPENROUTER_TENCENT_HY3_PREVIEW_MODEL)
@@ -3693,7 +3727,39 @@ unix_socket_path = "/tmp/cw-hooks.sock"
     }
 
     #[test]
-    fn xiaomi_mimo_tts_aliases_resolve_to_canonical_models() {
+    fn xiaomi_provider_alias_table_maps_to_mimo_runtime_config() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let config: ConfigToml = toml::from_str(
+            r#"
+provider = "xiaomi-mimo"
+default_text_model = "deepseek/deepseek-v4-pro"
+
+[providers.xiaomi]
+api_key = "mimo-table-key"
+base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
+model = "mimo-v2.5-pro"
+"#,
+        )
+        .expect("xiaomi provider alias config");
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::XiaomiMimo);
+        assert_eq!(resolved.api_key.as_deref(), Some("mimo-table-key"));
+        assert_eq!(
+            resolved.base_url,
+            "https://token-plan-sgp.xiaomimimo.com/v1"
+        );
+        assert_eq!(resolved.model, DEFAULT_XIAOMI_MIMO_MODEL);
+    }
+
+    #[test]
+    fn xiaomi_mimo_aliases_resolve_to_canonical_models() {
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::XiaomiMimo, "omni"),
+            "mimo-v2.5"
+        );
         assert_eq!(
             normalize_model_for_provider(ProviderKind::XiaomiMimo, "tts"),
             "mimo-v2.5-tts"
@@ -4343,7 +4409,10 @@ unix_socket_path = "/tmp/cw-hooks.sock"
                 "trinity-large-thinking",
                 OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL,
             ),
+            ("qwen3.6-flash", OPENROUTER_QWEN_3_6_FLASH_MODEL),
             ("qwen3.6-35b-a3b", OPENROUTER_QWEN_3_6_35B_A3B_MODEL),
+            ("qwen3.6-max-preview", OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL),
+            ("qwen3.6-plus", OPENROUTER_QWEN_3_6_PLUS_MODEL),
             ("mimo-v2.5-pro", OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL),
             ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
             ("gemma-4-31b-it", OPENROUTER_GEMMA_4_31B_MODEL),

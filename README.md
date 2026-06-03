@@ -104,18 +104,19 @@ for authority in a single turn. LLM-as-a-judge needs jurisdiction — which
 source wins when they disagree?
 
 CodeWhale answers this with a **Constitution** (`prompts/base.md`). It's a
-formal hierarchy of law — Article VII ranks nine sources from the
+formal hierarchy of law — Article VII ranks nine tiers from the
 Constitution's own articles down to prior-session handoffs. The user's
 current message outranks stale project instructions. Live tool output
 outranks assumptions. Verification outranks confidence. The model inherits
 a clear chain of authority every turn and never has to guess which
 directive to follow.
 
-Seven articles sit above the hierarchy, defining the model's identity,
-duties, and agency: a verification mandate (Article V — every action leaves
-evidence, never declare success on faith), a coordination legacy (Article
-VI — leave the workspace legible for the next intelligence), and a
-primacy-of-truth clause (Article II — no lower rule may override it).
+Six Articles define the model's identity, duties, and agency (Article VII
+is the hierarchy itself): a verification mandate (Article V — every action
+leaves evidence, never declare success on faith), a coordination legacy
+(Article VI — leave the workspace cleaner and the handoff truthful for the
+next intelligence), and a primacy-of-truth clause (Article II —
+non-negotiable; not even a user request may override the duty of truth).
 
 DeepSeek V4's prefix caching makes this practical. The Constitution is long
 and detailed, but once cached it costs roughly 100× less per turn than a
@@ -320,14 +321,45 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
 codewhale --provider openrouter --model arcee-ai/trinity-large-thinking
 codewhale --provider openrouter --model minimax/minimax-m3
 
-# Arcee AI direct API
+Arcee AI offers direct API access to its powerful Trinity models, including the reasoning-capable Trinity-Large Thinking. This section provides comprehensive setup instructions and model comparisons.
+
+## Configuration
+
+### API Key
+The primary authentication method is the `ARCEE_API_KEY` environment variable or the `[providers.arcee]` configuration section in `~/.codewhale/config.toml`:
+
+```toml
+[providers.arcee]
+# api_key = "your-arcee-api-key"
+# base_url = "https://api.arcee.ai/api/v1"
+# model = "trinity-large-thinking"  # or "trinity-large-preview", "trinity-mini"
+```
+
+### Environment Variables
+
+- `ARCEE_API_KEY`: Your Arcee API key (required)
+- `ARCEE_BASE_URL`: Custom base URL (optional, defaults to `https://api.arcee.ai/api/v1`)
+- `ARCEE_MODEL`: Default model to use (optional, defaults to `trinity-large-thinking`)
+
+### Model Support
+
+CodeWhale supports three Arcee models:
+
+| Model | Reasoning | Context Window | Max Output | Best For |
+|--------|-----------|----------------|------------|----------|
+| `trinity-large-thinking` | ✅ Yes | 262,144 tokens | 262,144 tokens | Complex reasoning, coding, math |
+| `trinity-large-preview` | ❌ No | 262,144 tokens | 4,096 tokens | High-accuracy non-reasoning tasks |
+| `trinity-mini` | ❌ No | 128,000 tokens | 4,096 tokens | Faster, cost-effective tasks |
+
+**Note:** The `trinity-large-thinking` model supports reasoning (thinking mode) and can handle very large contexts, making it ideal for complex programming tasks. The other models do not support reasoning but offer larger context windows than many other providers.
 codewhale auth set --provider arcee --api-key "YOUR_ARCEE_API_KEY"
-codewhale --provider arcee --model trinity-mini
+codewhale --provider arcee --model trinity-large-thinking
 codewhale --provider arcee --model trinity-large-preview
 
 # Xiaomi MiMo
 codewhale auth set --provider xiaomi-mimo --api-key "YOUR_XIAOMI_KEY"
 codewhale --provider xiaomi-mimo --model mimo-v2.5-pro
+codewhale --provider xiaomi-mimo --model mimo-v2.5
 codewhale --provider xiaomi-mimo speech "Hello from MiMo" --model tts -o hello.wav
 
 # Novita

@@ -784,7 +784,6 @@ fn write_provider_api_key_to_config(
     provider: ProviderKind,
     api_key: &str,
 ) {
-    store.config.provider = provider;
     store.config.auth_mode = Some("api_key".to_string());
     store.config.providers.for_provider_mut(provider).api_key = Some(api_key.to_string());
     if provider == ProviderKind::Deepseek {
@@ -987,7 +986,6 @@ fn run_auth_command_with_secrets(
             let provider: ProviderKind = provider.into();
             let slot = provider_slot(provider);
             if provider == ProviderKind::Ollama && api_key.is_none() && !api_key_stdin {
-                store.config.provider = provider;
                 let provider_cfg = store.config.providers.for_provider_mut(provider);
                 if provider_cfg.base_url.is_none() {
                     provider_cfg.base_url = Some("http://localhost:11434/v1".to_string());
@@ -2370,6 +2368,44 @@ mod tests {
     }
 
     #[test]
+    fn auth_set_provider_key_does_not_switch_active_provider() {
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "deepseek-cli-auth-set-preserve-provider-test-{}-{nanos}.toml",
+            std::process::id()
+        ));
+        let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
+        store.config.provider = ProviderKind::Deepseek;
+        let secrets = no_keyring_secrets();
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Set {
+                provider: ProviderArg::Arcee,
+                api_key: Some("arcee-key".to_string()),
+                api_key_stdin: false,
+            },
+            &secrets,
+        )
+        .expect("set should succeed");
+
+        assert_eq!(store.config.provider, ProviderKind::Deepseek);
+        assert_eq!(
+            store.config.providers.arcee.api_key.as_deref(),
+            Some("arcee-key")
+        );
+
+        let reloaded = ConfigStore::load(Some(path.clone())).expect("store should reload");
+        assert_eq!(reloaded.config.provider, ProviderKind::Deepseek);
+        assert_eq!(
+            reloaded.config.providers.arcee.api_key.as_deref(),
+            Some("arcee-key")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn auth_set_ollama_accepts_empty_key_and_records_base_url() {
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
@@ -2377,6 +2413,7 @@ mod tests {
             std::process::id()
         ));
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
+        store.config.provider = ProviderKind::Deepseek;
         let secrets = no_keyring_secrets();
 
         run_auth_command_with_secrets(
@@ -2390,7 +2427,7 @@ mod tests {
         )
         .expect("ollama auth set should not require a key");
 
-        assert_eq!(store.config.provider, ProviderKind::Ollama);
+        assert_eq!(store.config.provider, ProviderKind::Deepseek);
         assert_eq!(
             store.config.providers.ollama.base_url.as_deref(),
             Some("http://localhost:11434/v1")
