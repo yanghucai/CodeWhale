@@ -107,9 +107,9 @@ v0.9 branch so the remaining Windows/manual checks are explicit.
 | #2501 in-process LLM response cache | Conflicting | Defer; cache key risks noted in prior review. |
 | #2502 web_run RwLock split | Mergeable | Manually harvested with panic-safety and shared cached-page reads; close/comment after branch is public. |
 | #2505 subagent cap accounting | Draft/conflicting | Compare with current subagent cap tests before harvest. |
-| #2506 provider path suffix overrides | Draft/conflicting | Partly superseded by current provider path-suffix support; verify. |
+| #2506 provider path suffix overrides | Draft/conflicting / superseded | The current branch already contains provider-table `path_suffix` support from #2558 with the safer constrained behavior: only `chat/completions` uses the override, while `models` and DeepSeek `beta/*` keep their built-in routing. `cargo test -p codewhale-tui --bin codewhale-tui --locked api_url_with_suffix -- --nocapture` passed. Credit @cyq1017 for the earlier design/review trail; comment/close after branch is public, keeping #1874 tied to the shipped #2558 implementation/docs. |
 | #2507 stream chunk timeout config | Draft/conflicting | Defer unless stabilization needs it. |
-| #2508 configurable path suffix | Conflicting | Likely superseded by #2506/current code; verify linked issue #2089. |
+| #2508 configurable path suffix | Conflicting / superseded | #2089 is already closed. The current implementation covers #1874's third-party gateway need without the broader env/CLI surface from #2508. Docs now show `[providers.openai].path_suffix = "/chat/completions"` and state that model/beta paths are not rewritten. Credit @hongqitai for the follow-up PR and @shuxiangxuebiancheng for the original #1874 report; close/comment after branch is public. |
 | #2509 parallel read-only web search | Closed / already merged via #2504 | Already present in `origin/main` as `a09af2024`; closed as harvested/superseded on 2026-06-04. |
 | #2510 custom DuckDuckGo endpoint | Draft/mergeable | Low priority; defer unless docs/search lane takes it. |
 | #2511 ToolCallBefore hooks | Conflicting | Defer to hook lifecycle lane. |

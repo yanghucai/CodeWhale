@@ -638,6 +638,11 @@ Current v0.9 track credits:
 - **[NASLXTO](https://github.com/NASLXTO)** and
   **[wuxixing](https://github.com/wuxixing)** — large-workspace startup
   reports that shaped the bounded project-context fallback (#697, #1827)
+- **[shuxiangxuebiancheng](https://github.com/shuxiangxuebiancheng)**,
+  **[hongqitai](https://github.com/hongqitai)**, and
+  **[cyq1017](https://github.com/cyq1017)** — third-party
+  OpenAI-compatible path-suffix report and follow-up review trail (#1874,
+  #2508, #2506)
 
 Current and recurring contributors include:
 

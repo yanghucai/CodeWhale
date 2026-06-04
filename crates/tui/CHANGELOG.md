@@ -103,6 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated-context targets, trust markers, and trust config paths, and it
   stores post-load signatures so auto-generated context deletion/regeneration
   stays correct (#2636).
+- Configuration docs now show the provider-local `path_suffix` escape hatch
+  for OpenAI-compatible gateways that accept `/chat/completions` but reject
+  `/v1/chat/completions`, while making clear that model listing and DeepSeek
+  beta routes keep their built-in paths (#1874).
 
 ### Community
 
@@ -122,11 +126,13 @@ dense tool-call transcript collapse/sidebar detail direction (#2738, #2734,
 **@h3c-hexin** for the tool-agent model inheritance and configured
 `skills_dir` fixes (#2736, #2737). Thanks also to **@qiyuanlicn** for the
 checkpoint/resume report that shaped the sub-agent recovery slice (#2029),
-to **@bevis-wong** for the long-running shell/task liveness report (#1786),
-and to **@NASLXTO** and
-**@wuxixing** for the large-workspace startup reports (#697, #1827), and to
-**@linzhiqin2003** and **@merchloubna70-dot** for earlier context-cap and
-startup-diagnosis work that shaped this bounded fallback.
+**@bevis-wong** for the long-running shell/task liveness report (#1786),
+**@shuxiangxuebiancheng** for the third-party OpenAI-compatible path report
+(#1874), **@hongqitai** and **@cyq1017** for the follow-up path-suffix PR
+review trail (#2508, #2506), **@NASLXTO** and **@wuxixing** for the
+large-workspace startup reports (#697, #1827), and **@linzhiqin2003** and
+**@merchloubna70-dot** for earlier context-cap and startup-diagnosis work that
+shaped this bounded fallback.
 
 ## [0.8.53] - 2026-06-03
 
