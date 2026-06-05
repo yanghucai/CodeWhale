@@ -4,9 +4,17 @@
 //! follow-up question the user might want to ask next. The suggestion is
 //! rendered as dimmed ghost text in the composer when the input is empty.
 
+use std::sync::OnceLock;
+
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use tracing::debug;
+
+/// Reusable static client — avoids creating a new connection pool per request.
+fn suggestion_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
 
 /// Generate a follow-up prompt suggestion based on recent messages.
 ///
@@ -19,7 +27,7 @@ pub async fn generate_suggestion(
     model: &str,
     recent_messages: &str,
 ) -> Option<String> {
-    let client = reqwest::Client::new();
+    let client = suggestion_client();
     let body = serde_json::json!({
         "model": model,
         "messages": [

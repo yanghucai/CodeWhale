@@ -1185,6 +1185,10 @@ pub struct App {
     /// Ghost-text follow-up suggestion shown in the composer when empty.
     /// Generated asynchronously after each completed turn; cleared on new input.
     pub prompt_suggestion: Option<String>,
+    /// Monotonic turn counter for stale-suggestion protection. Incremented on
+    /// each TurnStarted; background suggestion tasks capture the token and
+    /// discard their result if the token no longer matches.
+    pub prompt_suggestion_gen: std::sync::atomic::AtomicU64,
     /// Degraded connectivity mode; new user inputs are queued for later retry.
     pub offline_mode: bool,
     /// Whether an `EngineEvent::Error` has already been posted for the
@@ -1525,7 +1529,7 @@ pub struct App {
     /// Shared cell updated by background fetch tasks; read lock in the UI thread.
     pub balance_cell: std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>>,
     /// Shared cell for async prompt suggestion delivery from background task.
-    pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<(u64, String)>>>,
     /// Tracks whether the initial balance fetch has been attempted for this session.
     pub balance_initiated: bool,
     /// Timestamp of the last balance fetch, used to debounce rapid requests.
@@ -1997,6 +2001,7 @@ impl App {
             api_messages: Vec::new(),
             is_loading: false,
             prompt_suggestion: None,
+            prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
             turn_error_posted: false,
             status_message: None,
