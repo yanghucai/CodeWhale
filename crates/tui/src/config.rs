@@ -915,6 +915,8 @@ pub enum CompletionSound {
     Beep,
     /// Terminal BEL character (`\x07`).
     Bell,
+    /// Play a configured WAV sound file.
+    File,
 }
 
 /// Desktop-notification configuration (OSC 9 / BEL on turn completion).
@@ -922,9 +924,9 @@ pub enum CompletionSound {
 pub struct NotificationsConfig {
     /// Delivery method: `auto` | `osc9` | `bel` | `off`. Default: `auto`.
     /// `auto` resolves to OSC 9 for iTerm.app / Ghostty / WezTerm / Cmux
-    /// (detected via `$TERM_PROGRAM` then `$LC_TERMINAL`); on macOS / Linux
-    /// it falls back to BEL, and on Windows it falls back to `Off` so the
-    /// post-turn notification doesn't ring the system error chime (#583).
+    /// (detected via `$TERM_PROGRAM` then `$LC_TERMINAL`); otherwise it
+    /// falls back to BEL. On Windows the BEL path is routed through
+    /// `MessageBeep(MB_OK)`.
     /// Use `method = "osc9"` explicitly when your terminal is OSC-9 capable
     /// but sets neither env var (e.g. Cmux without `LC_TERMINAL`).
     #[serde(default)]
@@ -937,10 +939,14 @@ pub struct NotificationsConfig {
     #[serde(default)]
     pub include_summary: bool,
 
-    /// Completion sound: `"off"` | `"beep"` | `"bell"`. Default: `"beep"`.
+    /// Completion sound: `"off"` | `"beep"` | `"bell"` | `"file"`. Default: `"beep"`.
     /// Plays a sound when every turn finishes (alongside the ✅ marker).
     #[serde(default)]
     pub completion_sound: CompletionSound,
+
+    /// Path to the WAV sound file used when `completion_sound = "file"`.
+    #[serde(default)]
+    pub sound_file: Option<PathBuf>,
 }
 
 fn default_snapshots_enabled() -> bool {
@@ -10219,5 +10225,24 @@ model = "deepseek-ai/deepseek-v4-pro"
         assert_eq!(config.deepseek_base_url(), "https://custom-hf.example/v1");
         assert_eq!(config.default_model(), "meta-llama/Llama-3-70B");
         Ok(())
+    }
+
+    #[test]
+    fn notifications_parse_custom_completion_sound_file() {
+        let config: Config = toml::from_str(
+            r#"
+            [notifications]
+            completion_sound = "file"
+            sound_file = "E:\\google\\downloads\\xm4114.wav"
+            "#,
+        )
+        .expect("custom completion sound config should parse");
+
+        let notifications = config.notifications_config();
+        assert_eq!(notifications.completion_sound, CompletionSound::File);
+        assert_eq!(
+            notifications.sound_file.as_deref(),
+            Some(std::path::Path::new("E:\\google\\downloads\\xm4114.wav"))
+        );
     }
 }

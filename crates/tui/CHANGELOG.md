@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DEEPSEEK_SEARCH_BASE_URL` as a legacy alias. Custom endpoints are gated by
   their configured host, do not fall back to public Bing, and report the custom
   host as the result source for diagnostics (#2436, #2510).
+- Added `completion_sound = "file"` with `[notifications].sound_file` so
+  Windows users can play a custom WAV file for turn-completion sounds without
+  changing the global Windows sound scheme (#2484, #2512).
 
 ### Changed
 
@@ -160,9 +163,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Thanks to **@sximelon** for reporting and fixing the saved-session resume
 footer hint (#2758, #2760), **@cyq1017** for the custom
-DuckDuckGo-compatible search endpoint, restore-listing implementation, and
-pending-input delivery-mode label work (#2510, #2513, #2532, #2054),
+DuckDuckGo-compatible search endpoint, custom completion sound file support,
+restore-listing implementation, and pending-input delivery-mode label work
+(#2510, #2512, #2513, #2532, #2054),
 **@Artenx** for the private-search endpoint report (#2436),
+**@LHqweasd** for the Windows custom notification sound request (#2484),
 **@wywsoor** for the broader macOS/iTerm rollback UX report (#2494),
 **@HUQIANTAO** for the `web_run` lock-splitting work (#2502), turn-metadata
 prefix-cache stability work (#2517), and project-context cache direction
