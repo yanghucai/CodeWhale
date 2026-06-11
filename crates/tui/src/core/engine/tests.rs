@@ -85,6 +85,45 @@ fn build_engine_with_capacity(capacity: CapacityControllerConfig) -> Engine {
     engine
 }
 
+fn catalog_tool(name: &str) -> Tool {
+    Tool {
+        tool_type: None,
+        name: name.to_string(),
+        description: String::new(),
+        input_schema: json!({"type": "object"}),
+        allowed_callers: None,
+        defer_loading: None,
+        input_examples: None,
+        strict: None,
+        cache_control: None,
+    }
+}
+
+#[test]
+fn tool_catalog_filter_applies_allow_and_deny_gates() {
+    // #3027 AC1: the advertised catalog must not contain tools the execution
+    // gates would deny; deny wins over allow.
+    let mut catalog = vec![
+        catalog_tool("read_file"),
+        catalog_tool("exec_shell"),
+        catalog_tool("grep_files"),
+    ];
+    filter_tool_catalog_for_gates(
+        &mut catalog,
+        Some(&["read_file".to_string(), "exec_shell".to_string()][..]),
+        Some(&["exec_shell".to_string()][..]),
+    );
+    let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["read_file"]);
+}
+
+#[test]
+fn tool_catalog_filter_is_inert_without_gates() {
+    let mut catalog = vec![catalog_tool("read_file"), catalog_tool("exec_shell")];
+    filter_tool_catalog_for_gates(&mut catalog, None, None);
+    assert_eq!(catalog.len(), 2);
+}
+
 #[test]
 fn structured_state_block_includes_rich_plan_artifact() {
     let state = StructuredState {
@@ -486,6 +525,33 @@ fn tool_error_messages_include_actionable_hints() {
     let timeout = ToolError::Timeout { seconds: 5 };
     let formatted = format_tool_error(&timeout, "exec_shell");
     assert!(formatted.contains("timed out"));
+
+    // #3020: Plan-mode denials already explain the fix — pass through
+    // verbatim, with no conflicting "Adjust approval mode" suffix.
+    let plan_denied = ToolError::permission_denied(
+        "'exec_shell' is not available in Plan mode — switch to Agent, Goal, or YOLO mode to run commands and code.",
+    );
+    let formatted = format_tool_error(&plan_denied, "exec_shell");
+    assert_eq!(
+        formatted,
+        "'exec_shell' is not available in Plan mode — switch to Agent, Goal, or YOLO mode to run commands and code."
+    );
+
+    // Bare denials still get the actionable suffix.
+    let bare_denied = ToolError::permission_denied("nope");
+    let formatted = format_tool_error(&bare_denied, "exec_shell");
+    assert!(
+        formatted.contains("Adjust approval mode or request permission"),
+        "{formatted}"
+    );
+
+    // "model" must not satisfy the "mode" pass-through check.
+    let model_denied = ToolError::permission_denied("requested model is not allowed");
+    let formatted = format_tool_error(&model_denied, "agent_open");
+    assert!(
+        formatted.contains("Adjust approval mode or request permission"),
+        "{formatted}"
+    );
 }
 
 #[test]
@@ -2863,6 +2929,33 @@ async fn pre_request_refresh_skips_compaction_below_normal_threshold() {
     assert!(!applied);
     assert_eq!(after, before);
     assert_eq!(engine.session.messages.len(), before_len);
+}
+
+#[test]
+fn capacity_observation_uses_bare_kimi_context_window() {
+    // #3023: capacity math reads models::context_window_for_model directly,
+    // so bare Moonshot ids must resolve their real window, not the 128K
+    // legacy fallback.
+    let mut engine = build_engine_with_capacity(CapacityControllerConfig::default());
+    engine.session.model = "kimi-k2.6".to_string();
+    engine.session.messages.push(Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(40_000),
+            cache_control: None,
+        }],
+    });
+
+    let estimated = engine.estimated_input_tokens() as f64;
+    let turn = TurnContext::new(1);
+    let observation = engine.capacity_observation(&turn);
+
+    let expected = estimated / 262_144.0;
+    assert!(
+        (observation.context_used_ratio - expected).abs() < 1e-9,
+        "context_used_ratio must use kimi-k2.6's 262,144-token window (got {})",
+        observation.context_used_ratio
+    );
 }
 
 #[tokio::test]
