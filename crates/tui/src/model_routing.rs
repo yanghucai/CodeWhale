@@ -57,8 +57,11 @@ pub(crate) fn provider_router_candidates(
         let normalized = crate::config::normalize_model_name_for_provider(provider, current_model)
             .unwrap_or_else(|| current_model.to_string());
         return RouterCandidates {
+            // GLM-5.2 (the default) routes faster/explore children to GLM-5-Turbo,
+            // the same-family fast sibling. GLM-5.1 and GLM-5-Turbo itself have no
+            // cheaper tier and keep children on the parent model.
             cheap: if normalized == crate::config::ZAI_GLM_5_2_MODEL {
-                Some(crate::config::DEFAULT_ZAI_MODEL.to_string())
+                Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string())
             } else {
                 None
             },
@@ -71,12 +74,16 @@ pub(crate) fn provider_router_candidates(
             crate::config::normalize_model_name_for_provider(provider, current_model)
         && matches!(
             normalized.as_str(),
-            crate::config::OPENROUTER_GLM_5_1_MODEL | crate::config::OPENROUTER_GLM_5_2_MODEL
+            crate::config::OPENROUTER_GLM_5_1_MODEL
+                | crate::config::OPENROUTER_GLM_5_2_MODEL
+                | crate::config::OPENROUTER_GLM_5_TURBO_MODEL
         )
     {
         return RouterCandidates {
+            // z-ai/glm-5.2 routes faster children to z-ai/glm-5-turbo; the 5.1
+            // and turbo ids have no cheaper tier and keep children on parent.
             cheap: if normalized == crate::config::OPENROUTER_GLM_5_2_MODEL {
-                Some(crate::config::OPENROUTER_GLM_5_1_MODEL.to_string())
+                Some(crate::config::OPENROUTER_GLM_5_TURBO_MODEL.to_string())
             } else {
                 None
             },
@@ -1089,15 +1096,23 @@ mod tests {
 
         let zai = provider_router_candidates(ApiProvider::Zai, "GLM-5.2");
         assert_eq!(zai.big, "GLM-5.2");
-        assert_eq!(zai.cheap.as_deref(), Some("GLM-5.1"));
+        // GLM-5.2 faster/explore children route to GLM-5-Turbo (same-family fast
+        // sibling), not back down to GLM-5.1.
+        assert_eq!(zai.cheap.as_deref(), Some("GLM-5-Turbo"));
 
         let openrouter_glm = provider_router_candidates(ApiProvider::Openrouter, "z-ai/glm-5.2");
         assert_eq!(openrouter_glm.big, "z-ai/glm-5.2");
-        assert_eq!(openrouter_glm.cheap.as_deref(), Some("z-ai/glm-5.1"));
+        assert_eq!(openrouter_glm.cheap.as_deref(), Some("z-ai/glm-5-turbo"));
 
-        let zai_default = provider_router_candidates(ApiProvider::Zai, "GLM-5.1");
-        assert_eq!(zai_default.big, "GLM-5.1");
-        assert_eq!(zai_default.cheap, None);
+        // GLM-5.1 has no cheaper tier; faster children stay on the parent.
+        let zai_51 = provider_router_candidates(ApiProvider::Zai, "GLM-5.1");
+        assert_eq!(zai_51.big, "GLM-5.1");
+        assert_eq!(zai_51.cheap, None);
+
+        // GLM-5-Turbo is itself the cheap tier; no further downgrade.
+        let zai_turbo = provider_router_candidates(ApiProvider::Zai, "GLM-5-Turbo");
+        assert_eq!(zai_turbo.big, "GLM-5-Turbo");
+        assert_eq!(zai_turbo.cheap, None);
 
         // Providers without a known cheap tier: big = session model, no cheap.
         let ollama = provider_router_candidates(ApiProvider::Ollama, "qwen3:32b");

@@ -42,9 +42,11 @@ base_url = "https://api.deepseek.com/beta"
 #   xiaomi/mimo-v2.5-pro          — OpenRouter Xiaomi MiMo 2.5 Pro
 #   xiaomi/mimo-v2.5              — OpenRouter Xiaomi MiMo 2.5
 #   z-ai/glm-5.1                  — OpenRouter Z.AI GLM 5.1
-#   z-ai/glm-5.2                  — OpenRouter Z.AI GLM 5.2 (opt-in preview)
-#   GLM-5.1                       — default direct Z.AI Coding Plan model
-#   GLM-5.2                       — direct Z.AI opt-in preview model
+#   z-ai/glm-5.2                  — OpenRouter Z.AI GLM 5.2 (default)
+#   z-ai/glm-5-turbo              — OpenRouter Z.AI GLM 5 Turbo (faster/explore sub-agent sibling)
+#   GLM-5.2                       — default direct Z.AI Coding Plan model
+#   GLM-5.1                       — direct Z.AI smaller model
+#   GLM-5-Turbo                   — direct Z.AI fast model (faster/explore sub-agent sibling)
 #   step-3.7-flash                — default direct StepFun / StepFlash model ID
 #   kimi-k2.6                       — default Moonshot/Kimi model ID
 #   gpt-4.1                         — default generic OpenAI-compatible model ID
@@ -414,7 +416,7 @@ max_subagents = 10 # optional (1-20)
 # base_url = "https://api.z.ai/api/coding/paas/v4"
 # # General API endpoint, if you are not using the Coding Plan:
 # # base_url = "https://api.z.ai/api/paas/v4"
-# model = "GLM-5.1"                             # default; GLM-5.2 is opt-in preview
+# model = "GLM-5.2"                             # default; GLM-5.1 is the smaller model, GLM-5-Turbo the fast sub-agent sibling
 
 # StepFun / StepFlash direct OpenAI-compatible endpoint (https://platform.stepfun.com)
 [providers.stepfun]

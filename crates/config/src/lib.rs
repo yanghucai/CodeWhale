@@ -105,8 +105,14 @@ const DEFAULT_OLLAMA_MODEL: &str = "deepseek-coder:1.3b";
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
 // Z.ai (GLM Coding Plan) defaults
-const DEFAULT_ZAI_MODEL: &str = "GLM-5.1";
+const DEFAULT_ZAI_MODEL: &str = "GLM-5.2";
+const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
+// GLM-5.2 is both the default and a named tier; the alias arm resolves the
+// `glm-5.2` spelling to DEFAULT_ZAI_MODEL directly, so this constant is only
+// referenced by the invariant test below.
+#[allow(dead_code)]
 const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
+const ZAI_GLM_5_TURBO_MODEL: &str = "GLM-5-Turbo";
 const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 // StepFun / StepFlash defaults
 const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
@@ -2855,8 +2861,9 @@ fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
     match normalized.as_str() {
-        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(DEFAULT_ZAI_MODEL),
-        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(ZAI_GLM_5_1_MODEL),
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(DEFAULT_ZAI_MODEL),
+        "glm-5-turbo" | "glm-5turbo" | "zai-glm-5-turbo" => Some(ZAI_GLM_5_TURBO_MODEL),
         _ => None,
     }
 }
@@ -6479,13 +6486,20 @@ mode = "token-plan-usa"
 
     #[test]
     fn zai_aliases_resolve_to_canonical_models() {
+        // GLM-5.2 is the default; the glm-5.1 alias must still resolve to 5.1
+        // (not to the default), and GLM-5-Turbo resolves to its own id.
         assert_eq!(
             normalize_model_for_provider(ProviderKind::Zai, "glm-5.1"),
-            DEFAULT_ZAI_MODEL
+            ZAI_GLM_5_1_MODEL
         );
         assert_eq!(
             normalize_model_for_provider(ProviderKind::Zai, "glm-5-2"),
-            ZAI_GLM_5_2_MODEL
+            DEFAULT_ZAI_MODEL
+        );
+        assert_eq!(DEFAULT_ZAI_MODEL, ZAI_GLM_5_2_MODEL);
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "glm-5-turbo"),
+            ZAI_GLM_5_TURBO_MODEL
         );
         assert_eq!(
             normalize_model_for_provider(ProviderKind::Zai, "custom-glm-preview"),

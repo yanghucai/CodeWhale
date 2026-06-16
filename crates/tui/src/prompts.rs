@@ -2804,6 +2804,11 @@ mod tests {
         assert!(prompt.contains("thinking: \"high\""));
         assert!(prompt.contains("thinking: \"max\""));
         assert!(prompt.contains("thinking: \"auto\""));
+        // explore defaults to the faster lane, and parallel exploration is
+        // encouraged for broad investigations.
+        assert!(prompt.contains("defaults to `model_strength: \"faster\"`"));
+        assert!(prompt.contains("2-4 `type: \"explore\"` sub-agents"));
+        assert!(prompt.contains("self-reports"));
     }
 
     #[test]

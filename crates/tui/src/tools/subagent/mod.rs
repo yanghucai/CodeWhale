@@ -3008,7 +3008,7 @@ impl ToolSpec for AgentTool {
                 "model_strength": {
                     "type": "string",
                     "enum": ["same", "faster"],
-                    "description": "Optional child model strength. Use same (default) when the child should be as capable as the current model. Use faster for type=explore, read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5.1. No hidden auto-downgrade happens."
+                    "description": "Optional child model strength. Use same when the child should be as capable as the current model. Use faster for type=explore, read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5-Turbo. type=explore defaults to faster unless you pass model_strength or model explicitly. No hidden auto-downgrade happens."
                 },
                 "model": {
                     "type": "string",
@@ -3365,10 +3365,18 @@ async fn run_subagent_task(task: SubAgentTask) {
     // text.
     let model_id = task.runtime.model.clone();
     let (summary, sentinel) = match &result {
-        Ok(res) => (
-            summarize_subagent_result(res),
-            subagent_done_sentinel(&task.agent_id, res),
-        ),
+        Ok(res) => {
+            // Issue #2652: the child's free-text result is its self-report, not
+            // verified evidence. Stamp it with a provenance marker: a soft
+            // "re-verify" note when short, or a head+tail truncation (reusing
+            // the tool-output vocabulary) when it exceeds the wire budget. The
+            // resulting `truncated` flag is carried in the sentinel so the
+            // parent model can branch on `summary_kind`.
+            let raw = summarize_subagent_result(res);
+            let (summary, truncated) = stamp_subagent_summary(&raw);
+            let sentinel = subagent_done_sentinel(&task.agent_id, res, truncated);
+            (summary, sentinel)
+        }
         Err(err) => {
             let annotated = annotate_child_model_error(&err.to_string(), &model_id);
             (
@@ -3494,7 +3502,12 @@ pub(crate) fn emit_parent_completion(
 /// line immediately before the sentinel; duplicating it here bloats the next
 /// parent request's cache-miss tail. Wall-clock duration is useful UI
 /// telemetry, but it is volatile and not useful for model coordination.
-fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult) -> String {
+///
+/// `truncated` reflects whether the previous-line summary was length-gated by
+/// [`stamp_subagent_summary`] (issue #2652); it surfaces as `summary_kind` so
+/// the parent model can tell a complete self-report from a clipped one and
+/// verify material claims accordingly.
+fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult, truncated: bool) -> String {
     let mut payload = json!({
         "agent_id": agent_id,
         // Whale name — a stable, human-friendly handle the orchestrator can use
@@ -3503,6 +3516,9 @@ fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult) -> String {
         "agent_type": res.agent_type.as_str(),
         "status": subagent_status_name(&res.status),
         "summary_location": "previous_line",
+        // issue #2652: lets the parent branch on whether the previous-line
+        // summary is the full child report or a head+tail excerpt.
+        "summary_kind": if truncated { "truncated" } else { "complete" },
     });
     if let Some(needs_input) = res.needs_input.clone() {
         payload["needs_input"] = json!(needs_input);
@@ -4381,7 +4397,20 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
     let model_strength = optional_input_str(input, &["model_strength", "modelStrength"])
         .map(SubAgentModelStrength::parse)
         .transpose()?
-        .unwrap_or(SubAgentModelStrength::Same);
+        .unwrap_or_else(|| {
+            // Default model strength. `type: "explore"` defaults to Faster for
+            // bounded read-only lookup/search/status work — the cheap, fast
+            // same-family sibling is exactly the lossy-breadth job a child
+            // should run. Every other role (and any call that supplies an
+            // explicit `model`) stays conservative at Same. Explicit
+            // model_strength above already wins via .parse(); explicit `model`
+            // wins downstream in assignment_model_route regardless of strength.
+            if agent_type == SubAgentType::Explore && model.is_none() {
+                SubAgentModelStrength::Faster
+            } else {
+                SubAgentModelStrength::Same
+            }
+        });
     let thinking = optional_input_str(input, &["thinking", "reasoning_effort", "reasoningEffort"])
         .map(SubAgentThinking::parse)
         .transpose()?
@@ -4670,7 +4699,18 @@ fn subagent_reasoning_effort_for_request(
                 .to_string(),
         ),
         SubAgentThinking::Inherit if requested_fast_lane => {
-            Some(ReasoningEffort::Off.as_setting().to_string())
+            // Faster/explore lane: cheaper reasoning by default. The OpenAI Codex
+            // (GPT-5.5) adapter has no true "off" on the wire (it collapses off
+            // to low), so we resolve Low honestly for that provider instead of
+            // emitting an off that is silently rewritten. Explicit thinking
+            // passed by the caller already won via the arms above.
+            let provider = runtime.client.api_provider();
+            let effort = if matches!(provider, crate::config::ApiProvider::OpenaiCodex) {
+                ReasoningEffort::Low
+            } else {
+                ReasoningEffort::Off
+            };
+            Some(effort.as_setting().to_string())
         }
         SubAgentThinking::Inherit => fallback_subagent_reasoning_effort(runtime, prompt),
     }
@@ -5176,6 +5216,60 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
             }
         }
     }
+}
+
+/// Char budget above which a sub-agent summary is treated as a large dump and
+/// head+tail truncated. Mirrors `TOOL_RESULT_SENT_CHAR_BUDGET` in
+/// `crates/tui/src/client/chat.rs:702` so sub-agent summaries use the same
+/// threshold as regular tool outputs. Duplicated locally to avoid coupling the
+/// sub-agent module to the wire-compaction internals.
+const SUBAGENT_SUMMARY_CHAR_BUDGET: usize = 12_000;
+/// Head/tail slice sizes when truncating; mirror the wire constants
+/// (`TOOL_RESULT_HEAD_CHARS`/`TOOL_RESULT_TAIL_CHARS`, chat.rs:703-704).
+const SUBAGENT_SUMMARY_HEAD_CHARS: usize = 4_000;
+const SUBAGENT_SUMMARY_TAIL_CHARS: usize = 4_000;
+
+/// One-line provenance suffix reinforcing that a sub-agent summary is a
+/// self-report (issue #2652). Appended only when the summary was NOT
+/// length-truncated, so every summary carries exactly one boundary marker.
+const SUBAGENT_SELF_REPORT_NOTE: &str = "\n[Sub-agent self-report — re-verify material claims (read changed files, \
+run the relevant tests) before relying on it.]";
+
+/// Stamp a sub-agent summary with a provenance/clip marker (issue #2652).
+///
+/// Returns `(stamped_summary, truncated)`:
+/// - When the raw summary is within the budget, append the soft self-report
+///   note and report `truncated: false`.
+/// - When it exceeds the budget, keep a head+tail slice and stamp it with the
+///   existing `[Output truncated ...]` vocabulary (reused from tool-output
+///   truncation), adapted to be honest that the elided middle is NOT in the
+///   spillover store — there is no `retrieve_tool_result` handle for
+///   sub-agent summaries. Report `truncated: true`.
+///
+/// Every summary therefore gets exactly one boundary marker, never both.
+fn stamp_subagent_summary(raw: &str) -> (String, bool) {
+    let total = raw.chars().count();
+    if total <= SUBAGENT_SUMMARY_CHAR_BUDGET {
+        return (format!("{raw}{SUBAGENT_SELF_REPORT_NOTE}"), false);
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let head: String = chars.iter().take(SUBAGENT_SUMMARY_HEAD_CHARS).collect();
+    let tail: String = chars
+        .iter()
+        .skip(total.saturating_sub(SUBAGENT_SUMMARY_TAIL_CHARS))
+        .collect();
+    let omitted = total
+        .saturating_sub(SUBAGENT_SUMMARY_HEAD_CHARS)
+        .saturating_sub(SUBAGENT_SUMMARY_TAIL_CHARS);
+    let stamped = format!(
+        "{head}\n\n[Sub-agent summary truncated: {head_chars} + {tail_chars} of {total} \
+chars shown. This is the child's self-report; the elided middle ({omitted} chars) is not in \
+the spillover store and cannot be retrieved via retrieve_tool_result. Re-open the child or \
+read changed files directly to verify material claims.]\n\n{tail}",
+        head_chars = SUBAGENT_SUMMARY_HEAD_CHARS,
+        tail_chars = SUBAGENT_SUMMARY_TAIL_CHARS,
+    );
+    (stamped, true)
 }
 
 fn summarize_subagent_result(result: &SubAgentResult) -> String {

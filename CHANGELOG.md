@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Default model + sub-agent routing
+
+- **GLM-5.2 is now the default direct Z.AI model.** `DEFAULT_ZAI_MODEL` resolves
+  to `GLM-5.2` in both `codewhale-tui` and `codewhale-config`; the `glm-5.1`
+  alias still resolves to `GLM-5.1` (the defaulting was decoupled from the alias
+  arm so it no longer tracks the default). Docs and `config.example.toml` no
+  longer describe GLM-5.2 as an opt-in preview.
+- **GLM-5-Turbo registered as a real model** and wired as the faster/explore
+  sub-agent sibling for the GLM family: a `GLM-5.2` parent routes
+  faster/explore children to `GLM-5-Turbo` (direct Z.ai) and `z-ai/glm-5-turbo`
+  (OpenRouter), instead of down to GLM-5.1. GLM-5.1 and GLM-5-Turbo themselves
+  have no cheaper tier and keep children on the parent.
+- **`type: "explore"` sub-agents default to `model_strength: "faster"`.** Bounded
+  read-only lookup/search/status work now uses the cheaper same-family sibling
+  automatically, unless an explicit `model` or `model_strength: "same"` is
+  supplied. Non-explore roles keep the conservative `same` default.
+- **GPT-5.5 / OpenAI Codex faster route stays on GPT-5.5** with reasoning
+  resolved to `low` (the Codex Responses API has no true `off`, so the resolved
+  effort is now honest `low` rather than `off` silently rewritten). No
+  DeepSeek/GLM fallback is fabricated when no cheaper same-provider sibling
+  exists. DeepSeek Pro→Flash routing and its no-thinking faster lane are
+  unchanged.
+- **Base prompt / delegate skill guidance** updated to encourage parallel
+  read-only exploration (2-4 `type: "explore"` sub-agents) for broad repo,
+  version, branch, benchmark, and API-surface investigations, while keeping
+  architecture, integration, and final verification in the parent. The
+  delegate skill examples now use provider-neutral `model_strength` instead of
+  hardcoded DeepSeek model ids.
+
+> Note: the workspace version is intentionally still `0.8.61`. A full version
+> bump to `0.8.62` is deferred until the routing change is smoke-tested end to
+> end against the live Z.ai and OpenRouter endpoints.
+
 ### Retroactive credits
 
 A credit-reconciliation pass found shipped community fixes that were never

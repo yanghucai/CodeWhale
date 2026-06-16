@@ -455,6 +455,16 @@ impl Renderable for ChatWidget {
             Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
         paragraph.render(area, buf);
 
+        // #3029: the transcript carries OSC 8 hyperlinks in-band inside span
+        // content. Scan the rendered buffer for those payloads, blank the
+        // payload cells (so no cell ever holds `\x1b`/`]8;;` — fixes the
+        // column-drift corruption), and publish the recovered link regions
+        // for ColorCompatBackend::draw to re-emit out-of-band. This is the
+        // main transcript surface; the live-transcript overlay appends its
+        // own regions separately. Replaces the frame buffer each render.
+        let regions = crate::tui::osc8::extract_buffer_link_regions(buf, area);
+        crate::tui::osc8::set_frame_links(regions);
+
         if let Some(scrollbar) = self.scrollbar {
             let scrollable_range = scrollbar.total.saturating_sub(scrollbar.visible);
             let mut state = ScrollbarState::new(scrollable_range)

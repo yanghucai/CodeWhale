@@ -250,11 +250,16 @@ For the work itself:
 with its own runtime, so the win is a clean context, not free parallelism.
 Reach for them when the work is genuinely independent:
 
-- **Parallel investigation**: When you need to understand three or more
-  independent files or modules, open one read-only sub-agent session per
-  target. They run concurrently in a single turn and return structured
-  findings you synthesize. This is faster and more thorough than reading
-  sequentially.
+- **Parallel investigation**: For repo, version, branch, benchmark,
+  API-surface, bug, PR, issue, or multi-module investigations, start by
+  splitting independent read-only exploration across 2-4 `type: "explore"`
+  sub-agents when that will reduce uncertainty faster than reading
+  sequentially. They run concurrently in a single turn and return structured
+  findings you synthesize — faster and more thorough than reading yourself.
+  `type: "explore"` already defaults to `model_strength: "faster"` for bounded
+  read-only lookup/search/status work, so prefer it over hand-picking a model.
+  Keep architecture decisions, integration, verification, and the final
+  response in the parent.
 - **Parallel implementation**: After a plan is laid out, open one
   sub-agent session per independent leaf task. Each does one thing well;
   you integrate the results.

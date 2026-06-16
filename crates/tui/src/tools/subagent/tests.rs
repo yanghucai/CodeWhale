@@ -669,6 +669,57 @@ fn test_parse_spawn_request_accepts_model_strength() {
 }
 
 #[test]
+fn explore_subagent_defaults_to_faster_model_strength() {
+    // type: "explore" with no model_strength and no model defaults to Faster:
+    // bounded read-only lookup is exactly the cheap-sibling job.
+    let input = json!({
+        "prompt": "find every caller of normalize_model_name",
+        "type": "explore"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Faster);
+
+    // Explicit model_strength: "same" wins for explore too.
+    let input = json!({
+        "prompt": "explore but stay capable",
+        "type": "explore",
+        "model_strength": "same"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
+
+    // An explicit model pins the child (downstream Fixed route) and disables
+    // the explore→faster default, so model_strength falls back to Same.
+    let input = json!({
+        "prompt": "explore on a specific model",
+        "type": "explore",
+        "model": "GLM-5.2"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
+}
+
+#[test]
+fn non_explore_subagents_keep_default_same_model_strength() {
+    // Non-explore roles keep the conservative Same default even with no model.
+    for role in ["general", "plan", "review", "implementer"] {
+        let input = json!({
+            "prompt": "do some work",
+            "type": role
+        });
+        let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+        assert_eq!(
+            parsed.model_strength,
+            SubAgentModelStrength::Same,
+            "role {role:?} should default to Same"
+        );
+    }
+}
+
+#[test]
 fn test_parse_spawn_request_accepts_child_thinking() {
     let input = json!({
         "prompt": "scan parser references",
@@ -2112,7 +2163,7 @@ fn build_subagent_system_prompt_skips_role_when_blank() {
 #[test]
 fn subagent_done_sentinel_format_is_well_formed() {
     let res = make_snapshot(SubAgentStatus::Completed);
-    let sentinel = subagent_done_sentinel("agent_xyz", &res);
+    let sentinel = subagent_done_sentinel("agent_xyz", &res, false);
     assert!(sentinel.starts_with("<codewhale:subagent.done>"));
     assert!(sentinel.ends_with("</codewhale:subagent.done>"));
 
@@ -2125,6 +2176,8 @@ fn subagent_done_sentinel_format_is_well_formed() {
     assert_eq!(parsed["status"], "completed");
     assert_eq!(parsed["agent_type"], "general");
     assert_eq!(parsed["summary_location"], "previous_line");
+    // issue #2652: a complete (non-truncated) summary is tagged as such.
+    assert_eq!(parsed["summary_kind"], "complete");
     assert!(parsed.get("details").is_none());
     assert!(parsed.get("result_clipped").is_none());
     assert!(parsed.get("summary_complete").is_none());
@@ -2138,19 +2191,80 @@ fn subagent_done_sentinel_format_is_well_formed() {
 fn subagent_done_sentinel_keeps_large_result_out_of_metadata() {
     let mut res = make_snapshot(SubAgentStatus::Completed);
     res.result = Some("x".repeat(2048));
-    let sentinel = subagent_done_sentinel("agent_big", &res);
+    let sentinel = subagent_done_sentinel("agent_big", &res, false);
     let inner = sentinel
         .trim_start_matches("<codewhale:subagent.done>")
         .trim_end_matches("</codewhale:subagent.done>");
     let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
     assert_eq!(parsed["agent_id"], "agent_big");
     assert_eq!(parsed["summary_location"], "previous_line");
+    assert_eq!(parsed["summary_kind"], "complete");
     assert!(parsed.get("result_clipped").is_none());
     assert!(parsed.get("summary_complete").is_none());
     assert!(parsed.get("next_action").is_none());
     assert!(
         !inner.contains(&"x".repeat(128)),
         "sentinel should not duplicate large result text"
+    );
+}
+
+#[test]
+fn subagent_done_sentinel_marks_truncated_summaries() {
+    // issue #2652: when the child summary was length-gated, the sentinel must
+    // advertise summary_kind:"truncated" so the parent can steer verification.
+    let res = make_snapshot(SubAgentStatus::Completed);
+    let sentinel = subagent_done_sentinel("agent_trunc", &res, true);
+    let inner = sentinel
+        .trim_start_matches("<codewhale:subagent.done>")
+        .trim_end_matches("</codewhale:subagent.done>");
+    let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
+    assert_eq!(parsed["summary_kind"], "truncated");
+}
+
+#[test]
+fn stamp_subagent_summary_appends_note_when_short() {
+    // issue #2652: a short (complete) summary gets the soft self-report note
+    // and is NOT marked truncated.
+    let (stamped, truncated) = stamp_subagent_summary("All tests pass.");
+    assert!(!truncated);
+    assert!(stamped.starts_with("All tests pass."));
+    assert!(
+        stamped.contains("[Sub-agent self-report"),
+        "short summary gets the provenance note"
+    );
+    assert!(
+        !stamped.contains("[Sub-agent summary truncated"),
+        "short summary must not get the truncation footer"
+    );
+}
+
+#[test]
+fn stamp_subagent_summary_truncates_when_over_budget() {
+    // issue #2652: a summary exceeding the budget is head+tail truncated using
+    // the existing [Output truncated ...] vocabulary, honestly noting there is
+    // no retrieve handle, and is marked truncated.
+    let big = "a".repeat(SUBAGENT_SUMMARY_CHAR_BUDGET + 5_000);
+    let (stamped, truncated) = stamp_subagent_summary(&big);
+    assert!(truncated);
+    assert!(
+        stamped.contains("[Sub-agent summary truncated"),
+        "long summary gets the truncation footer"
+    );
+    assert!(
+        stamped.contains("not in the spillover store"),
+        "footer is honest about the missing retrieve handle"
+    );
+    assert!(
+        !stamped.contains("[Sub-agent self-report"),
+        "truncated summary must not also get the self-report note"
+    );
+    // Head and tail slices are present; a run of budget-length 'a's is gone
+    // from the middle.
+    assert!(stamped.contains(&"a".repeat(SUBAGENT_SUMMARY_HEAD_CHARS)));
+    assert!(stamped.contains(&"a".repeat(SUBAGENT_SUMMARY_TAIL_CHARS)));
+    assert!(
+        stamped.chars().filter(|c| *c == 'a').count() < big.chars().count(),
+        "truncation removed middle characters"
     );
 }
 
@@ -2836,6 +2950,14 @@ fn stub_client_for_provider(provider: &str) -> DeepSeekClient {
                 ..Default::default()
             };
         }
+        // OpenAI Codex (ChatGPT backend). Exercises the faster-lane reasoning
+        // rule: GPT-5.5 children stay on GPT-5.5 and resolve Low reasoning.
+        "openai-codex" => {
+            providers.openai_codex = crate::config::ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+        }
         // Ollama is keyless (local runtime); extend per-provider as needed.
         "ollama" => {}
         other => panic!("extend stub_client_for_provider for provider {other}"),
@@ -3310,7 +3432,7 @@ fn subagent_completion_payload_carries_existing_sentinel_format() {
     snap.result = Some("Found three errors.".to_string());
 
     let summary = summarize_subagent_result(&snap);
-    let sentinel = subagent_done_sentinel("agent_test", &snap);
+    let sentinel = subagent_done_sentinel("agent_test", &snap, false);
     let payload = format!("{summary}\n{sentinel}");
 
     let mut lines = payload.lines();
@@ -3415,7 +3537,10 @@ fn faster_route_uses_known_deepseek_and_glm_family_siblings() {
         SubAgentThinking::Inherit,
         "inspect docs",
     );
-    assert_eq!(route.model, "GLM-5.1");
+    // GLM-5.2 faster/explore children route to GLM-5-Turbo (same-family fast
+    // sibling), not down to GLM-5.1.
+    assert_eq!(route.model, "GLM-5-Turbo");
+    assert_ne!(route.model, "GLM-5.1");
 
     let mut openrouter = stub_runtime_for_provider("openrouter");
     openrouter.model = "z-ai/glm-5.2".to_string();
@@ -3426,7 +3551,52 @@ fn faster_route_uses_known_deepseek_and_glm_family_siblings() {
         SubAgentThinking::Inherit,
         "inspect docs",
     );
-    assert_eq!(route.model, "z-ai/glm-5.1");
+    assert_eq!(route.model, "z-ai/glm-5-turbo");
+    assert_ne!(route.model, "z-ai/glm-5.1");
+}
+
+#[test]
+fn gpt55_faster_route_stays_on_gpt55_with_low_reasoning() {
+    // AC: a faster/explore child of a GPT-5.5 (OpenAI Codex) parent must stay
+    // on GPT-5.5 — there is no cheaper same-provider sibling, so we never
+    // fabricate a DeepSeek/GLM id — and resolve Low reasoning rather than Off,
+    // because the Codex adapter has no true "off" on the wire.
+    //
+    // The Codex client validates OAuth credentials at construction time, so we
+    // stub the access-token env var for the duration of this test (save/restore
+    // to avoid leaking into parallel tests).
+    let prev_token = std::env::var_os("OPENAI_CODEX_ACCESS_TOKEN");
+    // Safety: this test does not run concurrently with other tests that read
+    // OPENAI_CODEX_ACCESS_TOKEN, and we restore the original value below.
+    unsafe {
+        std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+    }
+    let mut codex = stub_runtime_for_provider("openai-codex");
+    unsafe {
+        match prev_token {
+            Some(prev) => std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", prev),
+            None => std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN"),
+        }
+    }
+    codex.model = "gpt-5.5".to_string();
+    let route = fallback_subagent_assignment_route(
+        &codex,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "inspect one file",
+    );
+    assert_eq!(route.model, "gpt-5.5");
+    assert!(
+        !route.model.contains("deepseek"),
+        "no DeepSeek id may be fabricated: {route:?}"
+    );
+    assert!(
+        !route.model.contains("glm"),
+        "no GLM id may be fabricated: {route:?}"
+    );
+    assert_eq!(route.reasoning_effort.as_deref(), Some("low"));
+    assert_ne!(route.reasoning_effort.as_deref(), Some("off"));
 }
 
 #[test]

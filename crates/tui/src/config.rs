@@ -67,6 +67,7 @@ pub const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
 pub const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
 pub const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
 pub const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
+pub const OPENROUTER_GLM_5_TURBO_MODEL: &str = "z-ai/glm-5-turbo";
 pub const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
 pub const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
 pub const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
@@ -172,8 +173,10 @@ pub const COMMON_DEEPSEEK_MODELS: &[&str] = &[
     "deepseek/deepseek-v4-flash",
 ];
 pub const OFFICIAL_DEEPSEEK_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
-pub const DEFAULT_ZAI_MODEL: &str = "GLM-5.1";
+pub const DEFAULT_ZAI_MODEL: &str = "GLM-5.2";
+pub const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
 pub const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
+pub const ZAI_GLM_5_TURBO_MODEL: &str = "GLM-5-Turbo";
 pub const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 pub const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
 pub const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
@@ -729,6 +732,9 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_GLM_5_2_MODEL | "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => {
             Some(OPENROUTER_GLM_5_2_MODEL)
         }
+        OPENROUTER_GLM_5_TURBO_MODEL | "glm-5-turbo" | "glm-5turbo" | "zai-glm-5-turbo" => {
+            Some(OPENROUTER_GLM_5_TURBO_MODEL)
+        }
         OPENROUTER_KIMI_K2_7_CODE_MODEL
         | "kimi"
         | "kimi-k2"
@@ -880,8 +886,9 @@ fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
     match normalized.as_str() {
-        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(DEFAULT_ZAI_MODEL),
-        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(ZAI_GLM_5_1_MODEL),
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(DEFAULT_ZAI_MODEL),
+        "glm-5-turbo" | "glm-5turbo" | "zai-glm-5-turbo" => Some(ZAI_GLM_5_TURBO_MODEL),
         _ => None,
     }
 }
@@ -1046,7 +1053,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Openai | ApiProvider::Atlascloud => OFFICIAL_DEEPSEEK_MODELS.to_vec(),
         ApiProvider::Together => vec![DEFAULT_TOGETHER_MODEL],
         ApiProvider::OpenaiCodex => vec![DEFAULT_OPENAI_CODEX_MODEL],
-        ApiProvider::Zai => vec![DEFAULT_ZAI_MODEL, ZAI_GLM_5_2_MODEL],
+        ApiProvider::Zai => vec![DEFAULT_ZAI_MODEL, ZAI_GLM_5_1_MODEL, ZAI_GLM_5_TURBO_MODEL],
         ApiProvider::Stepfun => vec![DEFAULT_STEPFUN_MODEL],
         ApiProvider::Anthropic => vec![
             ANTHROPIC_OPUS_MODEL,
@@ -1123,8 +1130,10 @@ pub struct TuiConfig {
     /// supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty,
     /// WezTerm, Alacritty, recent gnome-terminal/konsole) make them
     /// Cmd+click-openable. Terminals without OSC 8 support render the plain
-    /// label and ignore the escape. Defaults to `true`; set `false` for
-    /// terminals that misrender the sequence.
+    /// label and ignore the escape. Defaults to on for macOS/Linux and off for
+    /// Windows legacy consoles; set `false` to suppress everywhere (e.g. for a
+    /// terminal that misrenders the sequence). OSC 8 escapes are emitted
+    /// out-of-band, so buffer-column corruption is not a concern.
     pub osc8_links: Option<bool>,
     /// High-level notification trigger condition. When set, overrides the
     /// `[notifications].threshold_secs` gate from the lower-level
@@ -8804,20 +8813,32 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
-    fn model_completion_names_for_zai_keep_5_1_default_and_include_5_2() {
+    fn model_completion_names_for_zai_lists_default_5_1_and_turbo() {
         let models = model_completion_names_for_provider(ApiProvider::Zai);
 
+        // GLM-5.2 is the default and must be first; GLM-5.1 stays available,
+        // and GLM-5-Turbo is the faster sub-agent sibling.
         assert_eq!(models.first().copied(), Some(DEFAULT_ZAI_MODEL));
-        assert!(models.contains(&ZAI_GLM_5_2_MODEL));
+        assert_eq!(DEFAULT_ZAI_MODEL, ZAI_GLM_5_2_MODEL);
+        assert!(models.contains(&ZAI_GLM_5_1_MODEL));
+        assert!(models.contains(&ZAI_GLM_5_TURBO_MODEL));
+        // No accidental duplicate entries.
+        let mut sorted = models.to_vec();
+        sorted.sort_unstable();
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(sorted, deduped);
     }
 
     #[test]
     fn normalize_model_name_for_zai_canonicalizes_current_glm_models() {
         for (alias, expected) in [
-            ("glm-5.1", DEFAULT_ZAI_MODEL),
-            ("glm-5-1", DEFAULT_ZAI_MODEL),
-            ("glm-5.2", ZAI_GLM_5_2_MODEL),
-            ("zai-glm-5-2", ZAI_GLM_5_2_MODEL),
+            ("glm-5.1", ZAI_GLM_5_1_MODEL),
+            ("glm-5-1", ZAI_GLM_5_1_MODEL),
+            ("glm-5.2", DEFAULT_ZAI_MODEL),
+            ("zai-glm-5-2", DEFAULT_ZAI_MODEL),
+            ("glm-5-turbo", ZAI_GLM_5_TURBO_MODEL),
+            ("zai-glm-5-turbo", ZAI_GLM_5_TURBO_MODEL),
         ] {
             assert_eq!(
                 normalize_model_name_for_provider(ApiProvider::Zai, alias).as_deref(),
@@ -11815,20 +11836,26 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
-    fn provider_capability_zai_keeps_5_1_default_and_tracks_5_2_window() {
+    fn provider_capability_zai_defaults_to_5_2_and_tracks_5_1_and_turbo() {
+        // GLM-5.2 is now the default direct Z.AI model (1M context window).
         let default = provider_capability(ApiProvider::Zai, DEFAULT_ZAI_MODEL);
         assert_eq!(default.resolved_model, DEFAULT_ZAI_MODEL);
-        assert_eq!(default.context_window, 202_752);
+        assert_eq!(default.resolved_model, ZAI_GLM_5_2_MODEL);
+        assert_eq!(default.context_window, 1_000_000);
         assert_eq!(default.max_output, 131_072);
         assert!(default.thinking_supported);
         assert!(!default.cache_telemetry_supported);
 
-        let preview = provider_capability(ApiProvider::Zai, ZAI_GLM_5_2_MODEL);
-        assert_eq!(preview.resolved_model, ZAI_GLM_5_2_MODEL);
-        assert_eq!(preview.context_window, 1_000_000);
-        assert_eq!(preview.max_output, 131_072);
-        assert!(preview.thinking_supported);
-        assert!(!preview.cache_telemetry_supported);
+        // GLM-5.1 remains available as an explicit model (smaller window).
+        let v51 = provider_capability(ApiProvider::Zai, ZAI_GLM_5_1_MODEL);
+        assert_eq!(v51.resolved_model, ZAI_GLM_5_1_MODEL);
+        assert_eq!(v51.context_window, 202_752);
+        assert_eq!(v51.max_output, 131_072);
+        assert!(v51.thinking_supported);
+
+        // GLM-5-Turbo is the faster sub-agent sibling.
+        let turbo = provider_capability(ApiProvider::Zai, ZAI_GLM_5_TURBO_MODEL);
+        assert_eq!(turbo.resolved_model, ZAI_GLM_5_TURBO_MODEL);
     }
 
     #[test]

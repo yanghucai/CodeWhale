@@ -378,21 +378,19 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
 
     // Apply OSC 8 hyperlink toggle from config.
     //
-    // Default-off on Windows because legacy `cmd.exe` and pre-Win11
-    // PowerShell consoles don't always honor the OSC 8 string
-    // terminator (`ESC \`) cleanly — emitting the escape can leave
-    // stray bytes that eat the leading column of the next line and
-    // duplicate the composer panel during scroll. Reported on a
-    // Windows session (issue forthcoming, screenshot showed
-    // "eepseek-v4-flash" with the leading `d` consumed and three
-    // overlapping composer panels). v0.8.8 also surfaced macOS
-    // corruption ("526sOPEN" instead of "526   OPEN") because OSC 8
-    // wrappers are emitted inside ratatui `Span` content; ratatui's
-    // grapheme filter drops the bare ESC byte but paints every other
-    // byte of the wrapper into a buffer cell, drifting columns. Until
-    // OSC 8 is emitted out-of-band of the buffer pipeline, default off
-    // on every platform; opt back in via `[ui] osc8_links = true`.
-    let osc8_default_on = false;
+    // #3029: OSC 8 hyperlinks are now emitted out-of-band. The transcript
+    // carries the link payloads in-band inside `Span` content, but each render
+    // seam calls `osc8::extract_buffer_link_regions`, which blanks the payload
+    // cells (so no buffer cell ever holds `\x1b` or `]8;;` — the old column-
+    // drift corruption is gone by construction) and publishes `LinkRegion`s.
+    // `ColorCompatBackend::draw` then re-emits the OSC 8 escapes through the
+    // backend's `Write` impl, interleaved with the cell stream — never inside a
+    // buffer cell. So the corruption that previously forced this default off is
+    // fixed, and hyperlinks are on by default for terminals that handle the OSC
+    // terminator (`ESC \`) cleanly. Windows legacy consoles (conhost) still
+    // mishandle the terminator, so the default stays off there; opt in via
+    // `[tui] osc8_links = true` on any platform.
+    let osc8_default_on = !cfg!(target_os = "windows");
     crate::tui::osc8::set_enabled(
         config
             .tui
