@@ -2778,11 +2778,7 @@ fn non_external_provenance_cannot_inherit_yolo_auto_approval() {
 }
 
 #[test]
-fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
-    // Review-only wording must never silently override an explicitly chosen
-    // mode (Yolo/Agent) or strip its tools. The heuristic should only surface
-    // an advisory hint suggesting `/mode plan` for strict read-only tools.
-
+fn review_only_external_input_gets_read_only_policy_until_write_is_explicit() {
     let agent = effective_input_policy(
         UserInputProvenance::ExternalUser,
         AppMode::Agent,
@@ -2792,16 +2788,16 @@ fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
         true,
         crate::tui::approval::ApprovalMode::Auto,
     );
-    assert_eq!(agent.mode, AppMode::Agent);
+    assert_eq!(agent.mode, AppMode::Plan);
     assert!(agent.allow_shell);
-    assert!(agent.trust_mode);
-    assert!(agent.auto_approve);
+    assert!(!agent.trust_mode);
+    assert!(!agent.auto_approve);
     assert!(matches!(
         agent.approval_mode,
-        crate::tui::approval::ApprovalMode::Auto
+        crate::tui::approval::ApprovalMode::Suggest
     ));
     assert!(agent.status.as_deref().is_some_and(|status| {
-        status.contains("Keeping your current mode") && status.contains("/mode plan")
+        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
     }));
 
     let yolo = effective_input_policy(
@@ -2813,17 +2809,29 @@ fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
         true,
         crate::tui::approval::ApprovalMode::Auto,
     );
-    assert_eq!(yolo.mode, AppMode::Yolo);
+    assert_eq!(yolo.mode, AppMode::Plan);
     assert!(yolo.allow_shell);
-    assert!(yolo.trust_mode);
-    assert!(yolo.auto_approve);
+    assert!(!yolo.trust_mode);
+    assert!(!yolo.auto_approve);
     assert!(matches!(
         yolo.approval_mode,
-        crate::tui::approval::ApprovalMode::Auto
+        crate::tui::approval::ApprovalMode::Suggest
     ));
     assert!(yolo.status.as_deref().is_some_and(|status| {
-        status.contains("Keeping your current mode") && status.contains("/mode plan")
+        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
     }));
+
+    let explicit_write = effective_input_policy(
+        UserInputProvenance::ExternalUser,
+        AppMode::Agent,
+        "检查外卖模块并修复缺少的多语言注入",
+        true,
+        false,
+        false,
+        crate::tui::approval::ApprovalMode::Suggest,
+    );
+    assert_eq!(explicit_write.mode, AppMode::Agent);
+    assert!(explicit_write.status.is_none());
 }
 
 #[test]

@@ -3242,11 +3242,14 @@ fn effective_input_policy(
             ));
         }
     } else if is_review_only_user_intent(content) {
-        // Advisory only: never silently override an explicitly chosen mode
-        // (Yolo/Agent) or strip its tools. Surface the signal so the user can
-        // opt into read-only Plan mode themselves with `/mode plan`.
+        mode = AppMode::Plan;
+        trust_mode = false;
+        auto_approve = false;
+        if matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto) {
+            approval_mode = crate::tui::approval::ApprovalMode::Suggest;
+        }
         status = Some(
-            "This looks like a review or inspection request. Keeping your current mode and tools — run `/mode plan` for strict read-only tools.".to_string(),
+            "Review/inspection request detected; using read-only Plan tools for this turn. Add an explicit fix/edit/commit instruction to allow writes.".to_string(),
         );
     }
 
