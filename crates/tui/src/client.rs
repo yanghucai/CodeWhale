@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
+use codewhale_config::catalog::{
+    CatalogOffering, CatalogRefreshError, CatalogSource, CatalogStatus, ProviderCatalogCache,
+    ProviderCatalogDelta, base_url_fingerprint, now_unix,
+};
 use codewhale_config::route::ReadyRouteCandidate;
 
 use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider};
@@ -1037,6 +1041,124 @@ impl DeepSeekClient {
             .context("Failed to read models response body")?;
 
         parse_models_response(&response_text)
+    }
+
+    /// The catalog provider id for this client (the `ProviderKind` slug, falling
+    /// back to the `ApiProvider` slug for legacy variants without a kind). This
+    /// is the id used as the cache scope and `CatalogOffering.provider`.
+    fn catalog_provider_id(&self) -> String {
+        self.api_provider
+            .kind()
+            .map(|kind| kind.as_str().to_string())
+            .unwrap_or_else(|| self.api_provider.as_str().to_string())
+    }
+
+    /// Fetch the provider's live `/models` listing as a secret-free
+    /// [`ProviderCatalogDelta`] (#3385).
+    ///
+    /// Uses the same URL construction and auth client as [`Self::list_models`],
+    /// but issues a single request without `send_with_retry` so a refresh
+    /// failure stays typed and non-fatal — bundled / saved / static rows are
+    /// untouched. The delta is scoped to the base-URL fingerprint and stamped
+    /// with the fetch time; the API key authorizes the request but is **never**
+    /// persisted into the delta or cache. Unknown live rows carry no canonical
+    /// model, capabilities, or pricing, per the #3385 contract.
+    pub async fn fetch_catalog_delta(&self) -> Result<ProviderCatalogDelta, CatalogRefreshError> {
+        let url = api_url(&self.base_url, "models");
+        // A catalog refresh is non-fatal and must produce a *typed* outcome, so
+        // it issues a single request and maps the raw status. This intentionally
+        // does NOT route through `send_with_retry` like `list_models` does: that
+        // path erases the HTTP status into a generic error and retries
+        // non-retryable auth failures, neither of which suits a typed refresh.
+        // Auth headers are baked into `http_client` (the key is used but never
+        // persisted into the delta or cache).
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|_| CatalogRefreshError::Network)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                401 => CatalogRefreshError::Unauthorized,
+                403 => CatalogRefreshError::Forbidden,
+                404 => CatalogRefreshError::NotFound,
+                429 => CatalogRefreshError::RateLimited,
+                // Any other non-success (5xx, unexpected) is treated as a
+                // transient transport-class failure.
+                _ => CatalogRefreshError::Network,
+            });
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|_| CatalogRefreshError::Network)?;
+        let models =
+            parse_models_response(&body).map_err(|_| CatalogRefreshError::InvalidResponse)?;
+        if models.is_empty() {
+            return Err(CatalogRefreshError::EmptyList);
+        }
+
+        let provider = self.catalog_provider_id();
+        let fingerprint = base_url_fingerprint(&self.base_url);
+        let fetched_at = now_unix();
+        let offerings = models
+            .into_iter()
+            .map(|model| CatalogOffering {
+                provider: provider.clone(),
+                wire_model_id: model.id,
+                canonical_model: None,
+                // This refresh calls the chat-model listing endpoint. A future
+                // provider-specific catalog adapter can split image/TTS/embed
+                // rows before they become executable route candidates.
+                endpoint_key: "chat".to_string(),
+                default_for_provider: false,
+                family: None,
+                limit: None,
+                cost: None,
+                reasoning: None,
+                reasoning_options: Vec::new(),
+                source: CatalogSource::Live {
+                    base_url_fingerprint: fingerprint.clone(),
+                    fetched_at,
+                },
+            })
+            .collect();
+
+        Ok(ProviderCatalogDelta {
+            provider,
+            base_url_fingerprint: fingerprint,
+            fetched_at,
+            offerings,
+        })
+    }
+
+    /// Refresh `cache` for this client's provider + base URL, recording either a
+    /// success or a typed failure (#3385). Returns the resulting status so the UI
+    /// can surface a visible "fresh / failed(reason)" chip without inspecting the
+    /// cache internals. A failed refresh preserves any previously cached rows.
+    pub async fn refresh_catalog_cache(
+        &self,
+        cache: &mut ProviderCatalogCache,
+        ttl_secs: u64,
+    ) -> CatalogStatus {
+        match self.fetch_catalog_delta().await {
+            Ok(delta) => {
+                cache.record_success(delta, ttl_secs);
+                CatalogStatus::Fresh
+            }
+            Err(reason) => {
+                cache.record_failure(
+                    &self.catalog_provider_id(),
+                    &base_url_fingerprint(&self.base_url),
+                    reason,
+                );
+                CatalogStatus::Failed { reason }
+            }
+        }
     }
 
     /// Generate speech with Xiaomi MiMo TTS models.
@@ -3913,6 +4035,228 @@ mod tests {
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["deepseek-coder-v2:16b", "qwen2.5-coder:7b"]
+        );
+    }
+
+    // === #3385: provider live /models fetch + secret-free cache ==============
+    //
+    // All model ids below are SYNTHETIC (never real vendor model names), per the
+    // issue's anti-hardcoding rule.
+
+    /// Build a client whose OpenRouter base URL points at a mock server.
+    fn openrouter_client_for(server: &MockServer) -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        DeepSeekClient::new(&Config {
+            provider: Some("openrouter".to_string()),
+            providers: Some(ProvidersConfig {
+                openrouter: ProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    base_url: Some(server.uri()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("openrouter client")
+    }
+
+    async fn mount_models_json(server: &MockServer, status: u16, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_delta_success_builds_scoped_secret_free_live_delta() {
+        let server = MockServer::start().await;
+        mount_models_json(
+            &server,
+            200,
+            json!({"data": [
+                {"id": "synthetic-model-alpha", "owned_by": "synthetic-owner"},
+                {"id": "synthetic-model-beta"}
+            ]}),
+        )
+        .await;
+        let client = openrouter_client_for(&server);
+
+        let delta = client.fetch_catalog_delta().await.expect("delta");
+        assert_eq!(delta.provider, "openrouter");
+        assert_eq!(
+            delta.base_url_fingerprint,
+            base_url_fingerprint(&server.uri()),
+            "delta is scoped to the base-URL fingerprint"
+        );
+        let ids: Vec<&str> = delta
+            .offerings
+            .iter()
+            .map(|offering| offering.wire_model_id.as_str())
+            .collect();
+        assert!(ids.contains(&"synthetic-model-alpha"), "ids: {ids:?}");
+        assert!(ids.contains(&"synthetic-model-beta"), "ids: {ids:?}");
+        for offering in &delta.offerings {
+            // Live rows carry honest provenance and no inferred facts/secrets.
+            assert!(matches!(offering.source, CatalogSource::Live { .. }));
+            assert_eq!(offering.canonical_model, None);
+            assert_eq!(offering.cost, None);
+            assert!(offering.reasoning.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_delta_maps_http_statuses_to_typed_errors() {
+        for (status, expected) in [
+            (401u16, CatalogRefreshError::Unauthorized),
+            (403, CatalogRefreshError::Forbidden),
+            (404, CatalogRefreshError::NotFound),
+            (429, CatalogRefreshError::RateLimited),
+            (500, CatalogRefreshError::Network),
+        ] {
+            let server = MockServer::start().await;
+            mount_models_json(&server, status, json!({"error": "nope"})).await;
+            let client = openrouter_client_for(&server);
+            let err = client.fetch_catalog_delta().await.expect_err("should fail");
+            assert_eq!(err, expected, "status {status} should map to {expected:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_delta_maps_invalid_json_and_empty_list() {
+        // Invalid JSON -> InvalidResponse.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let client = openrouter_client_for(&server);
+        assert_eq!(
+            client
+                .fetch_catalog_delta()
+                .await
+                .expect_err("invalid json"),
+            CatalogRefreshError::InvalidResponse
+        );
+
+        // Empty list -> EmptyList.
+        let server = MockServer::start().await;
+        mount_models_json(&server, 200, json!({"data": []})).await;
+        let client = openrouter_client_for(&server);
+        assert_eq!(
+            client.fetch_catalog_delta().await.expect_err("empty list"),
+            CatalogRefreshError::EmptyList
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_catalog_cache_records_success_then_preserves_rows_on_failure() {
+        // First refresh succeeds and caches live rows.
+        let server = MockServer::start().await;
+        mount_models_json(
+            &server,
+            200,
+            json!({"data": [{"id": "synthetic-model-gamma"}]}),
+        )
+        .await;
+        let client = openrouter_client_for(&server);
+        let mut cache = ProviderCatalogCache::new();
+
+        let status = client.refresh_catalog_cache(&mut cache, 3600).await;
+        assert_eq!(status, CatalogStatus::Fresh);
+        let fp = base_url_fingerprint(&server.uri());
+        let cached = cache.get("openrouter", &fp).expect("cached entry");
+        assert_eq!(cached.offerings.len(), 1);
+        assert_eq!(cached.offerings[0].wire_model_id, "synthetic-model-gamma");
+
+        // A later failing refresh on the same base URL flips status to Failed
+        // but PRESERVES the rows.
+        server.reset().await;
+        mount_models_json(&server, 401, json!({"error": "denied"})).await;
+        let status = client.refresh_catalog_cache(&mut cache, 3600).await;
+        assert!(matches!(
+            status,
+            CatalogStatus::Failed {
+                reason: CatalogRefreshError::Unauthorized,
+                ..
+            }
+        ));
+        let cached = cache.get("openrouter", &fp).expect("entry still present");
+        assert_eq!(
+            cached.offerings.len(),
+            1,
+            "rows from the prior success must survive a failed refresh"
+        );
+        assert!(matches!(cached.status, CatalogStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn live_catalog_is_scoped_by_base_url_fingerprint() {
+        // Same provider, two different base URLs -> two distinct cache scopes.
+        let server_a = MockServer::start().await;
+        mount_models_json(&server_a, 200, json!({"data": [{"id": "synthetic-a"}]})).await;
+        let server_b = MockServer::start().await;
+        mount_models_json(&server_b, 200, json!({"data": [{"id": "synthetic-b"}]})).await;
+
+        let mut cache = ProviderCatalogCache::new();
+        openrouter_client_for(&server_a)
+            .refresh_catalog_cache(&mut cache, 3600)
+            .await;
+        openrouter_client_for(&server_b)
+            .refresh_catalog_cache(&mut cache, 3600)
+            .await;
+
+        let fp_a = base_url_fingerprint(&server_a.uri());
+        let fp_b = base_url_fingerprint(&server_b.uri());
+        assert_ne!(
+            fp_a, fp_b,
+            "different base URLs must fingerprint differently"
+        );
+        assert_eq!(
+            cache.get("openrouter", &fp_a).expect("a").offerings[0].wire_model_id,
+            "synthetic-a"
+        );
+        assert_eq!(
+            cache.get("openrouter", &fp_b).expect("b").offerings[0].wire_model_id,
+            "synthetic-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_rows_survive_a_live_refresh_failure() {
+        // Bundled/static rows compile through even when the live layer is empty
+        // (the state after a failed refresh with no prior success).
+        let server = MockServer::start().await;
+        mount_models_json(&server, 503, json!({"error": "down"})).await;
+        let client = openrouter_client_for(&server);
+        let mut cache = ProviderCatalogCache::new();
+        let status = client.refresh_catalog_cache(&mut cache, 3600).await;
+        assert!(matches!(status, CatalogStatus::Failed { .. }));
+
+        let static_row = CatalogOffering {
+            provider: "openrouter".to_string(),
+            wire_model_id: "synthetic-static".to_string(),
+            endpoint_key: "chat".to_string(),
+            ..CatalogOffering::default()
+        };
+        let fp = base_url_fingerprint(&server.uri());
+        let fresh_live: Vec<CatalogOffering> = cache
+            .get("openrouter", &fp)
+            .filter(|entry| entry.is_fresh(now_unix()))
+            .map(|entry| entry.offerings.clone())
+            .unwrap_or_default();
+        let snapshot = codewhale_config::catalog::CatalogCompiler::new()
+            .with_bundled(vec![static_row])
+            .with_live(fresh_live)
+            .compile();
+        assert!(
+            snapshot
+                .offerings
+                .iter()
+                .any(|offering| offering.wire_model_id == "synthetic-static"),
+            "static fallback row must remain available after a failed refresh"
         );
     }
 
