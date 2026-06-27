@@ -1,11 +1,11 @@
 # ACP Registry Submission Prep
 
-Prepared for #3192. This is local maintainer prep only; do not open or push the
-external `agentclientprotocol/registry` PR from this train.
+Prepared for #3192. The external registry submission is now open as
+`agentclientprotocol/registry#411`.
 
 ## Upstream Registry Requirements
 
-Checked against `agentclientprotocol/registry` on 2026-06-14:
+Checked against `agentclientprotocol/registry` on 2026-06-27:
 
 - New entries live in a directory whose name matches the `id` field.
 - Each entry needs `agent.json` plus a required `icon.svg`.
@@ -70,11 +70,12 @@ Known limitations to state clearly:
 - ACP does not expose shell tools, file-write tools, checkpoint replay, session
   loading, or the HTTP/SSE runtime API.
 - Registry submission should be gated on a local run of the upstream registry
-  auth-check before opening the external PR.
+  auth-check before opening the external PR. That check passed locally before
+  `agentclientprotocol/registry#411` was opened.
 
-Recommendation: submit an `npx` distribution first after the matching npm
-version is published. It avoids direct release-asset URL churn and lets the npm
-wrapper handle platform selection, checksums, mirrors, and glibc preflight.
+The submitted registry PR uses the `npx` distribution because
+`codewhale@0.8.65` is already published and the npm wrapper handles platform
+selection, checksums, mirrors, and glibc preflight.
 
 ## External Registry Files
 
@@ -86,8 +87,7 @@ codewhale/
   icon.svg
 ```
 
-Replace `0.8.61` with the final published CodeWhale version. Do not use
-`@latest`.
+Use a concrete published version. Do not use `@latest`.
 
 ### `codewhale/agent.json`
 
@@ -95,7 +95,7 @@ Replace `0.8.61` with the final published CodeWhale version. Do not use
 {
   "id": "codewhale",
   "name": "CodeWhale",
-  "version": "0.8.61",
+  "version": "0.8.65",
   "description": "Provider-agnostic terminal coding agent with first-class DeepSeek support.",
   "repository": "https://github.com/Hmbown/CodeWhale",
   "website": "https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md#acp-stdio-adapter-codewhale-serve---acp",
@@ -103,7 +103,7 @@ Replace `0.8.61` with the final published CodeWhale version. Do not use
   "license": "MIT",
   "distribution": {
     "npx": {
-      "package": "codewhale@0.8.61",
+      "package": "codewhale@0.8.65",
       "args": ["serve", "--acp"]
     }
   }
@@ -140,19 +140,21 @@ Local readiness checked in Hmbown/CodeWhale:
 - ACP stdio adapter exists at `codewhale serve --acp`.
 - `initialize` returns terminal auth via `auth set --provider <provider>`.
 - `session/new`, `session/prompt`, and `session/cancel` are implemented.
+- `session/prompt` streams provider text deltas as `session/update` chunks.
 - The adapter is intentionally baseline: no ACP shell/file tools, no session
-  load, and no provider-token streaming yet.
+  load, and no full runtime API through ACP.
 
-Version: 0.8.61
+Version: 0.8.65
 ```
 
 ## Pre-Submission Checklist
 
-- Confirm `codewhale@0.8.61` is published to npm, or switch the draft to
-  versioned GitHub Release binary URLs that exist.
-- Run the upstream registry validator:
-  `python3 .github/workflows/verify_agents.py --auth-check --agent codewhale`
-- Verify `npx codewhale@0.8.61 serve --acp` returns `authMethods` from
-  `initialize` on a clean machine.
+- Confirm `codewhale@0.8.65` is published to npm: done on 2026-06-27.
+- Run the upstream registry validator: done on 2026-06-27 with
+  `python3 .github/workflows/verify_agents.py --auth-check --agent codewhale --verbose`;
+  result was `Auth OK: codewhale-terminal-auth(terminal)`.
+- Verify `npx -y codewhale@0.8.65 serve --acp` returns `authMethods` from
+  `initialize`: done on 2026-06-27.
 - Keep the external PR body explicit that ACP support is baseline and does not
-  imply the full TUI/runtime API is available inside ACP.
+  imply the full TUI/runtime API is available inside ACP: done in
+  `agentclientprotocol/registry#411`.
