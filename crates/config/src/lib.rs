@@ -3333,31 +3333,81 @@ pub fn resolve_state_dir(subdir: &str) -> Result<PathBuf> {
 /// stops growing (#3240). After migration, [`resolve_state_dir`] finds the
 /// data in the primary location; the read resolver itself is unchanged.
 pub fn ensure_state_dir(subdir: &str) -> Result<PathBuf> {
+    let (dir, migration) = ensure_state_dir_with_migration(subdir)?;
+    if let Some(migration) = migration {
+        eprintln!("{}", migration.user_notice());
+    }
+    Ok(dir)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateMigrationKind {
+    Relocated,
+    Copied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateMigration {
+    pub subdir: String,
+    pub legacy_path: PathBuf,
+    pub primary_path: PathBuf,
+    pub kind: StateMigrationKind,
+}
+
+impl StateMigration {
+    pub fn user_notice(&self) -> String {
+        let action = match self.kind {
+            StateMigrationKind::Relocated => "relocated",
+            StateMigrationKind::Copied => "copied",
+        };
+        let legacy_detail = match self.kind {
+            StateMigrationKind::Relocated => {
+                "The legacy .deepseek copy for this state path was removed by the move."
+            }
+            StateMigrationKind::Copied => {
+                "The legacy .deepseek copy was left in place because a direct move failed."
+            }
+        };
+
+        format!(
+            "CodeWhale migrated legacy state ({action}):\n  {} -> {}\nYour data was preserved. Use .codewhale as the canonical state location from now on.\n{legacy_detail}\nIf no other apps use it, you can remove the legacy .deepseek tree after confirming everything looks right.",
+            self.legacy_path.display(),
+            self.primary_path.display(),
+        )
+    }
+}
+
+/// Variant of [`ensure_state_dir`] that exposes whether a legacy state path was
+/// migrated. Most callers should use [`ensure_state_dir`]; this is kept for
+/// tests and future UI surfaces that want to render the notice themselves.
+pub fn ensure_state_dir_with_migration(subdir: &str) -> Result<(PathBuf, Option<StateMigration>)> {
     ensure_safe_state_subdir(subdir)?;
     let explicit_codewhale_home = codewhale_home_env_override().is_some();
     let dir = codewhale_home()?.join(subdir);
-    if !explicit_codewhale_home {
-        migrate_legacy_state_dir(&dir, subdir)?;
-    }
+    let migration = if !explicit_codewhale_home {
+        migrate_legacy_state_dir(&dir, subdir)?
+    } else {
+        None
+    };
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create {}/", dir.display()))?;
-    Ok(dir)
+    Ok((dir, migration))
 }
 
 /// One-time relocation of a legacy `~/.deepseek/<subdir>` state directory into
 /// the primary `~/.codewhale/<subdir>` location (#3240). No-op once the primary
 /// exists, for the root sentinel `"."` (a whole-tree move is owned by the
 /// config-file migration), or when no legacy directory is present.
-fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
+fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<Option<StateMigration>> {
     if primary.exists() || subdir == "." || subdir.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let legacy = match legacy_deepseek_home() {
         Ok(home) => home.join(subdir),
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     if !legacy.exists() {
-        return Ok(());
+        return Ok(None);
     }
     // The primary's parent (the ~/.codewhale root) must exist for the rename.
     if let Some(parent) = primary.parent()
@@ -3378,6 +3428,12 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
                 legacy.display(),
                 primary.display()
             );
+            return Ok(Some(StateMigration {
+                subdir: subdir.to_string(),
+                legacy_path: legacy,
+                primary_path: primary.to_path_buf(),
+                kind: StateMigrationKind::Relocated,
+            }));
         }
         Err(err) => {
             // Cross-device rename or permission issue: fall back to a
@@ -3393,6 +3449,12 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
                         legacy.display(),
                         primary.display()
                     );
+                    return Ok(Some(StateMigration {
+                        subdir: subdir.to_string(),
+                        legacy_path: legacy,
+                        primary_path: primary.to_path_buf(),
+                        kind: StateMigrationKind::Copied,
+                    }));
                 }
                 Err(copy_err) => {
                     tracing::warn!(
@@ -3406,7 +3468,7 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Recursively copy a directory tree from `src` to `dst`, creating `dst`.

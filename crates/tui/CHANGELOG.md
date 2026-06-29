@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Surfaced legacy state relocation with a user-visible migration notice whenever
+  `~/.deepseek/<state>` is moved or copied into `~/.codewhale/<state>`, so
+  upgraded users know their data was preserved and where the canonical state
+  now lives (#3726).
 - Restored legacy `.deepseek/sessions` visibility for upgraded installs where
   an empty `~/.codewhale/sessions` directory already existed, by copying
   missing legacy session entries into the primary CodeWhale session store

@@ -2464,8 +2464,14 @@ fn ensure_state_dir_relocates_legacy_subdir_on_first_write() {
     .expect("legacy file");
     assert!(!state_env.primary("slop_ledger").exists());
 
-    let dir = ensure_state_dir("slop_ledger").expect("ensure_state_dir");
+    let (dir, migration) =
+        ensure_state_dir_with_migration("slop_ledger").expect("ensure_state_dir");
     assert_eq!(dir, state_env.primary("slop_ledger"));
+    let migration = migration.expect("legacy migration should be reported");
+    assert_eq!(migration.kind, StateMigrationKind::Relocated);
+    assert_eq!(migration.subdir, "slop_ledger");
+    assert_eq!(migration.legacy_path, state_env.legacy("slop_ledger"));
+    assert_eq!(migration.primary_path, state_env.primary("slop_ledger"));
     // Legacy contents relocated into primary.
     assert_eq!(
         fs::read_to_string(state_env.primary("slop_ledger").join("slop_ledger.json"))
@@ -2478,8 +2484,44 @@ fn ensure_state_dir_relocates_legacy_subdir_on_first_write() {
         "legacy subdir should be removed after relocation"
     );
     // Idempotent: a second call is a no-op now that primary exists.
-    ensure_state_dir("slop_ledger").expect("idempotent ensure");
+    let (_, repeated_migration) =
+        ensure_state_dir_with_migration("slop_ledger").expect("idempotent ensure");
+    assert!(repeated_migration.is_none());
     let _ = fs::remove_dir_all(&state_env.home);
+}
+
+#[test]
+fn state_migration_notice_explains_preserved_data_and_canonical_root() {
+    let migration = StateMigration {
+        subdir: "sessions".to_string(),
+        legacy_path: PathBuf::from("/home/alice/.deepseek/sessions"),
+        primary_path: PathBuf::from("/home/alice/.codewhale/sessions"),
+        kind: StateMigrationKind::Relocated,
+    };
+
+    let notice = migration.user_notice();
+
+    assert!(notice.contains("CodeWhale migrated legacy state"));
+    assert!(notice.contains("/home/alice/.deepseek/sessions"));
+    assert!(notice.contains("/home/alice/.codewhale/sessions"));
+    assert!(notice.contains("Your data was preserved"));
+    assert!(notice.contains("Use .codewhale as the canonical state location"));
+    assert!(notice.contains("remove the legacy .deepseek tree"));
+}
+
+#[test]
+fn copied_state_migration_notice_says_legacy_copy_remains() {
+    let migration = StateMigration {
+        subdir: "catalog".to_string(),
+        legacy_path: PathBuf::from("/home/alice/.deepseek/catalog"),
+        primary_path: PathBuf::from("/home/alice/.codewhale/catalog"),
+        kind: StateMigrationKind::Copied,
+    };
+
+    let notice = migration.user_notice();
+
+    assert!(notice.contains("copied"));
+    assert!(notice.contains("legacy .deepseek copy was left in place"));
 }
 
 #[test]
@@ -2496,8 +2538,12 @@ fn ensure_state_dir_writes_to_primary_when_both_exist() {
     fs::create_dir_all(state_env.legacy("sessions")).expect("legacy dir");
     fs::write(state_env.legacy("sessions").join("old.json"), b"legacy").expect("legacy file");
 
-    let dir = ensure_state_dir("sessions").expect("ensure_state_dir");
+    let (dir, migration) = ensure_state_dir_with_migration("sessions").expect("ensure_state_dir");
     assert_eq!(dir, state_env.primary("sessions"));
+    assert!(
+        migration.is_none(),
+        "existing primary must not emit a migration event"
+    );
     // Primary untouched; legacy orphan left as-is (not migrated, not deleted).
     assert_eq!(
         fs::read_to_string(state_env.primary("sessions").join("a.json")).expect("primary"),
