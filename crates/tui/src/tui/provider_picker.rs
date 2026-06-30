@@ -23,7 +23,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 
 use crate::config::{ApiProvider, Config, has_api_key_for, kimi_cli_credentials_present};
@@ -31,7 +31,10 @@ use crate::core::ops::ProviderRuntimeStatus;
 use crate::model_profile::{SupportState, resolved_capability_profile};
 use crate::palette;
 use crate::tui::app::ReasoningEffort;
-use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    render_modal_footer, render_modal_surface,
+};
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
 use codewhale_config::provider::WireFormat;
 use codewhale_config::route::{
@@ -1209,27 +1212,28 @@ impl ProviderPickerView {
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
             )))
-            .title_bottom(Line::from(vec![
-                Span::styled(" ↑↓ ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("move "),
-                Span::styled(" a-z ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("jump "),
-                Span::styled(" Enter ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw(format!("{enter_action} ")),
-                Span::styled(" R ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("edit key "),
-                Span::styled(" M ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("models "),
-                Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("cancel "),
-            ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default());
+            .style(Style::default().bg(palette::DEEPSEEK_INK));
         let inner = outer.inner(area);
         outer.render(area, buf);
 
-        let visible_rows = usize::from(inner.height);
+        // The action footer moves into the body so it wraps instead of clipping
+        // at narrow widths (#3732); the provider list renders above it.
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", "move"),
+                ActionHint::new("a-z", "jump"),
+                ActionHint::new("Enter", enter_action),
+                ActionHint::new("R", "edit key"),
+                ActionHint::new("M", "models"),
+                ActionHint::new("Esc", "cancel"),
+            ],
+        );
+
+        let visible_rows = usize::from(content.height);
         let visible_start = self.visible_start(visible_rows);
         let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
         for (idx, row) in self
@@ -1277,7 +1281,7 @@ impl ProviderPickerView {
             ]);
             if is_selected {
                 line.style = Self::selected_row_bg_style();
-                let target_width = usize::from(inner.width);
+                let target_width = usize::from(content.width);
                 let line_width = line.width();
                 if line_width < target_width {
                     line.spans.push(Span::styled(
@@ -1288,7 +1292,7 @@ impl ProviderPickerView {
             }
             lines.push(line);
         }
-        Paragraph::new(lines).render(inner, buf);
+        Paragraph::new(lines).render(content, buf);
     }
 
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
@@ -1300,17 +1304,22 @@ impl ProviderPickerView {
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
             )))
-            .title_bottom(Line::from(vec![
-                Span::styled(" Enter ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("save & switch "),
-                Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("back "),
-            ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default());
+            .style(Style::default().bg(palette::DEEPSEEK_INK));
         let inner = outer.inner(area);
         outer.render(area, buf);
+
+        // The action footer moves into the body so it wraps instead of clipping
+        // at narrow widths (#3732); the key-entry fields render above it.
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("Enter", "save & switch"),
+                ActionHint::new("Esc", "back"),
+            ],
+        );
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -1319,7 +1328,7 @@ impl ProviderPickerView {
                 Constraint::Length(2),
                 Constraint::Min(1),
             ])
-            .split(inner);
+            .split(content);
 
         let masked = mask_key(&self.api_key_input);
         let display = if masked.is_empty() {
@@ -1488,21 +1497,13 @@ impl ModalView for ProviderPickerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = 120.min(area.width.saturating_sub(4)).max(64);
-        let popup_height = match self.stage {
+        let preferred_height = match self.stage {
             Stage::List => (self.rows.len() as u16).saturating_add(2),
             Stage::KeyEntry => 10,
-        }
-        .min(area.height.saturating_sub(4))
-        .max(8);
-        let popup_area = Rect {
-            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
-            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
         };
+        let popup_area = centered_modal_area(area, 120, preferred_height, 64, 8);
 
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
 
         match self.stage {
             Stage::List => self.render_list(popup_area, buf),
@@ -2478,6 +2479,76 @@ mod tests {
 
         assert!(rendered.contains("DeepSeek *"));
         assert!(rendered.contains("Ollama"));
+    }
+
+    /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every
+    /// overlay to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn provider_picker_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        // Provider display names contain capital X/Q (Xiaomi MiMo, Qianfan), so
+        // use a glyph that can never appear in the modal content as the
+        // bleed-through sentinel.
+        const SENTINEL: &str = "\u{2592}"; // ▒
+        let config = Config::default();
+        // Make the first provider in the sorted list active so its highlighted
+        // row sits at the top of the list, never on the vertical center cell
+        // that must read as the opaque modal ink.
+        let active = ProviderPickerView::new(ApiProvider::Deepseek, &config).rows[0].provider;
+
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol(SENTINEL);
+                }
+            }
+            // Render through the ViewStack so the shared opaque backdrop is
+            // painted exactly as it is in production.
+            let mut stack = ViewStack::new();
+            stack.push(ProviderPickerView::new(active, &config));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            let text = rows.join("\n");
+
+            // Footer keeps every action (it wraps instead of clipping).
+            for label in ["move", "jump", "edit key", "models", "cancel"] {
+                assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
+            }
+            // The Enter action label is dynamic (apply vs set key); one shows.
+            assert!(
+                text.contains("apply") || text.contains("set key"),
+                "{w}x{h}: missing Enter action label"
+            );
+            // Composited frame is fully opaque: no sentinel survives and the
+            // center cell carries the modal ink background.
+            assert!(
+                !text.contains(SENTINEL),
+                "{w}x{h}: background bleed-through into modal surface"
+            );
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+            // No row exceeds the frame width (no horizontal overflow).
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -14,14 +14,17 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 
 use crate::config::{ApiProvider, model_completion_names_for_provider};
 use crate::model_registry;
 use crate::palette;
 use crate::tui::app::{App, ReasoningEffort};
-use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    render_modal_footer, render_modal_surface,
+};
 
 /// Thinking-effort rows shown for DeepSeek-style providers, in the order
 /// DeepSeek behaviorally distinguishes them.
@@ -745,31 +748,15 @@ impl ModalView for ModelPickerView {
 
 impl ModelPickerView {
     fn render_classic(&self, area: Rect, buf: &mut Buffer) {
-        let available_width = area.width.saturating_sub(4);
-        let popup_width = if available_width >= 60 {
-            available_width.min(96)
-        } else {
-            area.width.saturating_sub(2).max(1)
-        };
         let desired_height = (self.model_row_count().max(self.current_efforts().len()) as u16)
             .saturating_add(4)
             .clamp(10, 22);
-        let available_height = area.height.saturating_sub(4);
-        let popup_height = if available_height >= 10 {
-            desired_height.min(available_height)
-        } else {
-            area.height.saturating_sub(2).max(1)
-        };
-        let popup_area = Rect {
-            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
-            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        let popup_area = centered_modal_area(area, 96, desired_height, 60, 10);
 
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
 
-        // Outer chrome with title + footer hint.
+        // Outer chrome with title; the action footer moves into the body so it
+        // wraps instead of clipping at narrow widths (#3732).
         let outer = Block::default()
             .title(Line::from(Span::styled(
                 " Model & thinking ",
@@ -777,28 +764,28 @@ impl ModelPickerView {
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
             )))
-            .title_bottom(Line::from(vec![
-                Span::styled(" ↑↓ ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("move "),
-                Span::styled(" Tab ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("switch "),
-                Span::styled(" Type ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("filter "),
-                Span::styled(" Enter ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("apply "),
-                Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("cancel "),
-            ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default());
+            .style(Style::default().bg(palette::DEEPSEEK_INK));
         let inner = outer.inner(popup_area);
         outer.render(popup_area, buf);
+
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", "move"),
+                ActionHint::new("Tab", "switch"),
+                ActionHint::new("Type", "filter"),
+                ActionHint::new("Enter", "apply"),
+                ActionHint::new("Esc", "cancel"),
+            ],
+        );
 
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(inner);
+            .split(content);
 
         let mut model_rows: Vec<(String, String)> = self
             .visible_model_rows()
@@ -1848,6 +1835,65 @@ mod tests {
         ));
 
         assert!(matches!(action, ViewAction::Close));
+    }
+
+    /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every
+    /// overlay to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn model_picker_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        let (app, _lock) = create_test_app();
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            // Pre-fill with a sentinel so any cell the composited modal fails to
+            // paint (bleed-through) is detectable as a surviving 'X'. The default
+            // test app uses DeepSeek model ids, so 'X' never appears legitimately.
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            // Render through the ViewStack so the shared opaque backdrop is
+            // painted exactly as it is in production.
+            let mut stack = ViewStack::new();
+            stack.push(ModelPickerView::new(&app));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            let text = rows.join("\n");
+
+            // Footer keeps every action (it wraps instead of clipping).
+            for label in ["move", "switch", "filter", "apply", "cancel"] {
+                assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
+            }
+            // Composited frame is fully opaque: no sentinel survives and the
+            // center cell carries the modal ink background.
+            assert!(
+                !text.contains('X'),
+                "{w}x{h}: background bleed-through into modal surface"
+            );
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+            // No row exceeds the frame width (no horizontal overflow).
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]
