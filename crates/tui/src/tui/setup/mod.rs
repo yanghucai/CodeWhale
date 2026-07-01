@@ -135,6 +135,7 @@ pub struct SetupWizardView {
     selected: usize,
     locale: Locale,
     facts: SetupRuntimeFacts,
+    guided_preview_seen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +266,7 @@ impl SetupWizardView {
             selected,
             locale,
             facts: SetupRuntimeFacts::default(),
+            guided_preview_seen: false,
         }
     }
 
@@ -309,6 +311,7 @@ impl SetupWizardView {
             selected,
             locale,
             facts,
+            guided_preview_seen: false,
         }
     }
 
@@ -323,6 +326,7 @@ impl SetupWizardView {
             selected: step_index(step),
             locale,
             facts,
+            guided_preview_seen: false,
         }
     }
 
@@ -423,6 +427,10 @@ impl SetupWizardView {
     }
 
     fn commit_guided_constitution(&mut self) -> ViewAction {
+        if !self.guided_preview_seen {
+            return self.preview_guided_constitution();
+        }
+
         let constitution = guided_constitution_template(self.locale);
         let mut state = self.state.clone();
         state.complete_constitution_checkpoint(
@@ -449,6 +457,14 @@ impl SetupWizardView {
             constitution,
             state,
             message: tr(self.locale, MessageId::SetupCheckpointDoneGuided).to_string(),
+        })
+    }
+
+    fn preview_guided_constitution(&mut self) -> ViewAction {
+        self.guided_preview_seen = true;
+        ViewAction::Emit(ViewEvent::OpenTextPager {
+            title: "Guided Constitution Preview".to_string(),
+            content: guided_constitution_preview_text(self.locale),
         })
     }
 
@@ -910,6 +926,26 @@ fn guided_constitution_template(locale: Locale) -> UserConstitution {
     }
 }
 
+fn guided_constitution_preview_text(locale: Locale) -> String {
+    let constitution = guided_constitution_template(locale);
+    let intro = match locale {
+        Locale::ZhHans => {
+            "这是将要保存的用户全局宪法预览。关闭预览后再次按 G 保存，或返回设置选择内置/稍后。"
+        }
+        _ => {
+            "This is the user-global constitution preview that will be saved. Close this preview and press G again to save, or return to setup and choose bundled/defer."
+        }
+    };
+    let rendered = constitution
+        .render_block(None)
+        .unwrap_or_else(|| "The structured constitution is empty.".to_string());
+
+    format!(
+        "{intro}\n\n{rendered}\n\n{}",
+        tr(locale, MessageId::SetupCheckpointLayerOrder)
+    )
+}
+
 fn constitution_choice_label(choice: ConstitutionChoice) -> &'static str {
     match choice {
         ConstitutionChoice::Unset => "unset",
@@ -1120,8 +1156,18 @@ mod tests {
     }
 
     #[test]
-    fn guided_constitution_commit_emits_structured_payload() {
+    fn guided_constitution_requires_preview_before_save() {
         let mut view = SetupWizardView::new(SetupState::default(), Locale::En);
+
+        let action = view.handle_key(key(KeyCode::Char('g')));
+
+        let ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) = action else {
+            panic!("expected guided constitution preview event");
+        };
+        assert!(title.contains("Guided Constitution Preview"));
+        assert!(content.contains("<codewhale_user_constitution"));
+        assert!(content.contains("press G again to save"));
+        assert_eq!(view.state().constitution_choice, ConstitutionChoice::Unset);
 
         let action = view.handle_key(key(KeyCode::Char('g')));
 
@@ -1173,6 +1219,19 @@ mod tests {
 
         assert!(english.contains("evidence-first coding workbench"));
         assert!(zh_hans.contains("重证据"));
+        assert_ne!(english, zh_hans);
+    }
+
+    #[test]
+    fn guided_constitution_preview_uses_rendered_block_and_layer_order() {
+        let english = guided_constitution_preview_text(Locale::En);
+        let zh_hans = guided_constitution_preview_text(Locale::ZhHans);
+
+        assert!(english.contains("<codewhale_user_constitution"));
+        assert!(english.contains("Layer order"));
+        assert!(english.contains("press G again to save"));
+        assert!(zh_hans.contains("<codewhale_user_constitution"));
+        assert!(zh_hans.contains("再次按 G 保存"));
         assert_ne!(english, zh_hans);
     }
 
