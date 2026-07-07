@@ -8966,6 +8966,7 @@ async fn model_picker_persists_model_and_reasoning_effort() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn model_picker_skips_setup_receipt_when_settings_persistence_fails() {
     let _lock = crate::test_support::lock_test_env();
     let tmp = TempDir::new().expect("settings tempdir");

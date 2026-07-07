@@ -2342,12 +2342,11 @@ mod tests {
         // Explicit-user-override clause keeps the prompt useful for the
         // opposite preference (#1118 commenters who want English
         // thinking for token-cost reasons).
-        for phrase in ["think in English"] {
-            assert!(
-                lang.contains(phrase) && LOCALE_CLOSER_ZH_HANS.contains(phrase),
-                "expected the user-override example `{phrase}`"
-            );
-        }
+        let phrase = "think in English";
+        assert!(
+            lang.contains(phrase) && LOCALE_CLOSER_ZH_HANS.contains(phrase),
+            "expected the user-override example `{phrase}`"
+        );
     }
 
     #[test]

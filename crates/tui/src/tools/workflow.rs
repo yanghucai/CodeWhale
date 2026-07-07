@@ -436,18 +436,17 @@ async fn run_workflow_vm(
         }
     }
     let task_records = driver.task_records_snapshot();
-    if let Ok(mut runs_guard) = runs.lock() {
-        if let Some(record) = runs_guard.get_mut(&run_id) {
-            if record.status != WorkflowRunStatus::Cancelled {
-                record.status = status;
-                record.result = output;
-                record.error = error;
-                record.execution = spec
-                    .as_ref()
-                    .map(|spec| execution_from_declarative_spec(spec, task_records, status));
-                record.completed_at_ms = Some(now_ms());
-            }
-        }
+    if let Ok(mut runs_guard) = runs.lock()
+        && let Some(record) = runs_guard.get_mut(&run_id)
+        && record.status != WorkflowRunStatus::Cancelled
+    {
+        record.status = status;
+        record.result = output;
+        record.error = error;
+        record.execution = spec
+            .as_ref()
+            .map(|spec| execution_from_declarative_spec(spec, task_records, status));
+        record.completed_at_ms = Some(now_ms());
     }
     if let Ok(mut controllers_guard) = controllers.lock() {
         controllers_guard.remove(&run_id);
@@ -893,6 +892,7 @@ fn is_write_or_shell_tool(tool: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn task_options_expression(
     description_expr: String,
     subagent_type: &str,
@@ -1013,10 +1013,10 @@ impl SubAgentWorkflowDriver {
     }
 
     fn record_child(&self, agent_id: &str) {
-        if let Ok(mut ids) = self.child_ids.lock() {
-            if !ids.iter().any(|id| id == agent_id) {
-                ids.push(agent_id.to_string());
-            }
+        if let Ok(mut ids) = self.child_ids.lock()
+            && !ids.iter().any(|id| id == agent_id)
+        {
+            ids.push(agent_id.to_string());
         }
         if let Ok(mut runs) = self.runs.lock()
             && let Some(record) = runs.get_mut(&self.run_id)

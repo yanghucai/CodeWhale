@@ -2582,7 +2582,7 @@ async fn streamable_http_caps_chunked_bodies_without_content_length() {
                     )
                     .await
                     .unwrap();
-                let chunk = vec![b'x'; 32];
+                let chunk = [b'x'; 32];
                 let mut sent = 0;
                 while sent < total {
                     let n = chunk.len().min(total - sent);

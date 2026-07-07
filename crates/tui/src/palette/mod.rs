@@ -17,7 +17,10 @@ mod tokens;
 #[cfg(test)]
 mod tests;
 
+#[allow(unused_imports)]
 pub use adapt::*;
+#[allow(unused_imports)]
 pub use detect::*;
+#[allow(unused_imports)]
 pub use themes::*;
 pub use tokens::*;
