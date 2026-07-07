@@ -3367,7 +3367,10 @@ fn onboarding_provider_copy_is_provider_neutral_in_en() {
     let api_title = tr(Locale::En, MessageId::OnboardApiKeyTitle);
     assert!(!title.to_ascii_lowercase().contains("deepseek"), "{title}");
     assert!(!blurb.to_ascii_lowercase().contains("deepseek"), "{blurb}");
-    assert!(!api_title.to_ascii_lowercase().contains("deepseek"), "{api_title}");
+    assert!(
+        !api_title.to_ascii_lowercase().contains("deepseek"),
+        "{api_title}"
+    );
 }
 
 #[test]

@@ -1,10 +1,7 @@
 //! Terminal palette-mode and color-depth detection.
 
-use ratatui::style::Color;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-
-use super::tokens::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {

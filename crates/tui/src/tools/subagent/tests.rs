@@ -5368,9 +5368,8 @@ fn subagent_budget_exhaustion_completion_carries_budget_exhausted_sentinel() {
 #[test]
 fn subagent_completion_inlines_evidence_before_sentinel() {
     let mut snap = make_snapshot(SubAgentStatus::Completed);
-    snap.result = Some(
-        "VERDICT: pass\n### EVIDENCE\n- src/lib.rs:1-3 — init ok\n### GAPS\nnone".to_string(),
-    );
+    snap.result =
+        Some("VERDICT: pass\n### EVIDENCE\n- src/lib.rs:1-3 — init ok\n### GAPS\nnone".to_string());
     let completion = subagent_completion_from_result(&snap);
     let evidence_pos = completion
         .payload

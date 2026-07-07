@@ -4442,10 +4442,7 @@ fn clip_evidence_block(block: &str) -> (String, bool) {
     if total <= SUBAGENT_EVIDENCE_CHAR_BUDGET {
         return (block.to_string(), false);
     }
-    let clipped: String = block
-        .chars()
-        .take(SUBAGENT_EVIDENCE_CHAR_BUDGET)
-        .collect();
+    let clipped: String = block.chars().take(SUBAGENT_EVIDENCE_CHAR_BUDGET).collect();
     (format!("{clipped}…"), true)
 }
 
