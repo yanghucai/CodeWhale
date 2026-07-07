@@ -8,6 +8,7 @@ use crate::palette;
 use crate::tui::app::App;
 
 pub fn lines(app: &App) -> Vec<Line<'static>> {
+    let provider = app.onboarding_provider;
     let mut lines = vec![
         Line::from(Span::styled(
             app.tr(MessageId::OnboardApiKeyTitle).to_string(),
@@ -17,9 +18,26 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            app.tr(MessageId::OnboardApiKeyStep1).to_string(),
+            format!(
+                "{} ({})",
+                app.tr(MessageId::OnboardApiKeyStep1).to_string(),
+                provider.display_name()
+            ),
             Style::default().fg(palette::TEXT_PRIMARY),
         )),
+    ];
+    if let Some(url) = provider.credential_url() {
+        lines.push(Line::from(Span::styled(
+            url.to_string(),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            app.tr(MessageId::OnboardApiKeyLocalHint).to_string(),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    }
+    lines.extend([
         Line::from(Span::styled(
             app.tr(MessageId::OnboardApiKeyStep2).to_string(),
             Style::default().fg(palette::TEXT_PRIMARY),
@@ -34,7 +52,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(palette::TEXT_MUTED),
         )),
         Line::from(""),
-    ];
+    ]);
 
     let masked = mask_key(&app.api_key_input);
     let placeholder = app.tr(MessageId::OnboardApiKeyPlaceholder).to_string();
@@ -141,7 +159,8 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(body.contains("DeepSeek API"), "title carries DeepSeek API");
+        assert!(body.contains("Connect your API key"), "title is provider-neutral");
+        assert!(body.contains("platform.deepseek.com"), "expected default DeepSeek credential URL, got: {body}");
         assert!(
             body.contains("密钥"),
             "expected zh-Hans 'key' label, got: {body}"

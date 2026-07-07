@@ -7568,7 +7568,7 @@ fn onboarding_after_api_key_save_does_not_repeat_language_step() {
     app.trust_mode = true;
     app.status_message = Some("saved".to_string());
 
-    crate::tui::onboarding::advance_onboarding_after_language(&mut app);
+    crate::tui::onboarding::advance_onboarding_after_api_key(&mut app);
 
     assert_eq!(app.onboarding, OnboardingState::Tips);
     assert_eq!(app.status_message, None);
@@ -7583,13 +7583,13 @@ fn onboarding_after_api_key_save_routes_to_trust_when_needed() {
     app.onboarding_needs_api_key = false;
     app.trust_mode = false;
 
-    crate::tui::onboarding::advance_onboarding_after_language(&mut app);
+    crate::tui::onboarding::advance_onboarding_after_api_key(&mut app);
 
     assert_eq!(app.onboarding, OnboardingState::TrustDirectory);
 }
 
 #[test]
-fn api_key_escape_returns_to_language_step() {
+fn api_key_escape_returns_to_provider_step() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::ApiKey;
     app.api_key_input = "sk-test-value".to_string();
@@ -7598,7 +7598,7 @@ fn api_key_escape_returns_to_language_step() {
 
     back_from_api_key_onboarding(&mut app);
 
-    assert_eq!(app.onboarding, OnboardingState::Language);
+    assert_eq!(app.onboarding, OnboardingState::Provider);
     assert!(app.api_key_input.is_empty());
     assert_eq!(app.api_key_cursor, 0);
     assert_eq!(app.status_message, None);

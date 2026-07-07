@@ -6072,8 +6072,8 @@ fn save_api_key_to_config_file(api_key: &str) -> Result<PathBuf> {
         // Create new minimal config
         let content = format!(
             r#"# codewhale Configuration
-# Get your API key from https://platform.deepseek.com
-# Or set DEEPSEEK_API_KEY environment variable
+# Set provider credentials in this file or via environment variables.
+# See /links in the TUI for provider-specific credential pages.
 
 api_key = "{api_key}"
 

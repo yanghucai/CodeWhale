@@ -627,9 +627,14 @@ fn complete_trust_directory_onboarding(app: &mut App, config: &Config) -> Result
 }
 
 fn back_from_api_key_onboarding(app: &mut App) {
-    app.onboarding = OnboardingState::Language;
+    app.onboarding = OnboardingState::Provider;
     app.api_key_input.clear();
     app.api_key_cursor = 0;
+    app.status_message = None;
+}
+
+fn back_from_provider_onboarding(app: &mut App) {
+    app.onboarding = OnboardingState::Language;
     app.status_message = None;
 }
 
@@ -3856,6 +3861,9 @@ async fn run_event_loop(
                     KeyCode::Esc if app.onboarding == OnboardingState::ApiKey => {
                         back_from_api_key_onboarding(app);
                     }
+                    KeyCode::Esc if app.onboarding == OnboardingState::Provider => {
+                        back_from_provider_onboarding(app);
+                    }
                     KeyCode::Esc if app.onboarding == OnboardingState::Language => {
                         app.onboarding = OnboardingState::Welcome;
                         app.status_message = None;
@@ -3889,6 +3897,22 @@ async fn run_event_loop(
                             }
                         }
                     }
+                    KeyCode::Char(c)
+                        if app.onboarding == OnboardingState::Provider && c.is_ascii_digit() =>
+                    {
+                        if let Some((_, provider)) = onboarding::ONBOARDING_PROVIDER_OPTIONS
+                            .iter()
+                            .find(|(hotkey, _)| *hotkey == c)
+                        {
+                            onboarding::select_onboarding_provider(app, *provider);
+                        }
+                    }
+                    KeyCode::Up if app.onboarding == OnboardingState::Provider => {
+                        onboarding::move_onboarding_provider_selection(app, -1);
+                    }
+                    KeyCode::Down if app.onboarding == OnboardingState::Provider => {
+                        onboarding::move_onboarding_provider_selection(app, 1);
+                    }
                     KeyCode::Enter => match app.onboarding {
                         OnboardingState::Welcome => {
                             onboarding::advance_onboarding_from_welcome(app);
@@ -3897,6 +3921,9 @@ async fn run_event_loop(
                             // Enter without a digit pick keeps the existing
                             // setting (which defaults to "auto").
                             onboarding::advance_onboarding_after_language(app);
+                        }
+                        OnboardingState::Provider => {
+                            onboarding::advance_onboarding_from_provider(app);
                         }
                         OnboardingState::ApiKey => {
                             let key = app.api_key_input.trim().to_string();
@@ -3921,38 +3948,22 @@ async fn run_event_loop(
                                         Some(4_000),
                                     );
                                     app.status_message = None;
-                                    // Recreate the engine so it picks up the newly saved key
-                                    // without requiring a full process restart.
-                                    let _ = engine_handle.send(Op::Shutdown).await;
-                                    // Stamp the new key on the long-lived
-                                    // `Config` reference so any future clone
-                                    // (e.g. a subsequent /provider switch)
-                                    // sees it; the explicit-override path
-                                    // in `deepseek_api_key` (#343) makes
-                                    // this win immediately.
-                                    config.api_key = Some(key.clone());
-                                    let mut refreshed_config = config.clone();
-                                    refreshed_config.api_key = Some(key);
-                                    let engine_config = build_engine_config(app, &refreshed_config);
-                                    engine_handle = spawn_engine(engine_config, &refreshed_config);
+                                    mirror_saved_api_key_in_config(
+                                        config,
+                                        app.onboarding_provider,
+                                        key.clone(),
+                                    );
+                                    switch_provider(
+                                        app,
+                                        &mut engine_handle,
+                                        config,
+                                        app.onboarding_provider,
+                                        None,
+                                    )
+                                    .await;
                                     app.offline_mode = false;
-                                    app.api_key_env_only = false;
 
-                                    if !app.api_messages.is_empty() {
-                                        let _ = engine_handle
-                                            .send(Op::SyncSession {
-                                                session_id: app.current_session_id.clone(),
-                                                messages: app.api_messages.clone(),
-                                                system_prompt: app.system_prompt.clone(),
-                                                system_prompt_override: false,
-                                                model: app.model.clone(),
-                                                workspace: app.workspace.clone(),
-                                                mode: app.mode,
-                                            })
-                                            .await;
-                                    }
-
-                                    onboarding::advance_onboarding_after_language(app);
+                                    onboarding::advance_onboarding_after_api_key(app);
                                 }
                                 Err(e) => {
                                     app.status_message = Some(e.to_string());
@@ -10927,63 +10938,60 @@ async fn apply_provider_picker_api_key(
         }
     }
 
-    // Mirror the saved key into the in-memory config so the engine sees it
-    // immediately without a reload — `save_api_key_for` only touches disk.
+    mirror_saved_api_key_in_config(config, provider, api_key);
+    switch_provider(app, engine_handle, config, provider, None).await;
+}
+
+fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, api_key: String) {
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         config.api_key = Some(api_key);
-    } else {
-        // Capture the custom entry key before borrowing `providers` (#1519).
-        let custom_key = (provider == ApiProvider::Custom).then(|| {
-            config
-                .provider
-                .clone()
-                .unwrap_or_else(|| "__custom__".to_string())
-        });
-        let providers = config
-            .providers
-            .get_or_insert_with(ProvidersConfig::default);
-        let entry: &mut ProviderConfig = match provider {
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
-                // Guarded by the outer `if` above; safety net against refactors.
-                return;
-            }
-            ApiProvider::Custom => providers
-                .custom
-                .entry(custom_key.expect("custom key captured for custom provider"))
-                .or_default(),
-            ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
-            ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
-            ApiProvider::Openai => &mut providers.openai,
-            ApiProvider::Atlascloud => &mut providers.atlascloud,
-            ApiProvider::WanjieArk => &mut providers.wanjie_ark,
-            ApiProvider::Volcengine => &mut providers.volcengine,
-            ApiProvider::Openrouter => &mut providers.openrouter,
-            ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
-            ApiProvider::Novita => &mut providers.novita,
-            ApiProvider::Fireworks => &mut providers.fireworks,
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
-            ApiProvider::Arcee => &mut providers.arcee,
-            ApiProvider::Moonshot => &mut providers.moonshot,
-            ApiProvider::Sglang => &mut providers.sglang,
-            ApiProvider::Vllm => &mut providers.vllm,
-            ApiProvider::Ollama => &mut providers.ollama,
-            ApiProvider::Huggingface => &mut providers.huggingface,
-            ApiProvider::Deepinfra => &mut providers.deepinfra,
-            ApiProvider::Together => &mut providers.together,
-            ApiProvider::Qianfan => &mut providers.qianfan,
-            ApiProvider::OpenaiCodex => &mut providers.openai_codex,
-            ApiProvider::Anthropic => &mut providers.anthropic,
-            ApiProvider::Openmodel => &mut providers.openmodel,
-            ApiProvider::Zai => &mut providers.zai,
-            ApiProvider::Stepfun => &mut providers.stepfun,
-            ApiProvider::Minimax => &mut providers.minimax,
-            ApiProvider::Sakana => &mut providers.sakana,
-            ApiProvider::LongCat => &mut providers.longcat,
-        };
-        entry.api_key = Some(api_key);
+        return;
     }
-
-    switch_provider(app, engine_handle, config, provider, None).await;
+    let custom_key = (provider == ApiProvider::Custom).then(|| {
+        config
+            .provider
+            .clone()
+            .unwrap_or_else(|| "__custom__".to_string())
+    });
+    let providers = config
+        .providers
+        .get_or_insert_with(ProvidersConfig::default);
+    let entry: &mut ProviderConfig = match provider {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => return,
+        ApiProvider::Custom => providers
+            .custom
+            .entry(custom_key.expect("custom key captured for custom provider"))
+            .or_default(),
+        ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
+        ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
+        ApiProvider::Openai => &mut providers.openai,
+        ApiProvider::Atlascloud => &mut providers.atlascloud,
+        ApiProvider::WanjieArk => &mut providers.wanjie_ark,
+        ApiProvider::Volcengine => &mut providers.volcengine,
+        ApiProvider::Openrouter => &mut providers.openrouter,
+        ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
+        ApiProvider::Novita => &mut providers.novita,
+        ApiProvider::Fireworks => &mut providers.fireworks,
+        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
+        ApiProvider::Arcee => &mut providers.arcee,
+        ApiProvider::Moonshot => &mut providers.moonshot,
+        ApiProvider::Sglang => &mut providers.sglang,
+        ApiProvider::Vllm => &mut providers.vllm,
+        ApiProvider::Ollama => &mut providers.ollama,
+        ApiProvider::Huggingface => &mut providers.huggingface,
+        ApiProvider::Deepinfra => &mut providers.deepinfra,
+        ApiProvider::Together => &mut providers.together,
+        ApiProvider::Qianfan => &mut providers.qianfan,
+        ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+        ApiProvider::Anthropic => &mut providers.anthropic,
+        ApiProvider::Openmodel => &mut providers.openmodel,
+        ApiProvider::Zai => &mut providers.zai,
+        ApiProvider::Stepfun => &mut providers.stepfun,
+        ApiProvider::Minimax => &mut providers.minimax,
+        ApiProvider::Sakana => &mut providers.sakana,
+        ApiProvider::LongCat => &mut providers.longcat,
+    };
+    entry.api_key = Some(api_key);
 }
 
 async fn apply_provider_picker_auth_mode(

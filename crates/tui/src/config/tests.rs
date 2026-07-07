@@ -2184,6 +2184,31 @@ fn save_api_key_writes_config_file_under_cfg_test() -> Result<()> {
 }
 
 #[test]
+fn save_api_key_onboarding_routes_openrouter_key_to_provider_table() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-onboarding-provider-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+
+    let path = save_api_key_for(ApiProvider::Openrouter, "onboarding-openrouter-key")?;
+    let contents = fs::read_to_string(&path)?;
+    assert!(
+        contents.contains("openrouter"),
+        "expected OpenRouter provider table, got: {contents}"
+    );
+    assert!(contents.contains("onboarding-openrouter-key"));
+    Ok(())
+}
+
+#[test]
 fn ensure_config_file_exists_creates_first_run_template() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
