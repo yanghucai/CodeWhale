@@ -224,7 +224,7 @@ fn tool_catalog_shell_only_benchmark_surface_hides_native_tools() {
         catalog_tool("write_file"),
         catalog_tool("list_dir"),
         catalog_tool("git_status"),
-        catalog_tool("checklist_write"),
+        catalog_tool("work_update"),
     ];
     let shell_only = [
         "exec_shell".to_string(),
@@ -2398,7 +2398,7 @@ fn deferred_tool_preflight_guides_checklist_update_list_replacement() {
     assert!(result.content.contains("id, status"));
     assert!(result.content.contains("Unexpected fields:"));
     assert!(result.content.contains("todos"));
-    assert!(result.content.contains("Use checklist_write"));
+    assert!(result.content.contains("Use work_update"));
 }
 
 #[tokio::test]
@@ -3412,6 +3412,7 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
         "todo_add",
         "todo_update",
         "todo_write",
+        "work_update",
         "update_plan",
     ];
     let mut write_or_exec_tools: Vec<String> = registry
@@ -6197,10 +6198,7 @@ fn missing_tool_error_message_redirects_checklist_item_miscalls() {
 
     for tool_name in ["item", "items", "todo", "checklist_item"] {
         let message = missing_tool_error_message(tool_name, &catalog);
-        assert!(
-            message.contains("checklist_write"),
-            "{tool_name}: {message}"
-        );
+        assert!(message.contains("work_update"), "{tool_name}: {message}");
         assert!(
             !message.contains("Did you mean"),
             "fuzzy suggestions are misleading for checklist mis-calls: {message}"

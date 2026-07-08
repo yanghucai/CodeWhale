@@ -47,25 +47,23 @@ The lifecycle policy exists to **shrink and discipline the model-visible
 surface** without ever breaking the ability to replay an old transcript that
 referenced a now-retired name.
 
-### Canonical work-tracking surface for v0.8.65
+### Canonical work-tracking surface for v0.8.68
 
-The model-visible progress surface is `checklist_*`:
-`checklist_write`, `checklist_add`, `checklist_update`, and `checklist_list`.
-Agents and Fleet workers use that surface for concrete Work progress under the
+The model-visible progress surface is a single tool: `work_update` (#4132).
+Agents and Fleet workers use it for concrete To-do / Work progress under the
 active runtime thread or durable task.
 
 `task_*` and the Fleet/Workflow ledger remain the durable lifecycle owners.
 Checklist metadata is the model-visible projection of progress:
 `task_updates.checklist` carries the current items, completion percentage, and
-in-progress item. `update_plan` is optional high-level strategy metadata for
-complex initiatives; it must not duplicate checklist items or become a parallel
+in-progress item. `update_plan` is optional Strategy metadata/context/route for
+complex initiatives; it must not duplicate To-do items or become a parallel
 progress store.
 
-The legacy `todo_*` names are deprecated hidden compatibility aliases. They
-remain registered and dispatchable against the same checklist state so old
-transcripts replay without data loss, but they are not advertised to the model
-catalog and their result metadata points callers to the corresponding
-`checklist_*` tool.
+The legacy `checklist_*` and older `todo_*` names are hidden compatibility
+aliases. They remain registered and dispatchable against the same To-do state
+so old transcripts replay without data loss, but they are not advertised to the
+model catalog.
 
 ---
 
