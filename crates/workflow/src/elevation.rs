@@ -510,6 +510,7 @@ mod tests {
                 AgentType::Explore
             },
             profile: None,
+            role: None,
             mode,
             isolation: IsolationMode::Auto,
             file_scope: Vec::new(),
