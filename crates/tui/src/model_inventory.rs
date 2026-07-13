@@ -87,9 +87,6 @@ impl ModelInventory {
             for model in models {
                 let readiness =
                     crate::provider_readiness::resolve_for_model(config, provider, &model, health);
-                if !readiness.can_attempt() {
-                    continue;
-                }
                 let capability = provider_capability(provider, &model);
                 let mut tags = Vec::new();
                 if capability.context_window >= 1_000_000 {
@@ -104,15 +101,22 @@ impl ModelInventory {
                 ) {
                     tags.push("local");
                 }
-                if model.eq_ignore_ascii_case(&default_model) {
+                // Unready routes stay visible (annotated) so an operator can
+                // override explicitly, but they are never a silent default.
+                let default_for_provider =
+                    readiness.can_attempt() && model.eq_ignore_ascii_case(&default_model);
+                if default_for_provider {
                     tags.push("default");
+                }
+                if !readiness.can_attempt() {
+                    tags.push("unready");
                 }
 
                 candidates.push(ModelRouteCandidate {
                     provider,
                     provider_name: provider.as_str(),
                     provider_display_name: provider.display_name(),
-                    default_for_provider: model.eq_ignore_ascii_case(&default_model),
+                    default_for_provider,
                     model,
                     context_window: capability.context_window,
                     max_output: capability.max_output,
@@ -405,5 +409,28 @@ mod tests {
         assert!(json.contains(r#""auth_source":"command""#));
         assert!(!json.contains("secret-tool"));
         assert!(!json.contains("lookup"));
+    }
+
+    #[test]
+    fn unready_candidates_are_never_provider_defaults() {
+        use crate::provider_readiness::ResolvedProviderReadiness;
+
+        let candidate = ModelRouteCandidate {
+            provider: ApiProvider::Openai,
+            provider_name: "openai",
+            provider_display_name: "OpenAI",
+            model: "gpt-5.5".to_string(),
+            context_window: 128_000,
+            max_output: 16_384,
+            thinking_supported: true,
+            cache_telemetry_supported: false,
+            auth_source: ModelAuthSource::Config,
+            readiness: ResolvedProviderReadiness::MissingLogin,
+            default_for_provider: false,
+            tags: vec!["unready"],
+        };
+        assert!(!candidate.readiness.can_attempt());
+        assert!(!candidate.default_for_provider);
+        assert!(candidate.tags.contains(&"unready"));
     }
 }

@@ -1189,6 +1189,8 @@ pub struct LaunchState {
     pub status: Option<String>,
     pub workspace_session_count: usize,
     pub worktree_available: bool,
+    /// Row hitboxes from the most recent launch render.
+    pub row_areas: Vec<Rect>,
 }
 
 impl LaunchState {
@@ -1220,6 +1222,7 @@ impl LaunchState {
             status: None,
             workspace_session_count,
             worktree_available,
+            row_areas: Vec::new(),
         }
     }
 }
@@ -1397,6 +1400,7 @@ pub struct ViewportState {
     pub last_sidebar_area: Option<Rect>,
     /// WorkflowPanel rect above the composer (#4121), for mouse toggle/cancel.
     pub last_workflow_panel_area: Option<Rect>,
+    pub last_workflow_cancel_area: Option<Rect>,
     pub last_transcript_top: usize,
     pub last_transcript_visible: usize,
     pub last_transcript_total: usize,
@@ -1427,6 +1431,7 @@ impl Default for ViewportState {
             last_composer_area: None,
             last_sidebar_area: None,
             last_workflow_panel_area: None,
+            last_workflow_cancel_area: None,
             last_transcript_top: 0,
             last_transcript_visible: 0,
             last_transcript_total: 0,
@@ -1536,7 +1541,9 @@ pub enum SidebarRowAction {
     Command(String),
     /// Put a destructive command in the composer instead of executing it.
     /// The user confirms with Enter or cancels by editing/clearing the draft.
+    #[allow(dead_code)] // destructive confirm path; mouse_ui already matches it (TUI-DOG-008)
     PrefillCommand(String),
+    HotbarSlot(u8),
     ToggleAgentDetails {
         agent_id: String,
     },
@@ -1563,6 +1570,7 @@ impl SidebarRowAction {
         match self {
             Self::Command(command) => Some(command.as_str()),
             Self::PrefillCommand(_)
+            | Self::HotbarSlot(_)
             | Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
             | Self::CancelAgent { .. }
@@ -1578,7 +1586,8 @@ impl SidebarRowAction {
             Self::CancelAgent { .. } => true,
             Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
-            | Self::InspectText { .. } => false,
+            | Self::InspectText { .. }
+            | Self::HotbarSlot(_) => false,
         }
     }
 }
@@ -1857,6 +1866,13 @@ pub struct App {
     /// Kept separate from the ambient ocean clock so completion can settle
     /// once without restarting or repainting the transcript field.
     pub ocean_completion_started_at: Option<Instant>,
+    /// History length at the current turn boundary. Successful completion
+    /// uses this stable index to settle only the receipts produced by that
+    /// turn, never old transcript rows.
+    pub ocean_turn_history_start: usize,
+    /// First committed history cell participating in the current one-shot
+    /// receipt-settle cascade.
+    pub ocean_receipt_settle_start: Option<usize>,
     /// Enables the authored underwater phase and ambient motion system.
     pub fancy_animations: bool,
     /// Typed appearance treatment; appearance is independent from motion
@@ -1865,6 +1881,10 @@ pub struct App {
     /// Distinct pre-session menu. Once dismissed, the normal idle ocean owns
     /// the empty session and this state stays hidden.
     pub launch: LaunchState,
+    /// Mouse-selected launch action, consumed by the async UI loop.
+    pub pending_launch_action: Option<crate::tui::underwater::LaunchAction>,
+    /// Mouse-selected hotbar slot, consumed by the async UI loop.
+    pub pending_hotbar_slot: Option<u8>,
     /// Whether the renderer should wrap each frame in DEC mode 2026
     /// synchronized output. Resolved from `Settings::synchronized_output`
     /// at construction; `auto`/`on` → `true`, `off` → `false`. The Ptyxis
@@ -2937,9 +2957,13 @@ impl App {
             constrained_frame_rate,
             ocean_started_at: Instant::now(),
             ocean_completion_started_at: None,
+            ocean_turn_history_start: 0,
+            ocean_receipt_settle_start: None,
             fancy_animations,
             ocean_treatment,
             launch,
+            pending_launch_action: None,
+            pending_hotbar_slot: None,
             synchronized_output_enabled,
             status_indicator,
             show_thinking,
@@ -3662,7 +3686,7 @@ impl App {
         )
     }
 
-    fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
+    pub(crate) fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
         if currency == CostCurrency::Cny
             && self.session.session_cost_cny == 0.0
             && self.session.subagent_cost_cny == 0.0

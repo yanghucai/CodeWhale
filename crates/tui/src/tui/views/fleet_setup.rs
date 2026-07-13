@@ -1,11 +1,11 @@
 //! `/fleet setup` — a progressive "set up your agent team" flow.
 //!
 //! Replaces the old six-column config matrix (#3791). Fleet is presented as an
-//! agent team: the user makes one focused choice at a time (a role, then a model
-//! class) and then reviews the full posture — model/route, permissions, tools,
-//! workspace/org scope, and review policy — before starting. "Start" previews a
-//! deterministic starter TOML profile; nothing is written until the user
-//! explicitly ratifies the exact rendered bytes.
+//! agent team: the shortest valid path is role → provider/model → save/apply.
+//! The review step shows resolved provider, model, auth/readiness, scope, and
+//! overwrite consequences once before anything is written. Thinking defaults to
+//! inherit and can be adjusted on the review step without an extra wizard
+//! screen. "Save profile" persists the exact rendered TOML bytes.
 //!
 //! NOTE (audit #7 / #3167): the role/model taxonomy and copy below are
 //! intentionally English for now; #3167 reworks this into an interactive
@@ -337,9 +337,7 @@ enum Step {
     Role,
     /// Pick the model-routing class.
     Model,
-    /// Pick the saved thinking tier.
-    Thinking,
-    /// Review the full posture and start.
+    /// Review the full posture and save.
     Review,
 }
 
@@ -350,18 +348,18 @@ pub struct FleetSetupView {
     model_idx: usize,
     thinking_idx: usize,
     review_scroll: usize,
-    /// A model-drafted profile awaiting ratification (already sanitized and
+    /// A model-drafted profile awaiting save (already sanitized and
     /// bounded by the untrusted gate). Cleared when the selection changes so
-    /// a stale draft can never be ratified against fresh answers.
+    /// a stale draft can never be saved against fresh answers.
     model_draft: Option<Box<crate::fleet::profile::FleetProfileDraft>>,
     /// Display label of the model that authored `model_draft`.
     model_draft_label: Option<String>,
     /// Exact rendered TOML preview for `model_draft` (header comment + the
-    /// deterministic bytes ratifying would persist). Rendered inline on the
+    /// deterministic bytes saving would persist). Rendered inline on the
     /// Review step — never in a separate pager (#4093): a standalone pager
     /// view owns its own `g`/`G` scroll bindings, which silently swallowed
-    /// the ratify keypress and left users unable to save without first
-    /// pressing Esc. Keeping the preview and the ratify control in the same
+    /// the save keypress and left users unable to save without first
+    /// pressing Esc. Keeping the preview and the save control in the same
     /// view means the footer's `g`/Enter hints are never a lie.
     model_draft_preview: Option<String>,
     /// Model-step rows: `inherit` followed by one row per concrete model from
@@ -518,7 +516,6 @@ impl FleetSetupView {
         match self.step {
             Step::Role => ROLES.len(),
             Step::Model => self.model_choices.len(),
-            Step::Thinking => THINKING_CHOICES.len(),
             Step::Review => 0,
         }
     }
@@ -531,10 +528,6 @@ impl FleetSetupView {
             }
             Step::Model => {
                 self.model_idx = self.model_idx.saturating_sub(1);
-                self.discard_model_draft();
-            }
-            Step::Thinking => {
-                self.thinking_idx = self.thinking_idx.saturating_sub(1);
                 self.discard_model_draft();
             }
             Step::Review => self.review_scroll = self.review_scroll.saturating_sub(1),
@@ -558,16 +551,12 @@ impl FleetSetupView {
                 self.model_idx = (self.model_idx + 1).min(self.step_len().saturating_sub(1));
                 self.discard_model_draft();
             }
-            Step::Thinking => {
-                self.thinking_idx = (self.thinking_idx + 1).min(self.step_len().saturating_sub(1));
-                self.discard_model_draft();
-            }
             Step::Review => self.review_scroll = self.review_scroll.saturating_add(1),
         }
     }
 
     /// Advance to the next step, or — on the review step — preview the exact
-    /// starter profile TOML the next ratify keypress would persist.
+    /// starter profile TOML the next save keypress would persist.
     fn advance(&mut self) -> ViewAction {
         match self.step {
             Step::Role => {
@@ -581,13 +570,11 @@ impl FleetSetupView {
                     .copied()
                     .unwrap_or(false)
                 {
-                    self.step = Step::Thinking;
+                    // Shortest valid path: role → model → review/save.
+                    // Thinking defaults to inherit; adjust on review with `t`.
+                    self.step = Step::Review;
+                    self.review_scroll = 0;
                 }
-                ViewAction::None
-            }
-            Step::Thinking => {
-                self.step = Step::Review;
-                self.review_scroll = 0;
                 ViewAction::None
             }
             Step::Review => self.preview_starter_profile_action(),
@@ -603,22 +590,18 @@ impl FleetSetupView {
                 self.step = Step::Role;
                 ViewAction::None
             }
-            Step::Thinking => {
-                self.step = Step::Model;
-                ViewAction::None
-            }
             Step::Review => {
-                self.step = Step::Thinking;
+                self.step = Step::Model;
                 ViewAction::None
             }
         }
     }
 
-    /// Preview the exact starter profile TOML the next ratify keypress would
+    /// Preview the exact starter profile TOML the next save keypress would
     /// persist. Renders inline within the Review step's own scrollable pane —
     /// deliberately NOT via `ViewEvent::OpenTextPager` (#4093): a standalone
     /// pager view has its own `g`/`G` scroll bindings and would swallow the
-    /// ratify keypress, forcing an Esc-then-g round trip to actually save.
+    /// save keypress, forcing an Esc-then-g round trip to actually save.
     fn preview_starter_profile_action(&mut self) -> ViewAction {
         let draft = self.starter_profile_draft();
         let header = tr(self.snapshot.locale, MessageId::FleetPreviewHeader)
@@ -631,7 +614,7 @@ impl FleetSetupView {
     }
 
     /// Build a deterministic starter profile for the current role/model
-    /// selection. The same ratify event persists this as model-drafted profiles,
+    /// selection. The same save event persists this as model-drafted profiles,
     /// so duplicate-id checks and atomic writes stay in one host path.
     ///
     /// `provider` is seeded from whatever the user actually picked in the
@@ -672,16 +655,12 @@ impl FleetSetupView {
                 hints.push(ActionHint::new("Enter", "next"));
                 hints.push(ActionHint::new("←", "back"));
             }
-            Step::Thinking => {
-                hints.push(ActionHint::new("↑/↓", "choose"));
-                hints.push(ActionHint::new("Enter", "next"));
-                hints.push(ActionHint::new("←", "back"));
-            }
             Step::Review => {
                 hints.push(ActionHint::new("↑/↓", "scroll"));
+                hints.push(ActionHint::new("t", "thinking"));
                 if self.model_draft.is_some() {
-                    hints.push(ActionHint::new("Enter", "ratify"));
-                    hints.push(ActionHint::new("g", "ratify draft"));
+                    hints.push(ActionHint::new("Enter", "Save profile"));
+                    hints.push(ActionHint::new("g", "Save profile"));
                     hints.push(ActionHint::new("m", "redraft"));
                 } else if self.snapshot.provider_ready {
                     hints.push(ActionHint::new("Enter", "preview"));
@@ -721,9 +700,6 @@ impl ModalView for FleetSetupView {
                         Step::Model => {
                             self.model_idx = row.min(self.model_choices.len().saturating_sub(1));
                         }
-                        Step::Thinking => {
-                            self.thinking_idx = row.min(THINKING_CHOICES.len().saturating_sub(1));
-                        }
                         Step::Review => {}
                     }
                     self.discard_model_draft();
@@ -743,6 +719,11 @@ impl ModalView for FleetSetupView {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_down();
+                ViewAction::None
+            }
+            KeyCode::Char('t') if self.step == Step::Review => {
+                self.thinking_idx = (self.thinking_idx + 1) % THINKING_CHOICES.len();
+                self.discard_model_draft();
                 ViewAction::None
             }
             KeyCode::Char('m') if self.step == Step::Review && self.snapshot.provider_ready => {
@@ -771,7 +752,7 @@ impl ModalView for FleetSetupView {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
                 if self.step == Step::Review && self.model_draft.is_some() =>
             {
-                // A ratify-ready draft is on screen; Enter should ratify it,
+                // A save-ready draft is on screen; Enter should save it,
                 // not silently start the manual profile-prompt flow and drop
                 // the draft.
                 match self.model_draft.clone() {
@@ -809,8 +790,7 @@ impl ModalView for FleetSetupView {
         let step_no = match self.step {
             Step::Role => 1,
             Step::Model => 2,
-            Step::Thinking => 3,
-            Step::Review => 4,
+            Step::Review => 3,
         };
         let block = Block::default()
             .title(Line::from(Span::styled(
@@ -821,7 +801,7 @@ impl ModalView for FleetSetupView {
             )))
             .title_bottom(
                 Line::from(Span::styled(
-                    format!(" Step {step_no}/4 "),
+                    format!(" Step {step_no}/3 "),
                     Style::default().fg(palette::TEXT_MUTED),
                 ))
                 .alignment(ratatui::layout::Alignment::Right),
@@ -880,24 +860,6 @@ impl ModalView for FleetSetupView {
                     &self.row_hitboxes,
                 );
             }
-            Step::Thinking => {
-                render_choice_step(
-                    chunks[1],
-                    buf,
-                    THINKING_CHOICES,
-                    self.thinking_idx,
-                    &[
-                        format!("Current reasoning: {}", self.snapshot.reasoning),
-                        format!("This worker will use {}.", self.selected_thinking_label()),
-                    ],
-                );
-                register_choice_hitboxes(
-                    chunks[1],
-                    THINKING_CHOICES.len(),
-                    self.thinking_idx,
-                    &self.row_hitboxes,
-                );
-            }
             Step::Review => self.render_review(chunks[1], buf),
         }
     }
@@ -914,17 +876,13 @@ impl FleetSetupView {
                 "Choose a model",
                 "Pick this worker's model, or inherit your current route.",
             ),
-            Step::Thinking => (
-                "Choose thinking",
-                "Pick this worker's reasoning tier, or inherit your current setting.",
-            ),
             Step::Review if self.model_draft.is_some() => (
-                "Ratify the draft",
-                "Exact TOML shown below. Press Enter or g to ratify, m to redraft.",
+                "Save profile",
+                "Exact TOML shown below. Press Enter or g to save, m to redraft.",
             ),
             Step::Review => (
-                "Review & start",
-                "Confirm the posture below, preview exact TOML, then ratify to save.",
+                "Review & save",
+                "Confirm provider, model, readiness, scope, and overwrite, then save the profile.",
             ),
         };
         let lines = vec![
@@ -990,15 +948,46 @@ impl FleetSetupView {
             // running on the active provider (#4093).
             match self.selected_route() {
                 Some((provider, model)) => {
-                    format!("{model}  ·  provider {}", provider_display_label(&provider))
+                    let readiness = self
+                        .snapshot
+                        .available_models
+                        .iter()
+                        .find(|(candidate_provider, candidate_model, _, _)| {
+                            candidate_provider == &provider && candidate_model == &model
+                        })
+                        .map(|(_, _, readiness, _)| readiness.as_str())
+                        .unwrap_or(if self.snapshot.provider_ready {
+                            "ready"
+                        } else {
+                            "needs action"
+                        });
+                    format!(
+                        "{model}  ·  provider {}  ·  {readiness}",
+                        provider_display_label(&provider)
+                    )
                 }
                 None => format!(
-                    "inherit  ·  route {} / {}, reasoning {}",
-                    self.snapshot.provider, self.snapshot.model, self.snapshot.reasoning
+                    "inherit  ·  route {} / {}  ·  {}",
+                    self.snapshot.provider,
+                    self.snapshot.model,
+                    if self.snapshot.provider_ready {
+                        "ready"
+                    } else {
+                        "needs action"
+                    }
                 ),
             },
         );
         section(&mut lines, "Thinking", self.selected_thinking_label());
+        section(
+            &mut lines,
+            "Auth & readiness",
+            if self.snapshot.provider_ready {
+                "Active route can be attempted with the current credentials.".to_string()
+            } else {
+                "Active route is not ready — fix auth/readiness before relying on this profile at runtime.".to_string()
+            },
+        );
         section(
             &mut lines,
             "Permissions",
@@ -1040,7 +1029,7 @@ impl FleetSetupView {
             &mut lines,
             "Profile",
             format!(
-                "{PROFILE_DIR}/{file_stem}.toml  ·  {profile_value} present. Start previews a deterministic starter profile; nothing is written to disk until ratification.",
+                "{PROFILE_DIR}/{file_stem}.toml  ·  {profile_value} present. Preview shows the exact starter profile; nothing is written until you save.",
             ),
         );
 
@@ -1326,9 +1315,8 @@ mod tests {
     }
 
     fn to_review(view: &mut FleetSetupView) {
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Enter)); // Role -> Model
+        view.handle_key(key(KeyCode::Enter)); // Model -> Review
         assert_eq!(view.step, Step::Review);
     }
 
@@ -1387,11 +1375,10 @@ mod tests {
             view.selected_route(),
             Some(("zai".to_string(), "glm-5.2".to_string()))
         );
-        view.handle_key(key(KeyCode::Enter)); // Model -> Thinking
+        view.handle_key(key(KeyCode::Enter)); // Model -> Review
         while view.selected_reasoning_effort().as_deref() != Some("max") {
-            view.handle_key(key(KeyCode::Down));
+            view.handle_key(key(KeyCode::Char('t')));
         }
-        view.handle_key(key(KeyCode::Enter)); // Thinking -> Review
 
         // `m` requests a draft and carries the picked cross-provider route.
         let action = view.handle_key(key(KeyCode::Char('m')));
@@ -1514,17 +1501,13 @@ mod tests {
         assert_eq!(view.model_idx, 1);
 
         view.handle_key(key(KeyCode::Enter));
-        assert_eq!(view.step, Step::Thinking);
-
-        view.handle_key(key(KeyCode::Down));
-        assert_eq!(view.thinking_idx, 1);
-
-        view.handle_key(key(KeyCode::Enter));
         assert_eq!(view.step, Step::Review);
 
+        // `t` cycles thinking on the review step without an extra wizard screen.
+        view.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(view.thinking_idx, 1);
+
         // Left steps back through the wizard.
-        view.handle_key(key(KeyCode::Left));
-        assert_eq!(view.step, Step::Thinking);
         view.handle_key(key(KeyCode::Left));
         assert_eq!(view.step, Step::Model);
         view.handle_key(key(KeyCode::Left));
@@ -1628,11 +1611,10 @@ mod tests {
         view.handle_key(key(KeyCode::Enter)); // -> Model
         // Model: inherit(0) deepseek-v4-pro(1) -> deepseek-v4-pro.
         view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter)); // -> Thinking
+        view.handle_key(key(KeyCode::Enter)); // Model -> Review
         while view.selected_reasoning_effort().as_deref() != Some("max") {
-            view.handle_key(key(KeyCode::Down));
+            view.handle_key(key(KeyCode::Char('t')));
         }
-        view.handle_key(key(KeyCode::Enter)); // -> Review
 
         // Start previews inline (#4093: no separate pager to steal the next
         // ratify keypress) — the action stays `None` and the draft/preview
@@ -1811,10 +1793,12 @@ mod tests {
 
     #[test]
     fn fleet_includes_saved_model_outside_bundled_catalog() {
-        let mut providers = crate::config::ProvidersConfig::default();
-        providers.openrouter = crate::config::ProviderConfig {
-            api_key: Some("openrouter-test-key".to_string()),
-            model: Some("acme/private-preview".to_string()),
+        let providers = crate::config::ProvidersConfig {
+            openrouter: crate::config::ProviderConfig {
+                api_key: Some("openrouter-test-key".to_string()),
+                model: Some("acme/private-preview".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let config = Config {
@@ -1967,13 +1951,12 @@ mod tests {
             40,
         )
         .join("\n");
-        for section in ["Role", "Model", "Permissions", "Tools"] {
+        for section in ["Role", "Model", "Auth & readiness", "Permissions", "Tools"] {
             assert!(top.contains(section), "review missing section: {section}");
         }
 
         // The review is intentionally scrollable; scrolling to the bottom reveals
-        // the workspace/org scope, review policy, and the honest ratification
-        // note on the Start action.
+        // the workspace/org scope, review policy, and the honest save note.
         let bottom = render_through_stack(
             || {
                 let mut v = FleetSetupView::from_snapshot(snapshot());
@@ -1985,7 +1968,7 @@ mod tests {
             40,
         )
         .join("\n");
-        for needle in ["Workspace", "Review policy", "until ratification"] {
+        for needle in ["Workspace", "Review policy", "until you save"] {
             assert!(bottom.contains(needle), "scrolled review missing: {needle}");
         }
     }

@@ -4,8 +4,16 @@
 //! The same model can be metered through an API key or covered by an OAuth /
 //! token-plan subscription.  Keep that decision in one small module so TUI
 //! surfaces do not infer dollars from a model id alone.
+//!
+//! Display rule (TUI-DOG-010):
+//! - dollars only for metered routes with a real priced usage basis and
+//!   positive accrued spend;
+//! - OAuth/token-plan routes show a quota label, or a real used % when one
+//!   was supplied by the provider;
+//! - unknown stays unknown — never `$0.00` and never an estimate-as-spend.
 
 use crate::config::{ApiProvider, Config, ProviderConfig};
+use crate::pricing::{CostCurrency, format_cost_amount};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BillingPresentation {
@@ -16,6 +24,26 @@ pub enum BillingPresentation {
     Subscription(&'static str),
     /// The route is local or otherwise has no provider bill.
     Local,
+    /// Billing basis is not known; never invent dollars or a fake zero.
+    Unknown,
+}
+
+/// Truthful chip for session/footer/sidebar usage surfaces.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageChip {
+    /// Positive accrued spend on a metered route with real pricing.
+    Money(String),
+    /// Subscription / OAuth allowance. `used_pct` is only set when the
+    /// provider supplied a real percentage.
+    Allowance {
+        label: &'static str,
+        used_pct: Option<f32>,
+    },
+    Local,
+    Unknown,
+    /// Metered route with pricing, but nothing spent yet — omit the chip
+    /// rather than rendering `$0.00` / `<$0.0001`.
+    Hidden,
 }
 
 impl BillingPresentation {
@@ -25,11 +53,13 @@ impl BillingPresentation {
     }
 
     #[must_use]
+    #[allow(dead_code)] // label helpers for non-metered chip copy (TUI-DOG-010)
     pub const fn label(self) -> Option<&'static str> {
         match self {
             Self::Metered => None,
             Self::Subscription(label) => Some(label),
             Self::Local => Some("local"),
+            Self::Unknown => Some("unknown"),
         }
     }
 }
@@ -61,6 +91,9 @@ pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation 
         ApiProvider::Anthropic if provider_config.is_some_and(uses_anthropic_oauth) => {
             BillingPresentation::Subscription("Claude OAuth quota")
         }
+        ApiProvider::Custom if provider_config.is_none_or(custom_billing_unknown) => {
+            BillingPresentation::Unknown
+        }
         _ => BillingPresentation::Metered,
     }
 }
@@ -85,8 +118,107 @@ pub fn for_child_route(
         | ApiProvider::Moonshot
         | ApiProvider::Anthropic
         | ApiProvider::XiaomiMimo => BillingPresentation::Subscription("provider quota"),
+        ApiProvider::Custom => BillingPresentation::Unknown,
         _ => BillingPresentation::Metered,
     }
+}
+
+/// Whether this route may show a dollar amount for the given model.
+///
+/// Requires both a metered billing presentation and an authoritative priced
+/// basis for the model. OAuth/token-plan routes always return false even when
+/// the same model id is priced on a public API route.
+#[must_use]
+pub fn has_priced_metered_basis(
+    billing: BillingPresentation,
+    provider: ApiProvider,
+    model: &str,
+) -> bool {
+    billing.shows_money() && crate::pricing::has_pricing_for_provider(provider, model)
+}
+
+/// Build the truthful usage chip for session surfaces.
+///
+/// `used_pct` is only honored for subscription/OAuth routes and must come from
+/// a provider-supplied allowance reading — never from a local estimate.
+#[must_use]
+pub fn usage_chip(
+    billing: BillingPresentation,
+    provider: ApiProvider,
+    model: &str,
+    displayed_cost: f64,
+    currency: CostCurrency,
+    used_pct: Option<f32>,
+) -> UsageChip {
+    match billing {
+        BillingPresentation::Local => UsageChip::Local,
+        BillingPresentation::Unknown => UsageChip::Unknown,
+        BillingPresentation::Subscription(label) => UsageChip::Allowance {
+            label,
+            used_pct: used_pct.filter(|pct| pct.is_finite() && *pct >= 0.0),
+        },
+        BillingPresentation::Metered => {
+            if !has_priced_metered_basis(billing, provider, model) {
+                UsageChip::Unknown
+            } else if displayed_cost.is_finite() && displayed_cost > 0.0 {
+                UsageChip::Money(format_cost_amount(displayed_cost, currency))
+            } else {
+                UsageChip::Hidden
+            }
+        }
+    }
+}
+
+/// Compact footer/header chip text. `None` means omit the chip.
+#[must_use]
+#[allow(dead_code)] // shared chip formatter for footer/sidebar siblings (TUI-DOG-010)
+pub fn format_usage_chip(chip: &UsageChip) -> Option<String> {
+    match chip {
+        UsageChip::Money(amount) => Some(amount.clone()),
+        UsageChip::Allowance { label, used_pct } => Some(match used_pct {
+            Some(pct) => format!("usage: {label} · {pct:.0}%"),
+            None => format!("usage: {label}"),
+        }),
+        UsageChip::Local => Some("cost: local".to_string()),
+        UsageChip::Unknown => Some("cost: unknown".to_string()),
+        UsageChip::Hidden => None,
+    }
+}
+
+/// Sidebar / detail line. Always returns a string so the panel has an owner.
+#[must_use]
+pub fn format_usage_line(chip: &UsageChip) -> String {
+    match chip {
+        UsageChip::Money(amount) => format!("cost: {amount}"),
+        UsageChip::Allowance { label, used_pct } => match used_pct {
+            Some(pct) => format!("usage: {label} · {pct:.0}% used"),
+            None => format!("usage: {label}"),
+        },
+        UsageChip::Local => "cost: local".to_string(),
+        UsageChip::Unknown => "cost: unknown".to_string(),
+        UsageChip::Hidden => "cost: —".to_string(),
+    }
+}
+
+fn custom_billing_unknown(config: &ProviderConfig) -> bool {
+    // A custom OpenAI-compatible endpoint with no explicit pay mode and no
+    // priced catalog is treated as unknown rather than inventing metered
+    // dollars from a borrowed model id.
+    let mode = auth_mode(config);
+    !mode.as_deref().is_some_and(|mode| {
+        matches!(
+            mode,
+            "api_key"
+                | "api"
+                | "key"
+                | "keyring"
+                | "payg"
+                | "paygo"
+                | "pay_as_you_go"
+                | "metered"
+                | "standard"
+        )
+    })
 }
 
 fn normalized(value: &str) -> String {
@@ -186,6 +318,7 @@ fn xiaomi_is_explicit_pay_as_you_go(config: Option<&ProviderConfig>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::CostCurrency;
 
     fn config_with(provider: ApiProvider, provider_config: ProviderConfig) -> Config {
         let mut config = Config::default();
@@ -199,6 +332,110 @@ mod tests {
             for_route(&Config::default(), ApiProvider::OpenaiCodex),
             BillingPresentation::Subscription("Codex OAuth quota")
         );
+        let chip = usage_chip(
+            BillingPresentation::Subscription("Codex OAuth quota"),
+            ApiProvider::OpenaiCodex,
+            "gpt-5.5",
+            12.34,
+            CostCurrency::Usd,
+            None,
+        );
+        assert_eq!(
+            format_usage_chip(&chip).as_deref(),
+            Some("usage: Codex OAuth quota")
+        );
+        assert!(!format_usage_line(&chip).contains('$'));
+    }
+
+    #[test]
+    fn oauth_allowance_percent_is_shown_when_provider_supplies_it() {
+        let chip = usage_chip(
+            BillingPresentation::Subscription("Grok OAuth quota"),
+            ApiProvider::Xai,
+            "grok-4",
+            0.0,
+            CostCurrency::Usd,
+            Some(37.0),
+        );
+        assert_eq!(
+            format_usage_chip(&chip).as_deref(),
+            Some("usage: Grok OAuth quota · 37%")
+        );
+    }
+
+    #[test]
+    fn api_key_metered_shows_dollars_only_with_priced_positive_spend() {
+        let billing = BillingPresentation::Metered;
+        assert!(has_priced_metered_basis(
+            billing,
+            ApiProvider::Deepseek,
+            "deepseek-v4-flash"
+        ));
+        let spent = usage_chip(
+            billing,
+            ApiProvider::Deepseek,
+            "deepseek-v4-flash",
+            0.42,
+            CostCurrency::Usd,
+            None,
+        );
+        assert_eq!(format_usage_chip(&spent).as_deref(), Some("$0.42"));
+
+        let zero = usage_chip(
+            billing,
+            ApiProvider::Deepseek,
+            "deepseek-v4-flash",
+            0.0,
+            CostCurrency::Usd,
+            None,
+        );
+        assert_eq!(zero, UsageChip::Hidden);
+        assert!(format_usage_chip(&zero).is_none());
+        assert!(!format_usage_line(&zero).contains('$'));
+    }
+
+    #[test]
+    fn local_free_routes_never_show_dollars() {
+        assert_eq!(
+            for_route(&Config::default(), ApiProvider::Ollama),
+            BillingPresentation::Local
+        );
+        let chip = usage_chip(
+            BillingPresentation::Local,
+            ApiProvider::Ollama,
+            "llama3.2",
+            9.99,
+            CostCurrency::Usd,
+            None,
+        );
+        assert_eq!(format_usage_chip(&chip).as_deref(), Some("cost: local"));
+        assert!(!format_usage_line(&chip).contains('$'));
+    }
+
+    #[test]
+    fn unknown_is_unknown_not_zero_dollars() {
+        let chip = usage_chip(
+            BillingPresentation::Metered,
+            ApiProvider::NvidiaNim,
+            "deepseek-ai/deepseek-v4-pro",
+            0.0,
+            CostCurrency::Usd,
+            None,
+        );
+        assert_eq!(chip, UsageChip::Unknown);
+        assert_eq!(format_usage_chip(&chip).as_deref(), Some("cost: unknown"));
+        assert!(!format_usage_line(&chip).contains('$'));
+
+        let unknown_billing = usage_chip(
+            BillingPresentation::Unknown,
+            ApiProvider::Custom,
+            "anything",
+            1.23,
+            CostCurrency::Usd,
+            None,
+        );
+        assert_eq!(unknown_billing, UsageChip::Unknown);
+        assert!(!format_usage_line(&unknown_billing).contains('$'));
     }
 
     #[test]
@@ -297,5 +534,25 @@ mod tests {
         let _standard = crate::test_support::EnvVarGuard::set("MIMO_API_KEY", "sk-metered");
 
         assert!(for_route(&Config::default(), ApiProvider::XiaomiMimo).shows_money());
+    }
+
+    #[test]
+    fn custom_without_pay_mode_stays_unknown() {
+        assert_eq!(
+            for_route(&Config::default(), ApiProvider::Custom),
+            BillingPresentation::Unknown
+        );
+        let mut metered_custom = Config {
+            provider: Some("acme".to_string()),
+            ..Config::default()
+        };
+        *metered_custom.provider_config_for_mut(ApiProvider::Custom) = ProviderConfig {
+            auth_mode: Some("api-key".to_string()),
+            ..ProviderConfig::default()
+        };
+        assert_eq!(
+            for_route(&metered_custom, ApiProvider::Custom),
+            BillingPresentation::Metered
+        );
     }
 }

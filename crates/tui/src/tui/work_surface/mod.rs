@@ -5,10 +5,13 @@
 //! rendering, focus, scrolling, and row actions live here as one component.
 
 mod input;
+mod interaction;
+mod live_projection;
 mod model;
 mod render;
 
 pub use input::{handle_key, handle_mouse};
+pub use interaction::tick_stop_arm;
 pub use model::{WorkSurfacePlacement, WorkSurfaceState};
 pub use render::{height, render, split_chat};
 
@@ -364,5 +367,229 @@ mod tests {
         let (chat, rail) = super::split_chat(&mut app, narrow, false);
         assert_eq!(chat, narrow);
         assert!(rail.is_none());
+    }
+
+    #[test]
+    fn enter_toggles_already_opened_worker_closed() {
+        let mut app = app();
+        for index in 1..=2 {
+            let id = format!("agent_{index}");
+            app.agent_label_map
+                .insert(id.clone(), format!("Agent {index}"));
+            app.agent_progress.insert(id, "running".to_string());
+        }
+        app.work_surface.focused = true;
+        let rows = super::model::project(&mut app);
+        let worker = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_1")
+            .expect("worker");
+        app.work_surface.selected = Some(worker.id.clone());
+        let open = worker.primary_action.clone();
+        assert!(super::interaction::activate_primary(&mut app, &worker.id, open.clone()).is_some());
+        assert_eq!(app.work_surface.opened.as_ref(), Some(&worker.id));
+        assert!(super::interaction::activate_primary(&mut app, &worker.id, open).is_none());
+        assert!(app.work_surface.opened.is_none());
+        assert_eq!(app.work_surface.selected.as_ref(), Some(&worker.id));
+    }
+
+    #[test]
+    fn stop_first_activation_arms_row_with_visible_confirm() {
+        let mut app = app();
+        app.agent_label_map
+            .insert("agent_1".into(), "Agent 1".into());
+        app.agent_progress
+            .insert("agent_1".into(), "running".into());
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| super::render(frame, frame.area(), &mut app))
+            .expect("draw");
+        let worker = app
+            .work_surface
+            .latest_rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_1")
+            .expect("worker")
+            .clone();
+        let stop = worker.stop_action.clone().expect("stop");
+        assert!(super::interaction::activate_stop(&mut app, &worker.id, stop.clone()).is_none());
+        terminal
+            .draw(|frame| super::render(frame, frame.area(), &mut app))
+            .expect("draw");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("confirm"), "{text}");
+        assert!(text.contains("Esc"), "{text}");
+        let confirmed =
+            super::interaction::activate_stop(&mut app, &worker.id, stop).expect("fire");
+        assert!(matches!(
+            confirmed,
+            crate::tui::app::SidebarRowAction::CancelAgent { agent_id } if agent_id == "agent_1"
+        ));
+    }
+
+    #[test]
+    fn todo_open_records_hitbox_and_opens_pager() {
+        let mut app = app();
+        app.todos
+            .try_lock()
+            .expect("todos")
+            .add("ship underwater strip".into(), TodoStatus::InProgress);
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| super::render(frame, frame.area(), &mut app))
+            .expect("draw");
+        let hit = app
+            .work_surface
+            .hitboxes
+            .iter()
+            .find(|hit| hit.id.0.starts_with("todo:"))
+            .expect("todo hitbox");
+        assert!(hit.open_zone_start_col.is_some());
+        assert!(hit.open_zone_end_col.is_some());
+        let open_col = hit.open_zone_start_col.expect("open");
+        let row_y = hit.row_y;
+        let outcome = super::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: open_col,
+                row: row_y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(outcome.consumed);
+        assert!(matches!(
+            outcome.action,
+            Some(crate::tui::app::SidebarRowAction::InspectText { .. })
+        ));
+        crate::tui::mouse_ui::apply_sidebar_row_action(&mut app, outcome.action.expect("action"));
+        assert_eq!(
+            app.view_stack.top_kind(),
+            Some(crate::tui::views::ModalKind::Pager)
+        );
+        assert!(app.work_surface.opened.is_some());
+    }
+
+    #[test]
+    fn focus_claim_clears_transcript_selection_owner() {
+        use crate::tui::selection::TranscriptSelectionPoint;
+        let mut app = app();
+        add_task(&mut app, "one");
+        app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+            line_index: 0,
+            column: 0,
+        });
+        app.viewport.transcript_selection.head = app.viewport.transcript_selection.anchor;
+        assert!(
+            super::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT)
+            )
+            .is_some()
+        );
+        assert!(app.work_surface.focused);
+        assert!(!app.viewport.transcript_selection.is_active());
+    }
+
+    #[test]
+    fn placements_share_keyboard_toggle_and_stop_arm() {
+        for placement in [
+            super::WorkSurfacePlacement::Top,
+            super::WorkSurfacePlacement::Left,
+            super::WorkSurfacePlacement::Right,
+        ] {
+            let mut app = app();
+            app.work_surface.placement = placement;
+            app.agent_label_map
+                .insert("agent_1".into(), "Agent 1".into());
+            app.agent_progress
+                .insert("agent_1".into(), "running".into());
+            let area = ratatui::layout::Rect::new(0, 0, 100, 12);
+            let render_area = match placement {
+                super::WorkSurfacePlacement::Top => {
+                    let _ = super::height(&mut app, 100, 24, false);
+                    area
+                }
+                super::WorkSurfacePlacement::Left | super::WorkSurfacePlacement::Right => {
+                    // Project rows before split_chat so the side rail exists.
+                    let _ = super::model::project(&mut app);
+                    let (_, rail) = super::split_chat(&mut app, area, false);
+                    rail.expect("rail")
+                }
+            };
+            let backend = TestBackend::new(100, 12);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| super::render(frame, render_area, &mut app))
+                .expect("draw");
+            app.work_surface.focused = true;
+            let worker_id = app
+                .work_surface
+                .latest_rows
+                .iter()
+                .find(|row| row.id.0.starts_with("worker:"))
+                .map(|row| row.id.clone())
+                .expect("worker");
+            app.work_surface.selected = Some(worker_id.clone());
+            let open = Some(crate::tui::app::SidebarRowAction::OpenAgentDetail {
+                agent_id: "agent_1".into(),
+            });
+            assert!(
+                super::interaction::activate_primary(&mut app, &worker_id, open.clone()).is_some(),
+                "{placement:?}"
+            );
+            assert!(
+                super::interaction::activate_primary(&mut app, &worker_id, open).is_none(),
+                "{placement:?}"
+            );
+            let stop = crate::tui::app::SidebarRowAction::CancelAgent {
+                agent_id: "agent_1".into(),
+            };
+            assert!(
+                super::interaction::activate_stop(&mut app, &worker_id, stop.clone()).is_none(),
+                "{placement:?}"
+            );
+            assert!(
+                super::interaction::activate_stop(&mut app, &worker_id, stop).is_some(),
+                "{placement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_selection_clears_armed_stop() {
+        let mut app = app();
+        for index in 1..=2 {
+            let id = format!("agent_{index}");
+            app.agent_label_map
+                .insert(id.clone(), format!("Agent {index}"));
+            app.agent_progress.insert(id, "running".into());
+        }
+        app.work_surface.focused = true;
+        let rows = super::model::project(&mut app);
+        let selectable: Vec<_> = rows
+            .iter()
+            .filter(|row| row.selectable)
+            .map(|row| row.id.clone())
+            .collect();
+        assert!(selectable.len() >= 2);
+        let first = selectable[0].clone();
+        let second = selectable[1].clone();
+        app.work_surface.selected = Some(first.clone());
+        let stop = crate::tui::app::SidebarRowAction::CancelAgent {
+            agent_id: first.0.trim_start_matches("worker:").to_string(),
+        };
+        assert!(super::interaction::activate_stop(&mut app, &first, stop).is_none());
+        app.work_surface.selected = Some(second);
+        super::interaction::on_selection_changed(&mut app);
+        assert!(app.work_surface.stop_arm.is_none());
     }
 }

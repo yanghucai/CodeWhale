@@ -1329,10 +1329,21 @@ fn render_picker_model_hint(
     let mut parts = Vec::new();
 
     if let Some(context_window) = metadata.context_window {
-        parts.push(format!(
-            "{} ctx",
-            format_picker_context_window(context_window)
-        ));
+        // The ChatGPT/Codex OAuth roster reports account-scoped windows (e.g.
+        // 272K for gpt-5.x) that differ from the API route's limits by
+        // deliberate policy. Label the value as route-scoped so it reads as a
+        // route fact, not a wrong generic model limit (TUI-DOG-016).
+        if provider == Some(ApiProvider::OpenaiCodex) {
+            parts.push(format!(
+                "{} ctx · ChatGPT route",
+                format_picker_context_window(context_window)
+            ));
+        } else {
+            parts.push(format!(
+                "{} ctx",
+                format_picker_context_window(context_window)
+            ));
+        }
     }
 
     if let Some(max_output) = metadata.max_output {
@@ -1918,7 +1929,10 @@ mod tests {
             api_hint.contains("priced") || api_hint.contains('$') || api_hint.contains("per Mtok"),
             "{api_hint}"
         );
-        assert!(oauth_hint.contains("272K ctx"), "{oauth_hint}");
+        assert!(
+            oauth_hint.contains("272K ctx · ChatGPT route"),
+            "OAuth ctx must be labeled route-scoped (TUI-DOG-016): {oauth_hint}"
+        );
         assert!(oauth_hint.contains("tools"), "{oauth_hint}");
         assert!(oauth_hint.contains("ChatGPT OAuth"), "{oauth_hint}");
         for false_api_fact in ["1.05M", "128K out", "priced", "$", "per Mtok"] {

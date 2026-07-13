@@ -8,6 +8,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use crate::localization::MessageId;
 use crate::tui::app::{App, SidebarHoverRow, SidebarHoverSection};
 use crate::tui::ui_text::truncate_line_to_width;
 
@@ -37,7 +38,10 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, classic_shell: bo
     if rows.is_empty() {
         app.work_surface.focused = false;
         app.work_surface.selected = None;
+        app.work_surface.opened = None;
         app.work_surface.hovered = None;
+        app.work_surface.stop_arm = None;
+        app.work_surface.stopping = None;
         app.work_surface.last_area = None;
         app.work_surface.hitboxes.clear();
         app.work_surface.latest_rows.clear();
@@ -190,36 +194,39 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         let selected =
             app.work_surface.focused && app.work_surface.selected.as_ref() == Some(&row.id);
         let hovered = app.work_surface.hovered.as_ref() == Some(&row.id);
-        let style = row_style(app, row, selected || hovered);
-        let controls = controls_text(app, row, content_area.width);
+        let opened = app.work_surface.opened.as_ref() == Some(&row.id);
+        let armed = app
+            .work_surface
+            .stop_arm
+            .as_ref()
+            .is_some_and(|arm| arm.is_active() && arm.row_id == row.id);
+        let stopping = app.work_surface.stopping.as_ref() == Some(&row.id);
+        let style = row_style(app, row, selected, hovered, opened, armed);
+        let controls = controls_text(app, row, content_area.width, armed, stopping, opened);
         let controls_width = UnicodeWidthStr::width(controls.as_str());
         let compact_owner = if body_area.height <= 2 {
             row.id
                 .0
                 .split_once(':')
                 .map(|(kind, _)| match kind {
-                    "task" => format!(
-                        "{} · ",
-                        app.tr(crate::localization::MessageId::SidebarTasksLabel)
-                    ),
-                    "todo" => format!(
-                        "{} · ",
-                        app.tr(crate::localization::MessageId::SidebarTodoLabel)
-                    ),
-                    "worker" => format!(
-                        "{} · ",
-                        app.tr(crate::localization::MessageId::FleetRosterWorkers)
-                    ),
+                    "task" => format!("{} · ", app.tr(MessageId::SidebarTasksLabel)),
+                    "todo" => format!("{} · ", app.tr(MessageId::SidebarTodoLabel)),
+                    "worker" => format!("{} · ", app.tr(MessageId::FleetRosterWorkers)),
                     _ => String::new(),
                 })
                 .unwrap_or_default()
         } else {
             String::new()
         };
-        let prefix = if row.tone == WorkTone::Heading {
-            format!("{} ", row.mark)
+        let mark = if opened && row.selectable {
+            "▾"
         } else {
-            format!("{compact_owner}{} ", row.mark)
+            row.mark
+        };
+        let prefix = if row.tone == WorkTone::Heading {
+            format!("{} ", mark)
+        } else {
+            format!("{compact_owner}{mark} ")
         };
         let label_width = usize::from(content_area.width)
             .saturating_sub(UnicodeWidthStr::width(prefix.as_str()) + controls_width)
@@ -232,25 +239,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         );
         let display = format!("{prefix}{label}{}{controls}", " ".repeat(gap));
         lines.push(Line::from(Span::styled(display.clone(), style)));
-        let stop_width = if row.stop_action.is_some() {
-            UnicodeWidthStr::width(if content_area.width < 60 {
-                " stop"
-            } else {
-                " [stop]"
-            })
-        } else {
-            0
-        };
-        let row_right = content_area.x.saturating_add(content_area.width);
-        let stop_start = row
-            .stop_action
-            .as_ref()
-            .map(|_| row_right.saturating_sub(stop_width as u16));
+
+        let (open_start, open_end, stop_start, stop_end) =
+            control_zones(app, row, content_area, armed, stopping, opened);
         hitboxes.push(WorkHitbox {
             id: row.id.clone(),
             row_y,
+            open_zone_start_col: open_start,
+            open_zone_end_col: open_end,
             stop_zone_start_col: stop_start,
-            stop_zone_end_col: stop_start.map(|start| start.saturating_add(stop_width as u16)),
+            stop_zone_end_col: stop_end,
         });
 
         if row.selectable {
@@ -263,7 +261,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                 click_action: row.primary_action.clone(),
                 stop_action: row.stop_action.clone(),
                 stop_zone_start_col: stop_start,
-                stop_zone_end_col: stop_start.map(|start| start.saturating_add(stop_width as u16)),
+                stop_zone_end_col: stop_end,
             });
         }
     }
@@ -290,9 +288,32 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     });
 }
 
-fn controls_text(app: &App, row: &WorkRow, width: u16) -> String {
-    let open = app.tr(crate::localization::MessageId::SidebarOpenControl);
-    let stop = app.tr(crate::localization::MessageId::SidebarStopControl);
+fn controls_text(
+    app: &App,
+    row: &WorkRow,
+    width: u16,
+    armed: bool,
+    stopping: bool,
+    _opened: bool,
+) -> String {
+    if stopping {
+        let stopping_label = app.tr(MessageId::WorkSurfaceStoppingControl);
+        return if width < 60 {
+            format!(" {stopping_label}")
+        } else {
+            format!(" [{stopping_label}]")
+        };
+    }
+    if armed {
+        let confirm = app.tr(MessageId::WorkSurfaceStopConfirmControl);
+        return if width < 60 {
+            format!(" {confirm} Esc")
+        } else {
+            format!(" [{confirm}] Esc")
+        };
+    }
+    let open = app.tr(MessageId::SidebarOpenControl);
+    let stop = app.tr(MessageId::SidebarStopControl);
     match (
         row.primary_action.is_some(),
         row.stop_action.is_some(),
@@ -306,7 +327,60 @@ fn controls_text(app: &App, row: &WorkRow, width: u16) -> String {
     }
 }
 
-fn row_style(app: &App, row: &WorkRow, highlighted: bool) -> Style {
+/// Record Open/Stop hitboxes from the same glyphs shown on screen.
+fn control_zones(
+    app: &App,
+    row: &WorkRow,
+    content_area: Rect,
+    armed: bool,
+    stopping: bool,
+    opened: bool,
+) -> (Option<u16>, Option<u16>, Option<u16>, Option<u16>) {
+    if stopping || (!row.primary_action.is_some() && !row.stop_action.is_some() && !armed) {
+        return (None, None, None, None);
+    }
+    let width = content_area.width;
+    let row_right = content_area.x.saturating_add(content_area.width);
+    let controls = controls_text(app, row, width, armed, stopping, opened);
+    let controls_width = UnicodeWidthStr::width(controls.as_str()) as u16;
+    let controls_start = row_right.saturating_sub(controls_width);
+
+    if armed {
+        // Whole armed control strip is the confirm hitbox.
+        return (None, None, Some(controls_start), Some(row_right));
+    }
+
+    let open = app.tr(MessageId::SidebarOpenControl);
+    let stop = app.tr(MessageId::SidebarStopControl);
+    let (open_text, stop_text) = if width < 60 {
+        (format!(" {open}"), format!(" {stop}"))
+    } else {
+        (format!(" [{open}]"), format!(" [{stop}]"))
+    };
+
+    let mut cursor = controls_start;
+    let mut open_zone = (None, None);
+    let mut stop_zone = (None, None);
+    if row.primary_action.is_some() {
+        let open_width = UnicodeWidthStr::width(open_text.as_str()) as u16;
+        open_zone = (Some(cursor), Some(cursor.saturating_add(open_width)));
+        cursor = cursor.saturating_add(open_width);
+    }
+    if row.stop_action.is_some() {
+        let stop_width = UnicodeWidthStr::width(stop_text.as_str()) as u16;
+        stop_zone = (Some(cursor), Some(cursor.saturating_add(stop_width)));
+    }
+    (open_zone.0, open_zone.1, stop_zone.0, stop_zone.1)
+}
+
+fn row_style(
+    app: &App,
+    row: &WorkRow,
+    selected: bool,
+    hovered: bool,
+    opened: bool,
+    armed: bool,
+) -> Style {
     let fg = match row.tone {
         WorkTone::Heading => app.ui_theme.accent_primary,
         WorkTone::Live => app.ui_theme.status_working,
@@ -319,10 +393,26 @@ fn row_style(app: &App, row: &WorkRow, highlighted: bool) -> Style {
     if row.tone == WorkTone::Heading {
         style = style.add_modifier(Modifier::BOLD);
     }
-    if highlighted && row.selectable {
+    if !row.selectable {
+        return style;
+    }
+    if armed {
+        return style
+            .fg(app.ui_theme.error_fg)
+            .bg(app.ui_theme.selection_bg)
+            .add_modifier(Modifier::BOLD);
+    }
+    if opened {
+        style = style
+            .fg(app.ui_theme.accent_primary)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    if selected {
         style = style
             .bg(app.ui_theme.selection_bg)
             .add_modifier(Modifier::BOLD);
+    } else if hovered {
+        style = style.bg(app.ui_theme.elevated_bg);
     }
     style
 }

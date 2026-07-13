@@ -1914,10 +1914,7 @@ fn app_system_prompt_includes_configured_instructions() {
         ..Config::default()
     };
 
-    let prompt = match build_app_system_prompt(&app, &config) {
-        SystemPrompt::Text(text) => text,
-        SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-    };
+    let prompt = crate::prompts::system_prompt_flat_text(&build_app_system_prompt(&app, &config));
 
     assert!(prompt.contains("CONFIGURED_INSTRUCTIONS_MARKER"));
     assert!(prompt.contains(&instructions.display().to_string()));
@@ -5868,6 +5865,10 @@ async fn bang_shell_input_dispatches_shell_op_instead_of_model_message() {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
     app.trust_mode = false;
+    // Pin the posture: App::new consults the developer's real saved
+    // settings, so a machine dogfooding with Bypass/Full Access would flip
+    // the auto_approve assertion below (hermeticity, not behavior).
+    app.approval_mode = ApprovalMode::Suggest;
 
     let mut engine = mock_engine_handle();
 

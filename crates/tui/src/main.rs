@@ -5,10 +5,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -62,6 +63,7 @@ mod mcp;
 mod mcp_server;
 mod memory;
 mod model_catalog;
+mod model_context;
 mod model_inventory;
 mod model_profile;
 mod model_registry;
@@ -275,7 +277,7 @@ enum Commands {
     /// Generate speech audio with Xiaomi MiMo TTS models
     #[command(visible_alias = "tts")]
     Speech(SpeechArgs),
-    /// Run a non-interactive prompt. Use --auto for tool-backed agent mode.
+    /// Run a non-interactive prompt. Use --auto for agent-with-tools mode.
     Exec(ExecArgs),
     /// Manage local Agent Fleet runs and workers
     Fleet(FleetArgs),
@@ -346,7 +348,9 @@ Examples:
   codewhale exec --auto --output-format stream-json \"fix the failing test\"
 
 Plain `codewhale exec` is a one-shot model response. Use `--auto` for
-non-interactive filesystem/shell tool use.
+non-interactive agent-with-tools execution. `--auto` does not change the
+sandbox posture or elevate a denied tool. Use `--sandbox danger-full-access`
+or `--allow-sandbox-elevation` to explicitly authorize sandbox elevation.
 ")]
 struct ExecArgs {
     /// Override model for this run
@@ -363,9 +367,16 @@ struct ExecArgs {
     /// Accepted values: auto, off, low, medium, high, max.
     #[arg(long = "reasoning-effort", value_name = "EFFORT")]
     reasoning_effort: Option<String>,
-    /// Enable tool-backed agent mode with auto-approvals
+    /// Enable agent-with-tools mode with automatic tool approvals. This does
+    /// not authorize sandbox elevation.
     #[arg(long, default_value_t = false)]
     auto: bool,
+    /// Sandbox policy for this exec run; independent from --auto.
+    #[arg(long, value_name = "POLICY")]
+    sandbox: Option<String>,
+    /// Explicitly allow a denied tool to retry with danger-full-access.
+    #[arg(long, default_value_t = false)]
+    allow_sandbox_elevation: bool,
     /// Emit machine-readable JSON output
     #[arg(long, default_value_t = false, conflicts_with = "output_format")]
     json: bool,
@@ -1323,6 +1334,10 @@ async fn main() -> Result<()> {
                 });
                 let mut config = config.clone();
                 merge_user_workspace_config(&mut config, cli.config.clone(), &workspace);
+                if let Some(sandbox) = args.sandbox.as_deref() {
+                    let _ = parse_sandbox_policy(sandbox, true, Vec::new(), false, false)?;
+                    config.sandbox_mode = Some(sandbox.to_ascii_lowercase());
+                }
                 // Honour DEEPSEEK_BASE_URL forwarded by the CLI dispatcher from --base-url.
                 if let Ok(env_url) = std::env::var("DEEPSEEK_BASE_URL") {
                     let trimmed = env_url.trim();
@@ -1371,6 +1386,8 @@ async fn main() -> Result<()> {
                     || args.allowed_tools.is_some()
                     || args.disallowed_tools.is_some()
                     || args.append_system_prompt.is_some()
+                    || args.sandbox.is_some()
+                    || args.allow_sandbox_elevation
                     || env_tool_surface.is_some();
                 if needs_engine {
                     let provider = config.api_provider();
@@ -1393,6 +1410,8 @@ async fn main() -> Result<()> {
                         workspace,
                         max_subagents,
                         auto_mode,
+                        args.allow_sandbox_elevation,
+                        args.sandbox.as_deref(),
                         auto_mode,
                         args.json,
                         resume_session_id,
@@ -7510,16 +7529,46 @@ async fn run_one_shot_json(config: &Config, model: &str, prompt: &str) -> Result
 
 #[derive(serde::Serialize)]
 struct ExecStreamMeta {
+    receipt_kind: &'static str,
+    provider: String,
     model: String,
-    input_tokens: u32,
-    output_tokens: u32,
+    route_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_hit_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_miss_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_write_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<u32>,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_count: Option<u32>,
+    approval_posture: String,
+    sandbox_posture: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_sha256: Option<String>,
+    prompt_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_catalog_sha256: Option<String>,
     input_analysis: ExecStreamInputAnalysis,
     visible_final_answer_chars: usize,
     session_id: String,
     resume_command: String,
     workspace: String,
     message_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    termination_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_category: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, PartialEq, Eq)]
@@ -7545,6 +7594,9 @@ struct ExecStreamInputAnalysis {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
+// Keep receipts flat for stable JSONL consumers. Boxing the whole tool_result
+// payload would introduce a nested object and break the stream schema.
+#[allow(clippy::large_enum_variant)]
 enum ExecStreamEvent {
     #[serde(rename = "content")]
     Content { content: String },
@@ -7553,12 +7605,33 @@ enum ExecStreamEvent {
         name: String,
         id: String,
         input: serde_json::Value,
+        started_at: String,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
         id: String,
+        name: String,
         output: String,
         status: String,
+        started_at: String,
+        completed_at: String,
+        duration_ms: u64,
+        side_effect_status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_category: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncated: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifact: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_metadata: Option<serde_json::Value>,
+    },
+    #[serde(rename = "sandbox_denied")]
+    SandboxDenied {
+        tool_id: String,
+        tool_name: String,
+        reason: String,
+        outcome: String,
     },
     #[serde(rename = "workflow_event")]
     WorkflowEvent {
@@ -7568,16 +7641,75 @@ enum ExecStreamEvent {
     #[serde(rename = "session_capture")]
     SessionCapture { content: String },
     #[serde(rename = "metadata")]
-    Metadata { meta: ExecStreamMeta },
+    Metadata { meta: Box<ExecStreamMeta> },
     #[serde(rename = "done")]
     Done,
     #[serde(rename = "error")]
     Error { error: String },
 }
 
+fn exec_sandbox_elevation_authorized(
+    allow_sandbox_elevation: bool,
+    explicit_sandbox: Option<&str>,
+) -> bool {
+    allow_sandbox_elevation
+        || explicit_sandbox.is_some_and(|policy| policy.eq_ignore_ascii_case("danger-full-access"))
+}
+
 fn emit_exec_stream_event(event: &ExecStreamEvent) -> Result<()> {
-    println!("{}", serde_json::to_string(event)?);
+    println!("{}", serde_json::to_string(&exec_stream_value(event)?)?);
     Ok(())
+}
+
+fn exec_stream_value(event: &ExecStreamEvent) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(event)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("schema_version".to_string(), serde_json::json!(1));
+        object.insert(
+            "schema".to_string(),
+            serde_json::json!("codewhale.exec-stream"),
+        );
+    }
+    Ok(value)
+}
+
+fn tool_error_receipt_category(error: &crate::tools::spec::ToolError) -> &'static str {
+    use crate::tools::spec::ToolError;
+    match error {
+        ToolError::InvalidInput { .. } => "invalid_input",
+        ToolError::MissingField { .. } => "missing_field",
+        ToolError::PathEscape { .. } => "path_escape",
+        ToolError::ExecutionFailed { .. } => "execution_failed",
+        ToolError::Timeout { .. } => "timeout",
+        ToolError::NotAvailable { .. } => "not_available",
+        ToolError::PermissionDenied { .. } => "permission_denied",
+    }
+}
+
+fn tool_artifact_receipt(metadata: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let object = metadata?.as_object()?;
+    let mut artifact = serde_json::Map::new();
+    for key in [
+        "artifact_id",
+        "artifact_path",
+        "artifact_relative_path",
+        "artifact_byte_size",
+        "spillover_path",
+        "content_digest",
+        "original_byte_count",
+        "retained_head_bytes",
+        "retained_tail_bytes",
+    ] {
+        if let Some(value) = object.get(key) {
+            artifact.insert(key.to_string(), value.clone());
+        }
+    }
+    (!artifact.is_empty()).then_some(serde_json::Value::Object(artifact))
+}
+
+fn current_binary_sha256() -> Option<String> {
+    let bytes = std::fs::read(std::env::current_exe().ok()?).ok()?;
+    Some(format!("sha256:{}", crate::hashing::sha256_hex(&bytes)))
 }
 
 async fn run_workflow_tool_command(cli: &Cli, args: WorkflowToolArgs) -> Result<()> {
@@ -7629,12 +7761,20 @@ async fn run_workflow_tool_command_inner(cli: &Cli, args: WorkflowToolArgs) -> R
     )
     .await?;
     let execution_config = config_for_cli_route(&config, &route);
+    let route_provider = route.provider.as_str().to_string();
+    let workflow_input_sha256 = format!(
+        "sha256:{}",
+        crate::hashing::sha256_hex(&serde_json::to_vec(&input)?)
+    );
     let tool_id = format!("workflow_host_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let tool_started = Instant::now();
+    let tool_started_at = chrono::Utc::now().to_rfc3339();
 
     emit_exec_stream_event(&ExecStreamEvent::ToolUse {
         name: "workflow".to_string(),
         id: tool_id.clone(),
         input: input.clone(),
+        started_at: tool_started_at.clone(),
     })?;
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(1024);
@@ -7670,17 +7810,51 @@ async fn run_workflow_tool_command_inner(cli: &Cli, args: WorkflowToolArgs) -> R
     let completed = result.success && workflow_status == "completed";
     emit_exec_stream_event(&ExecStreamEvent::ToolResult {
         id: tool_id,
+        name: "workflow".to_string(),
         output: result.content.clone(),
         status: if completed { "success" } else { "error" }.to_string(),
+        started_at: tool_started_at,
+        completed_at: chrono::Utc::now().to_rfc3339(),
+        duration_ms: u64::try_from(tool_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        side_effect_status: result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("side_effect_status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        error_category: (!completed).then(|| "tool_error".to_string()),
+        truncated: result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("truncated"))
+            .and_then(serde_json::Value::as_bool),
+        artifact: tool_artifact_receipt(result.metadata.as_ref()),
+        result_metadata: result.metadata.clone(),
     })?;
     emit_exec_stream_event(&ExecStreamEvent::Metadata {
-        meta: ExecStreamMeta {
+        meta: Box::new(ExecStreamMeta {
+            receipt_kind: "terminal",
+            provider: route_provider,
             // No parent/operator model call occurs on this host-owned path;
             // child model/provider usage remains attributable in typed task
             // receipts rather than being misreported as one root model.
             model: "host-workflow".to_string(),
-            input_tokens: 0,
-            output_tokens: 0,
+            route_source: "host_workflow".to_string(),
+            input_tokens: None,
+            output_tokens: None,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_cache_write_tokens: None,
+            reasoning_tokens: None,
+            duration_ms: u64::try_from(tool_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            retry_count: None,
+            approval_posture: "explicit_workflow_command".to_string(),
+            sandbox_posture: "configured".to_string(),
+            binary_sha256: current_binary_sha256(),
+            config_sha256: None,
+            prompt_sha256: workflow_input_sha256,
+            tool_catalog_sha256: None,
             input_analysis: ExecStreamInputAnalysis::default(),
             visible_final_answer_chars: result.content.chars().count(),
             session_id: String::new(),
@@ -7688,7 +7862,9 @@ async fn run_workflow_tool_command_inner(cli: &Cli, args: WorkflowToolArgs) -> R
             workspace: workspace.display().to_string(),
             message_count: 0,
             status: Some(workflow_status.clone()),
-        },
+            termination_reason: Some(if completed { "resolved" } else { "tool_error" }.to_string()),
+            error_category: (!completed).then(|| "tool".to_string()),
+        }),
     })?;
     if !completed {
         let error = format!("workflow run ended with terminal status {workflow_status}");
@@ -7707,10 +7883,20 @@ fn exit_workflow_tool_failure() -> ! {
 }
 
 fn exit_workflow_tool_error(tool_id: &str, error: String) -> ! {
+    let now = chrono::Utc::now().to_rfc3339();
     let _ = emit_exec_stream_event(&ExecStreamEvent::ToolResult {
         id: tool_id.to_string(),
+        name: "workflow".to_string(),
         output: error.clone(),
         status: "error".to_string(),
+        started_at: now.clone(),
+        completed_at: now,
+        duration_ms: 0,
+        side_effect_status: "unknown".to_string(),
+        error_category: Some("execution_failed".to_string()),
+        truncated: None,
+        artifact: None,
+        result_metadata: None,
     });
     let _ = emit_exec_stream_event(&ExecStreamEvent::Error { error });
     exit_workflow_tool_failure()
@@ -8140,6 +8326,8 @@ async fn run_exec_agent(
     workspace: PathBuf,
     max_subagents: usize,
     auto_approve: bool,
+    allow_sandbox_elevation: bool,
+    explicit_sandbox: Option<&str>,
     trust_mode: bool,
     json_output: bool,
     resume_session_id: Option<String>,
@@ -8162,6 +8350,18 @@ async fn run_exec_agent(
     let auto_model = route.auto_model;
     let effective_provider = route.provider;
     let effective_model = route.model;
+    let effective_provider_name = effective_provider.as_str().to_string();
+    let route_source = if auto_model {
+        "auto_resolver"
+    } else {
+        "explicit_or_configured"
+    }
+    .to_string();
+    let exec_started = Instant::now();
+    let prompt_sha256 = format!("sha256:{}", crate::hashing::sha256_hex(prompt.as_bytes()));
+    let binary_sha256 = current_binary_sha256();
+    let approval_posture = if auto_approve { "auto_tools" } else { "ask" }.to_string();
+    let sandbox_posture = explicit_sandbox.unwrap_or("configured_default").to_string();
     let active_route_limits =
         resolve_cli_route_limits(&execution_config, effective_provider, &effective_model);
     let max_subagents = if max_subagents == config.max_subagents_for_provider(config.api_provider())
@@ -8393,6 +8593,13 @@ async fn run_exec_agent(
         success: bool,
         output: String,
     }
+    #[derive(serde::Serialize)]
+    struct ExecOutcome {
+        kind: String,
+        outcome: String,
+        tool_name: String,
+        reason: String,
+    }
     #[derive(serde::Serialize, Default)]
     struct ExecSummary {
         mode: String,
@@ -8400,7 +8607,10 @@ async fn run_exec_agent(
         prompt: String,
         output: String,
         tools: Vec<ExecToolEntry>,
+        outcomes: Vec<ExecOutcome>,
         status: Option<String>,
+        termination_reason: Option<String>,
+        error_category: Option<String>,
         error: Option<String>,
     }
     let mut summary = ExecSummary {
@@ -8409,6 +8619,13 @@ async fn run_exec_agent(
         prompt: prompt.to_string(),
         ..ExecSummary::default()
     };
+    let can_elevate_sandbox =
+        exec_sandbox_elevation_authorized(allow_sandbox_elevation, explicit_sandbox);
+    let mut sandbox_denied = false;
+    let mut approval_required = false;
+    let mut tool_error_seen = false;
+    let mut last_error_category = None;
+    let mut reported_sandbox_contract = false;
 
     let should_persist_session =
         resume_session_id.is_some() || output_format == ExecOutputFormat::StreamJson;
@@ -8417,6 +8634,7 @@ async fn run_exec_agent(
     let mut latest_system_prompt: Option<SystemPrompt> = None;
     let mut latest_model = effective_model;
     let mut latest_workspace = workspace.clone();
+    let mut tool_starts: HashMap<String, (Instant, String)> = HashMap::new();
 
     let mut stdout = io::stdout();
     let mut ends_with_newline = false;
@@ -8453,8 +8671,15 @@ async fn run_exec_agent(
                 // TUI transcript retains its existing Activity Detail surface.
             }
             Event::ToolCallStarted { id, name, input } => {
+                let started_at = chrono::Utc::now().to_rfc3339();
+                tool_starts.insert(id.clone(), (Instant::now(), started_at.clone()));
                 if output_format == ExecOutputFormat::StreamJson {
-                    emit_exec_stream_event(&ExecStreamEvent::ToolUse { name, id, input })?;
+                    emit_exec_stream_event(&ExecStreamEvent::ToolUse {
+                        name,
+                        id,
+                        input,
+                        started_at,
+                    })?;
                 } else if !json_output {
                     let summary = summarize_tool_args(&input);
                     if let Some(summary) = summary {
@@ -8466,56 +8691,106 @@ async fn run_exec_agent(
             }
             Event::ToolCallComplete {
                 id, name, result, ..
-            } => match result {
-                Ok(output) => {
-                    summary.tools.push(ExecToolEntry {
-                        name: name.clone(),
-                        success: output.success,
-                        output: output.content.clone(),
-                    });
-                    if output_format == ExecOutputFormat::StreamJson {
-                        emit_exec_stream_event(&ExecStreamEvent::ToolResult {
-                            id,
-                            output: output.content,
-                            status: if output.success {
-                                "success".to_string()
+            } => {
+                let (duration_ms, started_at) = tool_starts
+                    .remove(&id)
+                    .map(|(started, timestamp)| {
+                        (
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            timestamp,
+                        )
+                    })
+                    .unwrap_or_else(|| (0, chrono::Utc::now().to_rfc3339()));
+                let receipt_name = name.clone();
+                match result {
+                    Ok(output) => {
+                        tool_error_seen |= !output.success;
+                        summary.tools.push(ExecToolEntry {
+                            name: name.clone(),
+                            success: output.success,
+                            output: output.content.clone(),
+                        });
+                        if output_format == ExecOutputFormat::StreamJson {
+                            emit_exec_stream_event(&ExecStreamEvent::ToolResult {
+                                id,
+                                name: receipt_name,
+                                output: output.content,
+                                status: if output.success {
+                                    "success".to_string()
+                                } else {
+                                    "error".to_string()
+                                },
+                                started_at,
+                                completed_at: chrono::Utc::now().to_rfc3339(),
+                                duration_ms,
+                                side_effect_status: output
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.get("side_effect_status"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                error_category: (!output.success).then(|| {
+                                    output
+                                        .metadata
+                                        .as_ref()
+                                        .and_then(|metadata| metadata.get("error_category"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("tool_reported_failure")
+                                        .to_string()
+                                }),
+                                truncated: output
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.get("truncated"))
+                                    .and_then(serde_json::Value::as_bool),
+                                artifact: tool_artifact_receipt(output.metadata.as_ref()),
+                                result_metadata: output.metadata,
+                            })?;
+                        } else if !json_output {
+                            if name == "exec_shell" && !output.content.trim().is_empty() {
+                                eprintln!("tool {name} completed");
+                                eprintln!(
+                                    "--- stdout/stderr ---\n{}\n---------------------",
+                                    output.content
+                                );
                             } else {
-                                "error".to_string()
-                            },
-                        })?;
-                    } else if !json_output {
-                        if name == "exec_shell" && !output.content.trim().is_empty() {
-                            eprintln!("tool {name} completed");
-                            eprintln!(
-                                "--- stdout/stderr ---\n{}\n---------------------",
-                                output.content
-                            );
-                        } else {
-                            eprintln!(
-                                "tool {name} completed: {}",
-                                summarize_tool_output(&output.content)
-                            );
+                                eprintln!(
+                                    "tool {name} completed: {}",
+                                    summarize_tool_output(&output.content)
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tool_error_seen = true;
+                        let error_text = err.to_string();
+                        summary.tools.push(ExecToolEntry {
+                            name: name.clone(),
+                            success: false,
+                            output: error_text.clone(),
+                        });
+                        if output_format == ExecOutputFormat::StreamJson {
+                            emit_exec_stream_event(&ExecStreamEvent::ToolResult {
+                                id,
+                                name: receipt_name,
+                                output: error_text,
+                                status: "error".to_string(),
+                                started_at,
+                                completed_at: chrono::Utc::now().to_rfc3339(),
+                                duration_ms,
+                                side_effect_status: "not_started_or_unknown".to_string(),
+                                error_category: Some(tool_error_receipt_category(&err).to_string()),
+                                truncated: None,
+                                artifact: None,
+                                result_metadata: None,
+                            })?;
+                        } else if !json_output {
+                            eprintln!("tool {name} failed: {err}");
                         }
                     }
                 }
-                Err(err) => {
-                    let error_text = err.to_string();
-                    summary.tools.push(ExecToolEntry {
-                        name: name.clone(),
-                        success: false,
-                        output: error_text.clone(),
-                    });
-                    if output_format == ExecOutputFormat::StreamJson {
-                        emit_exec_stream_event(&ExecStreamEvent::ToolResult {
-                            id,
-                            output: error_text,
-                            status: "error".to_string(),
-                        })?;
-                    } else if !json_output {
-                        eprintln!("tool {name} failed: {err}");
-                    }
-                }
-            },
+            }
             Event::AgentSpawned { id, prompt, .. }
                 if output_format == ExecOutputFormat::Text && !json_output =>
             {
@@ -8546,6 +8821,7 @@ async fn run_exec_agent(
                 if auto_approve {
                     let _ = engine_handle.approve_tool_call(id).await;
                 } else {
+                    approval_required = true;
                     let _ = engine_handle.deny_tool_call(id).await;
                 }
             }
@@ -8555,15 +8831,31 @@ async fn run_exec_agent(
                 denial_reason,
                 ..
             } => {
-                if auto_approve {
-                    if output_format == ExecOutputFormat::Text && !json_output {
-                        eprintln!("sandbox denied {tool_name}: {denial_reason} (auto-elevating)");
-                    }
+                if can_elevate_sandbox {
                     let policy = crate::sandbox::SandboxPolicy::DangerFullAccess;
                     let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
                 } else {
-                    if output_format == ExecOutputFormat::Text && !json_output {
-                        eprintln!("sandbox denied {tool_name}: {denial_reason}");
+                    sandbox_denied = true;
+                    approval_required = true;
+                    summary.outcomes.push(ExecOutcome {
+                        kind: "sandbox_denied".to_string(),
+                        outcome: "approval_required".to_string(),
+                        tool_name: tool_name.clone(),
+                        reason: denial_reason.clone(),
+                    });
+                    if !reported_sandbox_contract {
+                        eprintln!(
+                            "sandbox denied {tool_name}: {denial_reason}; --auto approves tools but does not elevate sandbox access — use --sandbox danger-full-access or --allow-sandbox-elevation to opt in"
+                        );
+                        reported_sandbox_contract = true;
+                    }
+                    if output_format == ExecOutputFormat::StreamJson {
+                        emit_exec_stream_event(&ExecStreamEvent::SandboxDenied {
+                            tool_id: tool_id.clone(),
+                            tool_name,
+                            reason: denial_reason,
+                            outcome: "approval_required".to_string(),
+                        })?;
                     }
                     let _ = engine_handle.deny_tool_call(tool_id).await;
                 }
@@ -8572,6 +8864,8 @@ async fn run_exec_agent(
                 envelope,
                 recoverable: _,
             } => {
+                last_error_category = Some(envelope.category);
+                summary.error_category = Some(envelope.category.to_string());
                 summary.error = Some(envelope.message.clone());
                 if output_format == ExecOutputFormat::StreamJson {
                     emit_exec_stream_event(&ExecStreamEvent::Error {
@@ -8585,10 +8879,37 @@ async fn run_exec_agent(
                 status,
                 error,
                 usage,
+                tool_catalog,
                 ..
             } => {
                 summary.status = Some(format!("{status:?}").to_lowercase());
-                summary.error = error;
+                if error.is_some() {
+                    summary.error = error;
+                }
+                if sandbox_denied
+                    && summary.error.is_none()
+                    && matches!(status, crate::core::events::TurnOutcomeStatus::Failed)
+                {
+                    summary.error = Some(
+                        "exec turn failed after sandbox denial; explicit sandbox elevation was not authorized"
+                            .to_string(),
+                    );
+                }
+                if last_error_category.is_none() {
+                    last_error_category = summary
+                        .error
+                        .as_deref()
+                        .map(crate::error_taxonomy::classify_error_message);
+                    summary.error_category =
+                        last_error_category.map(|category| category.to_string());
+                }
+                let termination_reason = crate::core::termination::classify_turn_termination(
+                    status,
+                    last_error_category,
+                    tool_error_seen,
+                    approval_required,
+                );
+                summary.termination_reason = Some(termination_reason.as_str().to_string());
                 let saved_session_id = if should_persist_session && !latest_messages.is_empty() {
                     match persist_exec_session(
                         &latest_messages,
@@ -8622,10 +8943,30 @@ async fn run_exec_agent(
                         })?;
                     }
                     emit_exec_stream_event(&ExecStreamEvent::Metadata {
-                        meta: ExecStreamMeta {
+                        meta: Box::new(ExecStreamMeta {
+                            receipt_kind: "terminal",
+                            provider: effective_provider_name.clone(),
                             model: latest_model.clone(),
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
+                            route_source: route_source.clone(),
+                            input_tokens: Some(usage.input_tokens),
+                            output_tokens: Some(usage.output_tokens),
+                            prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
+                            prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
+                            prompt_cache_write_tokens: usage.prompt_cache_write_tokens,
+                            reasoning_tokens: usage.reasoning_tokens,
+                            duration_ms: u64::try_from(exec_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            retry_count: None,
+                            approval_posture: approval_posture.clone(),
+                            sandbox_posture: sandbox_posture.clone(),
+                            binary_sha256: binary_sha256.clone(),
+                            config_sha256: None,
+                            prompt_sha256: prompt_sha256.clone(),
+                            tool_catalog_sha256: tool_catalog.as_ref().and_then(|catalog| {
+                                serde_json::to_vec(catalog).ok().map(|bytes| {
+                                    format!("sha256:{}", crate::hashing::sha256_hex(&bytes))
+                                })
+                            }),
                             input_analysis: exec_stream_input_analysis(
                                 &latest_messages,
                                 latest_system_prompt.as_ref(),
@@ -8642,7 +8983,9 @@ async fn run_exec_agent(
                             workspace: latest_workspace.display().to_string(),
                             message_count: latest_messages.len(),
                             status: summary.status.clone(),
-                        },
+                            termination_reason: summary.termination_reason.clone(),
+                            error_category: summary.error_category.clone(),
+                        }),
                     })?;
                     emit_exec_stream_event(&ExecStreamEvent::Done)?;
                 }
@@ -10225,6 +10568,83 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_auto_does_not_authorize_sandbox_elevation() {
+        let cli = parse_cli(&["codewhale", "exec", "--auto", "run it"]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert!(!exec_sandbox_elevation_authorized(
+            args.allow_sandbox_elevation,
+            args.sandbox.as_deref()
+        ));
+    }
+
+    #[test]
+    fn exec_explicit_sandbox_elevation_opt_ins_authorize_retry() {
+        let danger = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--auto",
+            "--sandbox",
+            "danger-full-access",
+            "run it",
+        ]);
+        let Some(Commands::Exec(args)) = danger.command else {
+            panic!("expected exec command");
+        };
+        assert!(exec_sandbox_elevation_authorized(
+            args.allow_sandbox_elevation,
+            args.sandbox.as_deref()
+        ));
+
+        let flag = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--auto",
+            "--allow-sandbox-elevation",
+            "run it",
+        ]);
+        let Some(Commands::Exec(args)) = flag.command else {
+            panic!("expected exec command");
+        };
+        assert!(exec_sandbox_elevation_authorized(
+            args.allow_sandbox_elevation,
+            args.sandbox.as_deref()
+        ));
+    }
+
+    #[test]
+    fn exec_sandbox_denial_stream_event_is_typed() {
+        let event = ExecStreamEvent::SandboxDenied {
+            tool_id: "call_1".to_string(),
+            tool_name: "exec_shell".to_string(),
+            reason: "write blocked".to_string(),
+            outcome: "approval_required".to_string(),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).expect("serializes"))
+                .expect("valid json");
+        assert_eq!(value["type"], "sandbox_denied");
+        assert_eq!(value["outcome"], "approval_required");
+    }
+
+    #[test]
+    fn exec_help_separates_agent_mode_from_sandbox_elevation() {
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("exec")
+            .expect("exec command")
+            .render_help()
+            .to_string();
+        assert!(help.contains("--auto"));
+        assert!(help.contains("--sandbox"));
+        assert!(help.contains("--allow-sandbox-elevation"));
+        assert!(help.contains("does not change the"));
+        assert!(help.contains("explicitly authorize sandbox elevation"));
+    }
+
+    #[test]
     fn exec_shell_only_tool_surface_env_sets_shell_allowlist() {
         let _env_lock = crate::test_support::lock_test_env();
         let _surface =
@@ -10330,14 +10750,28 @@ mod terminal_mode_tests {
     fn exec_stream_events_are_json_lines() {
         let event = ExecStreamEvent::ToolResult {
             id: "call_1".to_string(),
+            name: "read_file".to_string(),
             output: "line 1\nline 2".to_string(),
             status: "success".to_string(),
+            started_at: "2026-07-13T00:00:00Z".to_string(),
+            completed_at: "2026-07-13T00:00:01Z".to_string(),
+            duration_ms: 1000,
+            side_effect_status: "not_started".to_string(),
+            error_category: None,
+            truncated: Some(false),
+            artifact: None,
+            result_metadata: None,
         };
 
-        let json = serde_json::to_string(&event).expect("serializes");
+        let value = exec_stream_value(&event).expect("serializes");
+        let json = serde_json::to_string(&value).expect("serializes");
         assert!(!json.contains('\n'));
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(parsed["type"], "tool_result");
+        assert_eq!(parsed["schema"], "codewhale.exec-stream");
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["duration_ms"], 1000);
+        assert_eq!(parsed["side_effect_status"], "not_started");
     }
 
     #[test]
@@ -10363,10 +10797,25 @@ mod terminal_mode_tests {
     fn exec_stream_metadata_redacts_resume_breadcrumbs() {
         let raw_session_id = "abc123fullsecret";
         let event = ExecStreamEvent::Metadata {
-            meta: ExecStreamMeta {
+            meta: Box::new(ExecStreamMeta {
+                receipt_kind: "terminal",
+                provider: "deepseek".to_string(),
                 model: "deepseek-v4-flash".to_string(),
-                input_tokens: 123,
-                output_tokens: 45,
+                route_source: "explicit_or_configured".to_string(),
+                input_tokens: Some(123),
+                output_tokens: Some(45),
+                prompt_cache_hit_tokens: Some(10),
+                prompt_cache_miss_tokens: None,
+                prompt_cache_write_tokens: None,
+                reasoning_tokens: Some(3),
+                duration_ms: 2500,
+                retry_count: None,
+                approval_posture: "ask".to_string(),
+                sandbox_posture: "configured_default".to_string(),
+                binary_sha256: Some("sha256:binary".to_string()),
+                config_sha256: None,
+                prompt_sha256: "sha256:prompt".to_string(),
+                tool_catalog_sha256: Some("sha256:tools".to_string()),
                 input_analysis: ExecStreamInputAnalysis::default(),
                 visible_final_answer_chars: 17,
                 session_id: exec_stream_session_ref(raw_session_id),
@@ -10374,7 +10823,9 @@ mod terminal_mode_tests {
                 workspace: "/tmp/work".to_string(),
                 message_count: 4,
                 status: Some("completed".to_string()),
-            },
+                termination_reason: Some("resolved".to_string()),
+                error_category: None,
+            }),
         };
 
         let json = serde_json::to_string(&event).expect("serializes");

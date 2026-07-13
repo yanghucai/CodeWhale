@@ -1573,10 +1573,31 @@ fn turn_route_lines(app: &App) -> Vec<String> {
     }
 
     let cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    if app.billing_presentation.shows_money() && cost > 0.0 {
-        lines.push(format!("Cost (session): {}", app.format_cost_amount(cost)));
-    } else if let Some(label) = app.billing_presentation.label() {
-        lines.push(format!("Usage plan: {label}"));
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        cost,
+        app.cost_currency,
+        None,
+    );
+    match chip {
+        crate::route_billing::UsageChip::Money(amount) => {
+            lines.push(format!("Cost (session): {amount}"));
+        }
+        crate::route_billing::UsageChip::Allowance { label, used_pct } => {
+            lines.push(match used_pct {
+                Some(pct) => format!("Usage plan: {label} ({pct:.0}% used)"),
+                None => format!("Usage plan: {label}"),
+            });
+        }
+        crate::route_billing::UsageChip::Local => {
+            lines.push("Cost: local".to_string());
+        }
+        crate::route_billing::UsageChip::Unknown => {
+            lines.push("Cost: unknown".to_string());
+        }
+        crate::route_billing::UsageChip::Hidden => {}
     }
 
     lines

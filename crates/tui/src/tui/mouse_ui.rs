@@ -227,10 +227,9 @@ fn handle_workflow_panel_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         panel.keyboard_focus = true;
     }
 
-    // Rightmost ~14 columns of the header row act as the cancel control.
     let on_header_row = mouse.row == area.y;
-    let cancel_zone_start = area.x.saturating_add(area.width.saturating_sub(14));
-    let in_cancel_zone = on_header_row && mouse.column >= cancel_zone_start;
+    let in_cancel_zone =
+        on_header_row && mouse_hits_rect(mouse, app.viewport.last_workflow_cancel_area);
     let running = app
         .workflow_panel
         .as_ref()
@@ -328,6 +327,47 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
     if !app.view_stack.is_empty() {
         app.needs_redraw = true;
         return app.view_stack.handle_mouse(mouse);
+    }
+
+    // The launch surface owns the whole frame until a session is chosen.
+    // Consume every mouse event here so wheel input cannot leak into the
+    // transcript or composer behind the splash.
+    if app.launch.visible {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                crate::tui::underwater::handle_launch_key(
+                    &mut app.launch,
+                    KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                    app.ui_locale,
+                );
+            }
+            MouseEventKind::ScrollDown => {
+                crate::tui::underwater::handle_launch_key(
+                    &mut app.launch,
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    app.ui_locale,
+                );
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((index, _)) = app
+                    .launch
+                    .row_areas
+                    .iter()
+                    .enumerate()
+                    .find(|(_, area)| mouse_hits_rect(mouse, Some(**area)))
+                {
+                    app.launch.selected = index;
+                    app.pending_launch_action = Some(crate::tui::underwater::handle_launch_key(
+                        &mut app.launch,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        app.ui_locale,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        app.needs_redraw = true;
+        return Vec::new();
     }
 
     // Sidebar resize handle — check before composer so it doesn't compete
@@ -589,7 +629,20 @@ fn sidebar_click_action(app: &App, mouse: MouseEvent) -> Option<SidebarRowAction
             {
                 return Some(action.clone());
             }
-            return row.click_action.clone();
+            return row.click_action.as_ref().map(|action| match action {
+                SidebarRowAction::HotbarSlot(first_slot) => {
+                    let cell_width = section
+                        .content_area
+                        .width
+                        .saturating_sub(3)
+                        .saturating_div(4)
+                        .max(1);
+                    let column = mouse.column.saturating_sub(section.content_area.x);
+                    let cell = (column / (cell_width + 1)).min(3);
+                    SidebarRowAction::HotbarSlot(first_slot.saturating_add(cell as u8))
+                }
+                _ => action.clone(),
+            });
         }
     }
     None
@@ -608,6 +661,10 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             app.cursor_position = app.input.len();
             app.status_message = Some(app.tr(MessageId::SidebarDestructiveArmed).into_owned());
             app.needs_redraw = true;
+            Vec::new()
+        }
+        SidebarRowAction::HotbarSlot(slot) => {
+            app.pending_hotbar_slot = Some(slot);
             Vec::new()
         }
         SidebarRowAction::ToggleAgentDetails { agent_id } => {
@@ -633,6 +690,15 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
                     open_details_pager_for_cell(app, cell_index);
                 }
                 None => {
+                    // Open failed — do not leave a stale detail-open owner.
+                    if app
+                        .work_surface
+                        .opened
+                        .as_ref()
+                        .is_some_and(|id| id.0 == format!("worker:{agent_id}"))
+                    {
+                        app.work_surface.opened = None;
+                    }
                     app.status_message = Some(format!(
                         "No transcript card for {agent_id} yet — use handle_read agent:{agent_id}/full_transcript"
                     ));
@@ -645,7 +711,24 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             vec![ViewEvent::SidebarAgentCancel { agent_id }]
         }
         SidebarRowAction::InspectText { label, detail } => {
-            app.status_message = Some(format!("{label} · {detail}"));
+            // Truthful To-do/Plan detail destination (TUI-DOG-005): open a pager
+            // with the full item text instead of a status-line-only fake Open.
+            let width = app
+                .viewport
+                .last_transcript_area
+                .map(|area| area.width)
+                .unwrap_or(80);
+            let title = app.tr(MessageId::SidebarTodoLabel).into_owned();
+            let body = if detail.trim().is_empty() {
+                label
+            } else {
+                format!("{label}\n\n{detail}")
+            };
+            app.view_stack.push(crate::tui::pager::PagerView::from_text(
+                title,
+                &body,
+                width.saturating_sub(2),
+            ));
             app.needs_redraw = true;
             Vec::new()
         }

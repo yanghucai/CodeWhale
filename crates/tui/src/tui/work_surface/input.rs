@@ -2,6 +2,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 
 use crate::tui::app::{App, SidebarRowAction};
 
+use super::interaction::{
+    activate_primary, activate_stop, claim_focus, close_opened, disarm_stop, on_selection_changed,
+    release_focus,
+};
 use super::model::{WorkRow, WorkRowId, project};
 
 #[derive(Debug, Default)]
@@ -11,7 +15,8 @@ pub struct MouseOutcome {
 }
 
 /// Handle the work surface's focused keyboard contract. `Alt+W` enters the
-/// surface from the composer; Esc returns ownership to the composer.
+/// surface from the composer; Esc returns ownership to the composer (or clears
+/// a local stop arm / open detail first).
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowAction>> {
     let rows = project(app);
     if rows.is_empty() {
@@ -19,7 +24,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
     }
     if !app.work_surface.focused {
         if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::ALT) {
-            app.work_surface.focused = true;
+            claim_focus(app);
             app.work_surface.clamp_selection(&rows);
             app.needs_redraw = true;
             return Some(None);
@@ -29,40 +34,64 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
 
     let action = match key.code {
         KeyCode::Esc => {
-            app.work_surface.focused = false;
-            app.work_surface.hovered = None;
-            app.needs_redraw = true;
+            if app.work_surface.stop_arm.is_some() {
+                disarm_stop(app);
+            } else if app.work_surface.opened.is_some() {
+                close_opened(app);
+            } else {
+                release_focus(app);
+            }
             return Some(None);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             move_selection(app, &rows, -1);
+            on_selection_changed(app);
             None
         }
         KeyCode::Down | KeyCode::Char('j') => {
             move_selection(app, &rows, 1);
+            on_selection_changed(app);
             None
         }
         KeyCode::Home => {
             select_edge(app, &rows, false);
+            on_selection_changed(app);
             None
         }
         KeyCode::End => {
             select_edge(app, &rows, true);
+            on_selection_changed(app);
             None
         }
         KeyCode::PageUp => {
             move_selection(app, &rows, -(app.work_surface.visible_rows.max(1) as isize));
+            on_selection_changed(app);
             None
         }
         KeyCode::PageDown => {
             move_selection(app, &rows, app.work_surface.visible_rows.max(1) as isize);
+            on_selection_changed(app);
             None
         }
-        KeyCode::Char('x') | KeyCode::Char('X') => {
-            selected_row(app, &rows).and_then(|row| row.stop_action.clone())
-        }
+        KeyCode::Char('x') | KeyCode::Char('X') => selected_row(app, &rows).and_then(|row| {
+            row.stop_action
+                .clone()
+                .and_then(|action| activate_stop(app, &row.id, action))
+        }),
         KeyCode::Enter | KeyCode::Char(' ') => {
-            selected_row(app, &rows).and_then(|row| row.primary_action.clone())
+            // Enter confirms an armed Stop on the selected row; otherwise it
+            // toggles the primary Open/detail action.
+            if let Some(arm) = app.work_surface.stop_arm.as_ref()
+                && arm.is_active()
+                && app.work_surface.selected.as_ref() == Some(&arm.row_id)
+            {
+                let row_id = arm.row_id.clone();
+                let action = arm.action.clone();
+                activate_stop(app, &row_id, action)
+            } else {
+                selected_row(app, &rows)
+                    .and_then(|row| activate_primary(app, &row.id, row.primary_action.clone()))
+            }
         }
         _ => return None,
     };
@@ -80,6 +109,17 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
         && mouse.row >= area.y
         && mouse.row < area.bottom();
     if !inside {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+        ) && app.work_surface.focused
+        {
+            // Another region is taking the pointer — release strip focus so
+            // only one owner shows selection.
+            release_focus(app);
+        }
         if matches!(mouse.kind, MouseEventKind::Moved) && app.work_surface.hovered.take().is_some()
         {
             app.needs_redraw = true;
@@ -89,7 +129,7 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.work_surface.focused = true;
+            claim_focus(app);
             app.work_surface.scroll_offset = app.work_surface.scroll_offset.saturating_sub(2);
             app.needs_redraw = true;
             MouseOutcome {
@@ -98,7 +138,7 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
             }
         }
         MouseEventKind::ScrollDown => {
-            app.work_surface.focused = true;
+            claim_focus(app);
             let max = app
                 .work_surface
                 .total_rows
@@ -117,37 +157,56 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
                 app.work_surface.hovered = hovered;
                 app.needs_redraw = true;
             }
-            MouseOutcome::default()
+            MouseOutcome {
+                consumed: true,
+                action: None,
+            }
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let row = hit_row(app, mouse.row).cloned();
             let Some(row) = row else {
+                claim_focus(app);
                 return MouseOutcome {
                     consumed: true,
                     action: None,
                 };
             };
-            app.work_surface.focused = true;
-            app.work_surface.selected = Some(row.id.clone());
-            app.needs_redraw = true;
-            let stop_zone = app
+            claim_focus(app);
+            let hitbox = app
                 .work_surface
                 .hitboxes
                 .iter()
                 .find(|candidate| candidate.row_y == mouse.row)
-                .and_then(|candidate| {
-                    Some((
-                        row.stop_action.clone()?,
-                        candidate.stop_zone_start_col?,
-                        candidate.stop_zone_end_col?,
-                    ))
-                });
-            let action = if let Some((action, start, end)) = stop_zone {
-                (mouse.column >= start && mouse.column < end).then_some(action)
+                .cloned();
+
+            let in_stop = hitbox.as_ref().is_some_and(|hit| {
+                hit.stop_zone_start_col
+                    .zip(hit.stop_zone_end_col)
+                    .is_some_and(|(start, end)| mouse.column >= start && mouse.column < end)
+            });
+            let in_open = hitbox.as_ref().is_some_and(|hit| {
+                hit.open_zone_start_col
+                    .zip(hit.open_zone_end_col)
+                    .is_some_and(|(start, end)| mouse.column >= start && mouse.column < end)
+            });
+
+            let previous = app.work_surface.selected.clone();
+            app.work_surface.selected = Some(row.id.clone());
+            if previous.as_ref() != Some(&row.id) {
+                on_selection_changed(app);
+            }
+            app.needs_redraw = true;
+
+            let action = if in_stop {
+                row.stop_action
+                    .clone()
+                    .and_then(|action| activate_stop(app, &row.id, action))
+            } else if in_open || row.primary_action.is_some() {
+                // Open zone and row body share the primary activate/toggle.
+                activate_primary(app, &row.id, row.primary_action.clone())
             } else {
                 None
-            }
-            .or(row.primary_action);
+            };
             MouseOutcome {
                 consumed: true,
                 action,

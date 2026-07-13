@@ -3091,6 +3091,10 @@ heartbeat_timeout_secs = 1
             std::process::id()
         ));
         fs::create_dir_all(&temp_root).unwrap();
+        // Hermetic: the audit reads Settings::load(); without this guard the
+        // developer's real saved permission_posture leaks in and the
+        // "(unset)" assertion below becomes machine-dependent.
+        let _guard = EnvGuard::new(&temp_root);
         let config_path = temp_root.join("custom-config.toml");
         fs::write(
             &config_path,

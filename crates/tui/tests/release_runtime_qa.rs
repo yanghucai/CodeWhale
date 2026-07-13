@@ -244,29 +244,16 @@ async fn underwater_footer_moves_from_working_through_one_shot_completion() -> R
     enter_launch_session(&mut tui)?;
 
     type_and_submit(&mut tui, "show the underwater phase transition")?;
+    // TUI-DOG-008: live phases (working/finishing/done) render on the phase
+    // strip ABOVE the composer, so the bottom row is no longer the phase
+    // owner. Assert the phase words anywhere in the frame — the mock reply
+    // ("local phase proof") and the prompt contain none of them.
+    tui.wait_for(|frame| frame.contains("working"), INTERACTION_TIMEOUT)?;
     tui.wait_for(
-        |frame| {
-            frame
-                .row(frame.rows().saturating_sub(1))
-                .contains("working")
-        },
+        |frame| frame.contains("finishing") || frame.contains("✓ done"),
         INTERACTION_TIMEOUT,
     )?;
-    tui.wait_for(
-        |frame| {
-            frame
-                .row(frame.rows().saturating_sub(1))
-                .contains("finishing")
-        },
-        INTERACTION_TIMEOUT,
-    )?;
-    tui.wait_for(
-        |frame| {
-            let footer = frame.row(frame.rows().saturating_sub(1));
-            footer.contains("✓ done")
-        },
-        INTERACTION_TIMEOUT,
-    )?;
+    tui.wait_for(|frame| frame.contains("✓ done"), INTERACTION_TIMEOUT)?;
 
     let _ = tui.shutdown();
     Ok(())

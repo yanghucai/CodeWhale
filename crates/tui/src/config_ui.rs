@@ -1185,7 +1185,10 @@ mod tests {
         let config = Config::default();
         let doc = build_document(&app, &config).expect("document");
         assert_eq!(doc.runtime.model, app.model);
-        assert_eq!(doc.runtime.approval_mode, ApprovalModeValue::Suggest);
+        // The document must mirror the live app posture. The developer's saved
+        // permission posture may legitimately be Bypass; this test must not
+        // rewrite that product setting into an assumed Suggest default.
+        assert_eq!(doc.runtime.approval_mode, app.approval_mode.into());
         assert_eq!(doc.config.reasoning_effort, ReasoningEffortValue::Max);
     }
 

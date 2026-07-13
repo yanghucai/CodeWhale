@@ -1,9 +1,8 @@
 use ratatui::layout::Rect;
 
 use crate::localization::MessageId;
-use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus};
 use crate::tools::todo::{TodoItem, TodoStatus};
-use crate::tui::app::{App, SidebarRowAction, TaskPanelEntry, TaskPanelEntryKind};
+use crate::tui::app::{App, SidebarRowAction};
 
 /// Persisted Ocean work-surface placement. Bottom is deliberately absent: the
 /// composer and phase footer own the shell's lower edge.
@@ -64,6 +63,9 @@ pub(super) struct WorkRow {
 pub(super) struct WorkHitbox {
     pub id: WorkRowId,
     pub row_y: u16,
+    /// Render-time Open control hitbox (TUI-DOG-005).
+    pub open_zone_start_col: Option<u16>,
+    pub open_zone_end_col: Option<u16>,
     pub stop_zone_start_col: Option<u16>,
     pub stop_zone_end_col: Option<u16>,
 }
@@ -72,13 +74,21 @@ pub(super) struct WorkHitbox {
 pub struct WorkSurfaceState {
     pub placement: WorkSurfacePlacement,
     pub(super) effective_placement: WorkSurfacePlacement,
+    /// Focus owner axis — distinct from selection and detail-open.
     pub focused: bool,
+    /// Keyboard/mouse selection highlight.
     pub selected: Option<WorkRowId>,
+    /// Which row currently owns an open detail (pager / agent card).
+    pub opened: Option<WorkRowId>,
     pub scroll_offset: usize,
     pub last_area: Option<Rect>,
     pub visible_rows: usize,
     pub total_rows: usize,
     pub(super) hovered: Option<WorkRowId>,
+    /// Row-local Stop arm (TUI-DOG-006).
+    pub(super) stop_arm: Option<super::interaction::StopArm>,
+    /// Transient marker after confirm until the worker leaves the live set.
+    pub(super) stopping: Option<WorkRowId>,
     pub(super) hitboxes: Vec<WorkHitbox>,
     pub(super) cached_todos: Vec<TodoItem>,
     pub(super) latest_rows: Vec<WorkRow>,
@@ -98,11 +108,14 @@ impl WorkSurfaceState {
             effective_placement: placement,
             focused: false,
             selected: None,
+            opened: None,
             scroll_offset: 0,
             last_area: None,
             visible_rows: 0,
             total_rows: 0,
             hovered: None,
+            stop_arm: None,
+            stopping: None,
             hitboxes: Vec::new(),
             cached_todos: Vec::new(),
             latest_rows: Vec::new(),
@@ -148,95 +161,24 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
         app.work_surface.cached_todos = todos.snapshot().items;
     }
 
-    let tasks = app
-        .task_panel
+    let live = super::live_projection::LiveWorkProjection::from_app(app);
+    let attention_hold = live
+        .rows
         .iter()
-        .filter(|task| task.kind == TaskPanelEntryKind::Background)
-        .cloned()
-        .collect::<Vec<_>>();
-    let attention_hold = tasks
-        .iter()
-        .any(|task| matches!(task.status.as_str(), "waiting" | "needs_user"));
+        .any(|row| row.state == super::live_projection::LiveWorkState::Waiting);
     let todos = app.work_surface.cached_todos.clone();
-    let mut workers = app
-        .subagent_cache
-        .iter()
-        .map(|agent| {
-            let name = agent
-                .nickname
-                .clone()
-                .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned())
-                .unwrap_or_else(|| agent.name.clone());
-            let status = agent
-                .worker_status
-                .map(worker_status)
-                .unwrap_or_else(|| subagent_status(&agent.status));
-            let active = worker_is_active(agent.worker_status, &agent.status);
-            WorkRow {
-                id: WorkRowId(format!("worker:{}", agent.agent_id)),
-                mark: worker_mark(status),
-                label: format!("{name} · {}", agent.agent_type.as_str()),
-                detail: format!("{} · {}", agent.assignment.objective, agent.model),
-                tone: match status {
-                    "waiting" | "failed" | "canceled" | "interrupted" => WorkTone::Attention,
-                    "done" => WorkTone::Success,
-                    _ => WorkTone::Worker,
-                },
-                selectable: true,
-                primary_action: Some(SidebarRowAction::OpenAgentDetail {
-                    agent_id: agent.agent_id.clone(),
-                }),
-                stop_action: active.then(|| {
-                    SidebarRowAction::PrefillCommand(format!("/agent cancel {}", agent.agent_id))
-                }),
-            }
-        })
-        .collect::<Vec<_>>();
-    let cached_worker_ids = app
-        .subagent_cache
-        .iter()
-        .map(|agent| agent.agent_id.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    workers.extend(
-        app.agent_progress
-            .iter()
-            .filter(|(agent_id, _)| !cached_worker_ids.contains(agent_id.as_str()))
-            .map(|(agent_id, progress)| {
-                let status = if progress.to_ascii_lowercase().contains("waiting") {
-                    "waiting"
-                } else {
-                    "running"
-                };
-                WorkRow {
-                    id: WorkRowId(format!("worker:{agent_id}")),
-                    mark: worker_mark(status),
-                    label: app
-                        .agent_label_map
-                        .get(agent_id)
-                        .cloned()
-                        .unwrap_or_else(|| agent_id.clone()),
-                    detail: progress.clone(),
-                    tone: if status == "waiting" {
-                        WorkTone::Attention
-                    } else {
-                        WorkTone::Worker
-                    },
-                    selectable: true,
-                    primary_action: Some(SidebarRowAction::OpenAgentDetail {
-                        agent_id: agent_id.clone(),
-                    }),
-                    stop_action: Some(SidebarRowAction::PrefillCommand(format!(
-                        "/agent cancel {agent_id}"
-                    ))),
-                }
-            }),
-    );
 
     let mut rows = Vec::new();
-    if !tasks.is_empty() {
-        let label = app.tr(MessageId::SidebarTasksLabel).into_owned();
-        rows.push(section("tasks", &label, tasks.len()));
-        rows.extend(tasks.iter().map(|task| task_row(task, attention_hold)));
+    if live.counts.active > 0 || !live.rows.is_empty() {
+        rows.push(section(
+            "active",
+            &format!(
+                "Active {} · Tasks {} · Runs {} · Workers {}",
+                live.counts.active, live.counts.tasks, live.counts.runs, live.counts.workers
+            ),
+            live.counts.active,
+        ));
+        rows.extend(live.rows.iter().map(|row| live_row(row, attention_hold)));
     }
     if !todos.is_empty() {
         let completed = todos
@@ -251,13 +193,18 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
         ));
         rows.extend(todos.into_iter().map(todo_row));
     }
-    if !workers.is_empty() {
-        let label = app.tr(MessageId::FleetRosterWorkers).into_owned();
-        rows.push(section("workers", &label, workers.len()));
-        rows.extend(workers);
-    }
-
     app.work_surface.latest_rows = rows.clone();
+    let stoppable: Vec<_> = rows
+        .iter()
+        .filter(|row| row.stop_action.is_some())
+        .map(|row| row.id.clone())
+        .collect();
+    super::interaction::clear_stale_stopping(app, &stoppable);
+    if let Some(opened) = app.work_surface.opened.as_ref()
+        && !rows.iter().any(|row| &row.id == opened)
+    {
+        app.work_surface.opened = None;
+    }
     rows
 }
 
@@ -278,35 +225,80 @@ fn section(id: &str, label: &str, count: usize) -> WorkRow {
     }
 }
 
-fn task_row(task: &TaskPanelEntry, attention_hold: bool) -> WorkRow {
-    let namespace = if task.id.starts_with("shell_") {
+fn live_row(row: &super::live_projection::LiveWorkRow, attention_hold: bool) -> WorkRow {
+    let namespace = if row.kind == super::live_projection::LiveWorkKind::Run {
         "jobs"
     } else {
         "task"
     };
-    let open = format!("/{namespace} show {}", task.id);
-    let stoppable = matches!(
-        task.status.as_str(),
-        "running" | "queued" | "waiting" | "needs_user"
-    );
-    let (mark, tone) = match task.status.as_str() {
-        "running" if attention_hold => ("·", WorkTone::Muted),
-        "running" => ("›", WorkTone::Live),
-        "waiting" | "needs_user" => ("◆", WorkTone::Attention),
-        "completed" | "success" => ("✓", WorkTone::Success),
-        "failed" | "canceled" => ("✕", WorkTone::Attention),
-        _ => ("☐", WorkTone::Muted),
+    let source_id = match row.kind {
+        super::live_projection::LiveWorkKind::Worker => row
+            .identity
+            .strip_prefix("worker:")
+            .unwrap_or(&row.identity)
+            .to_string(),
+        super::live_projection::LiveWorkKind::Run => row
+            .identity
+            .strip_prefix("shell:")
+            .unwrap_or(&row.detail)
+            .to_string(),
+        _ => row.detail.clone(),
+    };
+    let open = format!("/{namespace} show {source_id}");
+    let stoppable = row.state != super::live_projection::LiveWorkState::Settled
+        && matches!(
+            row.kind,
+            super::live_projection::LiveWorkKind::Task | super::live_projection::LiveWorkKind::Run
+        );
+    let (mark, tone) = match row.state {
+        super::live_projection::LiveWorkState::Active if attention_hold => ("·", WorkTone::Muted),
+        _ => match row.state {
+            super::live_projection::LiveWorkState::Active => (
+                "›",
+                if row.kind == super::live_projection::LiveWorkKind::Worker {
+                    WorkTone::Worker
+                } else {
+                    WorkTone::Live
+                },
+            ),
+            super::live_projection::LiveWorkState::Waiting => ("◆", WorkTone::Attention),
+            super::live_projection::LiveWorkState::Settled => match row.status.as_str() {
+                "completed" | "success" | "done" => ("✓", WorkTone::Success),
+                "failed" | "canceled" | "cancelled" | "interrupted" => ("✕", WorkTone::Attention),
+                _ => ("☐", WorkTone::Muted),
+            },
+        },
+    };
+    let (primary_action, stop_action) = match row.kind {
+        super::live_projection::LiveWorkKind::Worker => {
+            let agent_id = source_id
+                .strip_prefix("worker:")
+                .unwrap_or(&source_id)
+                .to_string();
+            (
+                Some(SidebarRowAction::OpenAgentDetail {
+                    agent_id: agent_id.clone(),
+                }),
+                (row.state != super::live_projection::LiveWorkState::Settled)
+                    .then_some(SidebarRowAction::CancelAgent { agent_id }),
+            )
+        }
+        super::live_projection::LiveWorkKind::Workflow => (None, None),
+        _ => (
+            Some(SidebarRowAction::Command(open)),
+            stoppable
+                .then(|| SidebarRowAction::Command(format!("/{namespace} cancel {source_id}"))),
+        ),
     };
     WorkRow {
-        id: WorkRowId(format!("task:{}", task.id)),
+        id: WorkRowId(row.identity.clone()),
         mark,
-        label: task.prompt_summary.clone(),
-        detail: task.id.clone(),
+        label: row.label.clone(),
+        detail: row.detail.clone(),
         tone,
         selectable: true,
-        primary_action: Some(SidebarRowAction::Command(open)),
-        stop_action: stoppable
-            .then(|| SidebarRowAction::PrefillCommand(format!("/{namespace} cancel {}", task.id))),
+        primary_action,
+        stop_action,
     }
 }
 
@@ -328,56 +320,5 @@ fn todo_row(item: TodoItem) -> WorkRow {
             detail: format!("#{}", item.id),
         }),
         stop_action: None,
-    }
-}
-
-fn worker_is_active(status: Option<AgentWorkerStatus>, legacy: &SubAgentStatus) -> bool {
-    status.map_or_else(
-        || matches!(legacy, SubAgentStatus::Running),
-        |status| {
-            !matches!(
-                status,
-                AgentWorkerStatus::Completed
-                    | AgentWorkerStatus::Failed
-                    | AgentWorkerStatus::Cancelled
-                    | AgentWorkerStatus::Interrupted
-            )
-        },
-    )
-}
-
-fn worker_status(status: AgentWorkerStatus) -> &'static str {
-    match status {
-        AgentWorkerStatus::Queued => "queued",
-        AgentWorkerStatus::Starting => "starting",
-        AgentWorkerStatus::Running => "running",
-        AgentWorkerStatus::WaitingForUser => "waiting",
-        AgentWorkerStatus::ModelWait => "model wait",
-        AgentWorkerStatus::RunningTool => "tool",
-        AgentWorkerStatus::Completed => "done",
-        AgentWorkerStatus::Failed => "failed",
-        AgentWorkerStatus::Cancelled => "canceled",
-        AgentWorkerStatus::Interrupted => "interrupted",
-    }
-}
-
-fn subagent_status(status: &SubAgentStatus) -> &'static str {
-    match status {
-        SubAgentStatus::Running => "running",
-        SubAgentStatus::Completed => "done",
-        SubAgentStatus::Interrupted(_) => "interrupted",
-        SubAgentStatus::Failed(_) => "failed",
-        SubAgentStatus::Cancelled => "canceled",
-        SubAgentStatus::BudgetExhausted => "budget",
-    }
-}
-
-fn worker_mark(status: &str) -> &'static str {
-    match status {
-        "waiting" => "◆",
-        "done" => "✓",
-        "failed" | "canceled" | "interrupted" => "✕",
-        "queued" => "☐",
-        _ => "›",
     }
 }

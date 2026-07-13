@@ -1350,6 +1350,17 @@ impl WorkflowPanel {
         truncate_line_to_width(&raw, width.max(1))
     }
 
+    /// Return the display-column span of the cancel hint in the exact header
+    /// string that `render_lines` paints, after truncation.
+    #[must_use]
+    pub fn cancel_hint_span(&self, width: u16) -> Option<(u16, u16)> {
+        let header = self.header_text(usize::from(width));
+        let start = header.find("[c] cancel")?;
+        let start = unicode_width::UnicodeWidthStr::width(&header[..start]);
+        let end = start + unicode_width::UnicodeWidthStr::width("[c] cancel");
+        Some((start as u16, end as u16))
+    }
+
     #[must_use]
     pub fn render_lines(&self, width: u16) -> Vec<Line<'static>> {
         let content_width = usize::from(width).max(1);
@@ -1713,6 +1724,18 @@ mod tests {
             at_ms: 1_200,
         });
         panel
+    }
+
+    #[test]
+    fn cancel_hint_span_matches_rendered_header_and_truncation() {
+        let panel = started_panel();
+        let header = panel.header_text(120);
+        let (start, end) = panel.cancel_hint_span(120).expect("running cancel hint");
+        let marker = header.find("[c] cancel").expect("rendered cancel hint");
+        assert_eq!(UnicodeWidthStr::width(&header[..marker]), start as usize);
+        assert_eq!(end - start, UnicodeWidthStr::width("[c] cancel") as u16);
+
+        assert!(panel.cancel_hint_span(8).is_none());
     }
 
     /// #4208: every decorative glyph the run map emits — expand marks, role

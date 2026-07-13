@@ -294,9 +294,16 @@ fn render_hotbar_panel(f: &mut Frame, area: Rect, app: &mut App, config: &Config
         &title,
         hotbar_panel_lines(&slots, content_width, &app.ui_theme),
         hotbar_panel_hover_texts(&slots),
-        Vec::new(),
+        hotbar_panel_row_actions(),
         app,
     );
+}
+
+fn hotbar_panel_row_actions() -> Vec<Option<SidebarRowAction>> {
+    (1..=codewhale_config::HOTBAR_SLOT_COUNT)
+        .step_by(HOTBAR_ROW_COLUMNS)
+        .map(|slot| Some(SidebarRowAction::HotbarSlot(slot)))
+        .collect()
 }
 
 fn hotbar_panel_enabled(app: &App, config: &Config) -> bool {
@@ -3414,31 +3421,41 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn context_panel_cost_line(app: &App) -> String {
-    if let Some(label) = app.billing_presentation.label() {
-        return format!("usage: {label}");
-    }
     let displayed_total = app.displayed_session_cost_for_currency(app.cost_currency);
-    if displayed_total == 0.0
-        && !crate::pricing::has_pricing_for_provider(app.api_provider, &app.model)
-    {
-        return format!("cost: n/a (no pricing data for {})", app.model);
-    }
-
-    let session_cost = app.session_cost_for_currency(app.cost_currency);
-    let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
-    let real_total = session_cost + agent_cost;
-    // Only show the additive breakdown when it matches the displayed
-    // total; when the high-water mark is in effect (post-reconciliation),
-    // the breakdown would not sum to the displayed value (#244).
-    if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
-        format!(
-            "cost: {} (session {} + agents {})",
-            app.format_cost_amount(displayed_total),
-            app.format_cost_amount(session_cost),
-            app.format_cost_amount(agent_cost)
-        )
-    } else {
-        format!("cost: {}", app.format_cost_amount(displayed_total))
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        displayed_total,
+        app.cost_display_currency(app.cost_currency),
+        None,
+    );
+    match &chip {
+        crate::route_billing::UsageChip::Money(_)
+            if crate::route_billing::has_priced_metered_basis(
+                app.billing_presentation,
+                app.api_provider,
+                &app.model,
+            ) =>
+        {
+            let session_cost = app.session_cost_for_currency(app.cost_currency);
+            let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
+            let real_total = session_cost + agent_cost;
+            // Only show the additive breakdown when it matches the displayed
+            // total; when the high-water mark is in effect (post-reconciliation),
+            // the breakdown would not sum to the displayed value (#244).
+            if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
+                format!(
+                    "cost: {} (session {} + agents {})",
+                    app.format_cost_amount(displayed_total),
+                    app.format_cost_amount(session_cost),
+                    app.format_cost_amount(agent_cost)
+                )
+            } else {
+                crate::route_billing::format_usage_line(&chip)
+            }
+        }
+        _ => crate::route_billing::format_usage_line(&chip),
     }
 }
 
@@ -3599,6 +3616,7 @@ fn agent_stop_action_for_click(action: &SidebarRowAction) -> Option<SidebarRowAc
         }),
         SidebarRowAction::Command(_)
         | SidebarRowAction::PrefillCommand(_)
+        | SidebarRowAction::HotbarSlot(_)
         | SidebarRowAction::OpenAgentDetail { .. }
         | SidebarRowAction::CancelAgent { .. }
         | SidebarRowAction::InspectText { .. } => None,
@@ -3694,11 +3712,9 @@ mod tests {
     fn context_panel_cost_line_shows_na_for_unpriced_zero_cost_model() {
         let mut app = create_test_app();
         app.model = "unknown-provider/unknown-model".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
 
-        assert_eq!(
-            context_panel_cost_line(&app),
-            "cost: n/a (no pricing data for unknown-provider/unknown-model)"
-        );
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
     }
 
     #[test]
@@ -3706,17 +3722,35 @@ mod tests {
         let mut app = create_test_app();
         app.api_provider = crate::config::ApiProvider::OpenaiCodex;
         app.model = "gpt-5.5".to_string();
+        app.billing_presentation =
+            crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+        app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(12.34));
 
-        assert_eq!(
-            context_panel_cost_line(&app),
-            "cost: n/a (no pricing data for gpt-5.5)"
-        );
+        let line = context_panel_cost_line(&app);
+        assert_eq!(line, "usage: Codex OAuth quota");
+        assert!(!line.contains('$'), "OAuth must not invent dollars: {line}");
+    }
+
+    #[test]
+    fn context_panel_cost_line_marks_unpriced_metered_as_unknown() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::NvidiaNim;
+        app.model = "deepseek-ai/deepseek-v4-pro".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
+
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
     }
 
     #[test]
     fn context_panel_cost_line_uses_usd_for_usd_only_model_in_cny_mode() {
         let mut app = create_test_app();
         app.model = "kimi-k2.6".to_string();
+        // This test is about METERED currency rendering; pin the route class
+        // and a metered provider so the session default (which may be a
+        // subscription/OAuth route with no API pricing basis) cannot change
+        // what is under test (TUI-DOG-010).
+        app.api_provider = crate::config::ApiProvider::Moonshot;
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
         app.cost_currency = crate::pricing::CostCurrency::Cny;
         app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(0.42));
 
@@ -3858,6 +3892,17 @@ mod tests {
                 .iter()
                 .all(|slot| slot.state == HotbarSlotState::Empty),
             "fresh config resolves to no bound slots"
+        );
+    }
+
+    #[test]
+    fn hotbar_rows_register_one_typed_action_per_rendered_row() {
+        assert_eq!(
+            super::hotbar_panel_row_actions(),
+            vec![
+                Some(SidebarRowAction::HotbarSlot(1)),
+                Some(SidebarRowAction::HotbarSlot(5)),
+            ]
         );
     }
 

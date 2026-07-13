@@ -3603,6 +3603,11 @@ export default workflow({
 
         assert!(registry.contains("workflow"));
         assert!(registry.contains("agent"));
+        assert!(registry.contains("agents/list"));
+        assert!(registry.contains("agents/message"));
+        assert!(registry.contains("agents/followup"));
+        assert!(registry.contains("agents/interrupt"));
+        assert!(registry.contains("agents/wait"));
         assert!(
             registry
                 .to_api_tools()

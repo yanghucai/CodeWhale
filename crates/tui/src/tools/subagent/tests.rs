@@ -873,15 +873,104 @@ fn agent_description_explains_background_child_and_transcript_handle() {
     let tool = AgentTool::new(manager, stub_runtime());
     let description = tool.description();
 
-    assert!(description.contains("Start, inspect, peek at, or cancel focused child agent tasks"));
-    assert!(description.contains("runs or queues"));
-    assert!(description.contains("provider rate-limit"));
-    assert!(description.contains("background"));
-    assert!(description.contains("transcript_handle"));
+    assert!(description.contains("Start a focused child agent task"));
+    assert!(description.contains("deliberate"));
+    assert!(description.contains("agents/list"));
+    assert!(description.contains("agents/wait"));
+    assert!(description.contains("Fleet roster"));
     assert!(
         estimate_tool_description_tokens_conservative(description) <= 1024,
         "agent description exceeds the conservative 1024-token budget"
     );
+}
+
+#[test]
+fn deliberate_spawn_requires_delegation_fields() {
+    let missing = parse_spawn_request(&json!({
+        "prompt": "do a thing",
+        "deliberate": true,
+    }));
+    assert!(
+        missing.is_err(),
+        "deliberate spawn without fields must fail"
+    );
+    let err = missing.unwrap_err().to_string();
+    assert!(err.contains("expected_artifact"), "{err}");
+    assert!(err.contains("token_budget"), "{err}");
+
+    let ok = parse_spawn_request(&json!({
+        "prompt": "review the diff",
+        "deliberate": true,
+        "type": "review",
+        "workspace_policy": "shared",
+        "expected_artifact": "review findings",
+        "write_authority": "read_only",
+        "token_budget": 50000,
+    }))
+    .expect("deliberate spawn with all fields");
+    assert_eq!(ok.agent_type, SubAgentType::Review);
+    assert_eq!(ok.token_budget, Some(50_000));
+    assert_eq!(ok.write_authority, Some(SpawnWriteAuthority::ReadOnly));
+    assert_eq!(ok.expected_artifact.as_deref(), Some("review findings"));
+    assert!(
+        ok.worktree.is_none(),
+        "workspace_policy shared must not materialize a worktree"
+    );
+}
+
+#[test]
+fn declared_workspace_policy_worktree_materializes_a_worktree_request() {
+    // TUI-DOG-017: a declared policy must be enforced, not decorative. The
+    // `worktree` request field is the mechanism that actually creates one.
+    let request = parse_spawn_request(&json!({
+        "prompt": "isolate this edit",
+        "workspace_policy": "worktree",
+    }))
+    .expect("worktree policy parses");
+    assert!(
+        request.worktree.is_some(),
+        "workspace_policy=worktree must materialize a worktree request"
+    );
+
+    let conflict = parse_spawn_request(&json!({
+        "prompt": "contradiction",
+        "workspace_policy": "shared",
+        "worktree": true,
+    }));
+    assert!(
+        conflict.is_err(),
+        "shared policy plus explicit worktree must fail closed"
+    );
+}
+
+#[test]
+fn declared_write_authority_parses_and_worktree_write_requires_isolation() {
+    let read_only = parse_spawn_request(&json!({
+        "prompt": "look around",
+        "write_authority": "read_only",
+    }))
+    .expect("read_only parses without deliberate");
+    assert_eq!(
+        read_only.write_authority,
+        Some(SpawnWriteAuthority::ReadOnly)
+    );
+
+    let contradiction = parse_spawn_request(&json!({
+        "prompt": "write in a worktree",
+        "write_authority": "worktree_write",
+    }));
+    assert!(
+        contradiction.is_err(),
+        "worktree_write without worktree isolation must fail closed"
+    );
+
+    let ok = parse_spawn_request(&json!({
+        "prompt": "write in a worktree",
+        "write_authority": "worktree_write",
+        "worktree": true,
+    }))
+    .expect("worktree_write with isolation parses");
+    assert_eq!(ok.write_authority, Some(SpawnWriteAuthority::WorktreeWrite));
 }
 
 #[test]
@@ -2639,6 +2728,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         started_at: Instant::now(),
         max_steps: 3,
         token_budget: None,
+        wall_time: DEFAULT_CHILD_WALL_TIME,
         input_rx: task_input_rx,
         launch_gate: None,
     };
@@ -2819,6 +2909,7 @@ async fn subagent_retries_transient_provider_header_timeout_before_succeeding() 
         started_at: Instant::now(),
         max_steps: 3,
         token_budget: None,
+        wall_time: DEFAULT_CHILD_WALL_TIME,
         input_rx: task_input_rx,
         launch_gate: None,
     };
@@ -2891,6 +2982,7 @@ async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
         started_at: Instant::now(),
         max_steps: 3,
         token_budget: None,
+        wall_time: DEFAULT_CHILD_WALL_TIME,
         input_rx: task_input_rx,
         launch_gate: None,
     };
@@ -5520,6 +5612,7 @@ async fn run_subagent_task_emits_parent_completion_before_terminal_update() {
         started_at: Instant::now(),
         max_steps: 0,
         token_budget: None,
+        wall_time: DEFAULT_CHILD_WALL_TIME,
         input_rx: task_input_rx,
         launch_gate: None,
     };
@@ -5631,10 +5724,14 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
 #[test]
 fn subagent_completion_from_result_surfaces_step_limit_not_silent_success() {
     let snap = make_snapshot(SubAgentStatus::Failed(
-        "child reached its step limit (12 steps) without returning a final summary".to_string(),
+        "child step budget exhausted (limit: 12 steps; used: 12); raise it with max_steps, or use max_depth/token_budget for other child budgets".to_string(),
     ));
     let completion = subagent_completion_from_result(&snap);
-    assert!(completion.payload.contains("step limit"), "{completion:?}");
+    assert!(
+        completion.payload.contains("step budget exhausted"),
+        "{completion:?}"
+    );
+    assert!(completion.payload.contains("max_steps"), "{completion:?}");
     assert!(!completion.payload.contains("Completed (no output)"));
 }
 
@@ -6127,15 +6224,41 @@ fn normalize_requested_subagent_model_is_provider_aware() {
 
 #[test]
 fn format_step_counter_hides_unbounded_sentinel() {
-    // DEFAULT_MAX_STEPS is u32::MAX, meaning "unbounded" — rendering the
-    // sentinel as a denominator produced "step 16/4294967295".
-    assert_eq!(format_step_counter(16, u32::MAX), "step 16");
+    // Concrete role defaults keep progress truthful.
+    assert_eq!(format_step_counter(16, 60), "step 16/60");
 }
 
 #[test]
 fn format_step_counter_keeps_concrete_budgets() {
     assert_eq!(format_step_counter(3, 25), "step 3/25");
     assert_eq!(format_step_counter(0, 1), "step 0/1");
+}
+
+#[test]
+fn child_step_override_wins_and_clamps_to_hard_ceiling() {
+    assert_eq!(resolve_max_steps(SubAgentType::Explore, None, None), 60);
+    assert_eq!(
+        resolve_max_steps(SubAgentType::Implementer, Some(7), None),
+        7
+    );
+    assert_eq!(
+        resolve_max_steps(SubAgentType::General, Some(u32::MAX), None),
+        MAX_SUBAGENT_STEPS
+    );
+}
+
+#[test]
+fn child_wall_timeout_reason_is_typed_and_actionable() {
+    let reason = child_wall_time_exhausted_reason(Duration::from_millis(1));
+    assert!(reason.contains("wall-time budget exhausted"), "{reason}");
+    assert!(reason.contains("limit: 0s"), "{reason}");
+    assert!(
+        reason.contains("wall_time_secs")
+            && reason.contains("max_depth")
+            && reason.contains("max_steps")
+            && reason.contains("token_budget"),
+        "{reason}"
+    );
 }
 
 // ── #3095: sub-agent launch gate ─────────────────────────────────────────────
@@ -6211,6 +6334,7 @@ async fn launch_gate_queues_extra_direct_children() {
             started_at: Instant::now(),
             max_steps: 1,
             token_budget: None,
+            wall_time: DEFAULT_CHILD_WALL_TIME,
             input_rx,
             launch_gate: gate,
         };
@@ -6379,6 +6503,7 @@ async fn spawn_budget_capped_worker(
     completion_tokens: u64,
     token_budget: Option<u64>,
     max_steps: u32,
+    wall_time: Duration,
 ) -> (
     Arc<RwLock<SubAgentManager>>,
     String,
@@ -6428,11 +6553,38 @@ async fn spawn_budget_capped_worker(
         started_at: Instant::now(),
         max_steps,
         token_budget,
+        wall_time,
         input_rx: task_input_rx,
         launch_gate: None,
     };
     let task_handle = tokio::spawn(run_subagent_task(task));
     (manager, agent_id, calls, task_handle)
+}
+
+#[tokio::test]
+async fn worker_stops_with_typed_wall_time_reason() {
+    let tmp = tempdir().expect("tempdir");
+    let (manager, agent_id, _calls, task_handle) =
+        spawn_budget_capped_worker(tmp.path(), 60, 40, None, 120, Duration::from_millis(1)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), task_handle)
+        .await
+        .expect("wall-time-capped worker must terminate")
+        .expect("task should finish");
+
+    let result = manager
+        .read()
+        .await
+        .get_result(&agent_id)
+        .expect("agent registered");
+    match result.status {
+        SubAgentStatus::Failed(reason) => {
+            assert!(reason.contains("wall-time budget exhausted"), "{reason}");
+            assert!(reason.contains("limit:"), "{reason}");
+            assert!(reason.contains("wall_time_secs"), "{reason}");
+        }
+        other => panic!("expected typed wall-time failure, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -6442,7 +6594,7 @@ async fn worker_stops_when_per_worker_token_budget_exceeded() {
     // stop with `BudgetExhausted` after its very first model turn instead of
     // running on to `max_steps`.
     let (manager, agent_id, calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4).await;
+        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4, DEFAULT_CHILD_WALL_TIME).await;
 
     tokio::time::timeout(Duration::from_secs(5), task_handle)
         .await
@@ -6472,7 +6624,7 @@ async fn worker_without_per_worker_token_budget_runs_to_completion() {
     // No per-worker cap: a final-text response completes the worker normally
     // even though each turn reports 100 tokens.
     let (manager, agent_id, calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, None, 4).await;
+        spawn_budget_capped_worker(tmp.path(), 60, 40, None, 4, DEFAULT_CHILD_WALL_TIME).await;
 
     tokio::time::timeout(Duration::from_secs(5), task_handle)
         .await
@@ -6500,7 +6652,7 @@ async fn per_worker_token_budget_does_not_double_count_scope_accounting() {
     // `total_tokens`) must reflect the tokens actually consumed exactly once
     // — never inflated by the runtime accumulator that triggered the stop.
     let (manager, agent_id, calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4).await;
+        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4, DEFAULT_CHILD_WALL_TIME).await;
 
     tokio::time::timeout(Duration::from_secs(5), task_handle)
         .await
@@ -6556,7 +6708,7 @@ async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
 
     let tmp = tempdir().expect("tempdir");
     let (manager, agent_id, _calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4).await;
+        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4, DEFAULT_CHILD_WALL_TIME).await;
 
     // Simulate the concurrent test finishing: the window closes shortly
     // after the worker's first request has already observed it.

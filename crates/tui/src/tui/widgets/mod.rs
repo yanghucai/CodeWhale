@@ -41,6 +41,7 @@ use crate::tui::approval::{
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::scrolling::TranscriptLineMeta;
 use crate::tui::ui_text::{char_display_width, text_display_width};
+use crate::tui::underwater::ShellPhase;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -55,6 +56,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SEND_FLASH_DURATION: Duration = Duration::from_millis(500);
+#[cfg(test)]
 const COMPOSER_PANEL_HEIGHT: u16 = 2;
 const JUMP_TO_LATEST_BUTTON_WIDTH: u16 = 3;
 const JUMP_TO_LATEST_BUTTON_HEIGHT: u16 = 3;
@@ -68,9 +70,12 @@ pub struct ChatWidget {
     ocean_ramp: Option<crate::tui::ocean::OceanRamp>,
     /// Ink for idle fish/bubbles. Present for every underwater treatment —
     /// flat and Terminal-owned keep ambient life without the ombre field.
-    ambient_ink: Option<Color>,
+    ambient_inks: Option<(Color, Color)>,
     ocean_elapsed_ms: u128,
+    completion_elapsed_ms: Option<u128>,
+    ocean_phase: ShellPhase,
     ocean_animated: bool,
+    fish_flee_elapsed_ms: Option<u128>,
     ambient_life: bool,
     scroll_track: Color,
     scroll_thumb: Color,
@@ -94,19 +99,33 @@ impl ChatWidget {
             .is_ombre()
             .then(|| crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme))
             .flatten();
-        let ambient_ink = app
+        let ambient_inks = app
             .ocean_treatment
             .supports_ambient_life()
-            .then(|| crate::tui::ocean::ambient_ink(&app.ui_theme));
+            .then(|| crate::tui::ocean::ambient_inks(&app.ui_theme));
         let ocean_elapsed_ms = app.ocean_started_at.elapsed().as_millis();
+        let completion_elapsed_ms = (!app.low_motion && app.fancy_animations)
+            .then_some(())
+            .and(app.ocean_completion_started_at)
+            .map(|started| started.elapsed().as_millis())
+            .filter(|elapsed| *elapsed < 800);
         let render_empty_state = should_render_empty_state(app);
+        let phase = ShellPhase::from_app(app);
         // Ambient phase animation is an empty-water affordance. Once real
         // transcript work exists, keep the field stable so model text and
         // receipts do not compete with a full-viewport repaint.
         let ocean_animated = render_empty_state
             && !app.low_motion
             && app.fancy_animations
-            && !app.attention_hold_active();
+            && !app.attention_hold_active()
+            && matches!(phase, ShellPhase::Idle | ShellPhase::Typing);
+        let fish_flee_elapsed_ms = render_empty_state
+            .then_some(())
+            .filter(|_| !app.low_motion && app.fancy_animations && !app.attention_hold_active())
+            .and(app.turn_started_at)
+            .map(|started| started.elapsed().as_millis())
+            .filter(|elapsed| *elapsed < 800)
+            .filter(|_| matches!(phase, ShellPhase::Working | ShellPhase::Verifying));
         let scroll_track = app.ui_theme.border;
         let scroll_thumb = app.ui_theme.status_working;
         let jump_border = app.ui_theme.border;
@@ -129,10 +148,21 @@ impl ChatWidget {
                 jump_to_latest_button: None,
                 background,
                 ocean_ramp,
-                ambient_ink,
+                ambient_inks,
                 ocean_elapsed_ms,
+                completion_elapsed_ms,
+                ocean_phase: phase,
                 ocean_animated,
-                ambient_life: app.input.trim().is_empty() && !app.attention_hold_active(),
+                fish_flee_elapsed_ms,
+                ambient_life: app.input.trim().is_empty()
+                    && !app.attention_hold_active()
+                    && matches!(
+                        phase,
+                        ShellPhase::Idle
+                            | ShellPhase::Typing
+                            | ShellPhase::Working
+                            | ShellPhase::Verifying
+                    ),
                 scroll_track,
                 scroll_thumb,
                 jump_border,
@@ -375,6 +405,24 @@ impl ChatWidget {
             app.viewport.transcript_cache.lines()[top..end].to_vec()
         };
 
+        if !app.low_motion
+            && app.fancy_animations
+            && let (Some(start), Some(started)) = (
+                app.ocean_receipt_settle_start,
+                app.ocean_completion_started_at,
+            )
+        {
+            apply_receipt_settle_cascade(
+                &mut lines,
+                top,
+                line_meta,
+                &app.collapsed_cell_map,
+                &app.history,
+                start,
+                started.elapsed().as_millis(),
+            );
+        }
+
         // Brief flash highlight on the most recently sent user message.
         if !app.low_motion
             && let Some(send_at) = app.last_send_at
@@ -440,9 +488,12 @@ impl ChatWidget {
             jump_to_latest_button,
             background,
             ocean_ramp,
-            ambient_ink,
+            ambient_inks,
             ocean_elapsed_ms,
+            completion_elapsed_ms,
+            ocean_phase: phase,
             ocean_animated,
+            fish_flee_elapsed_ms,
             ambient_life: false,
             scroll_track,
             scroll_thumb,
@@ -450,6 +501,47 @@ impl ChatWidget {
             jump_arrow,
         }
     }
+}
+
+fn apply_receipt_settle_cascade(
+    lines: &mut [Line<'static>],
+    top: usize,
+    line_meta: &[TranscriptLineMeta],
+    filtered_to_original: &[usize],
+    history: &[HistoryCell],
+    start: usize,
+    elapsed_ms: u128,
+) {
+    for (visible_index, line) in lines.iter_mut().enumerate() {
+        let Some((filtered_cell, _)) = line_meta
+            .get(top + visible_index)
+            .and_then(TranscriptLineMeta::cell_line)
+        else {
+            continue;
+        };
+        let original_cell = filtered_to_original
+            .get(filtered_cell)
+            .copied()
+            .unwrap_or(filtered_cell);
+        if original_cell < start
+            || !matches!(
+                history.get(original_cell),
+                Some(HistoryCell::Tool(_) | HistoryCell::SubAgent(_))
+            )
+            || !receipt_is_settling(original_cell - start, elapsed_ms)
+        {
+            continue;
+        }
+        for span in &mut line.spans {
+            span.style = span.style.add_modifier(Modifier::DIM);
+        }
+    }
+}
+
+#[must_use]
+fn receipt_is_settling(receipt_order: usize, elapsed_ms: u128) -> bool {
+    let delay = u128::try_from(receipt_order.min(6)).unwrap_or(6) * 70;
+    elapsed_ms < delay + 140
 }
 
 fn tool_run_summary_cell(run: &ToolRun) -> HistoryCell {
@@ -605,8 +697,15 @@ impl ChatWidget {
                     .lines
                     .get(usize::from(local_y))
                     .and_then(occupied_text_bounds);
-                let row_bg = if self.ocean_animated {
-                    ramp.color_at_phase(local_y, area.height, self.ocean_elapsed_ms)
+                let row_bg = if let Some(elapsed) = self.completion_elapsed_ms {
+                    ramp.color_at_completion(local_y, area.height, elapsed)
+                } else if self.ocean_animated {
+                    ramp.color_at_phase(
+                        local_y,
+                        area.height,
+                        self.ocean_elapsed_ms,
+                        self.ocean_phase,
+                    )
                 } else {
                     ramp.color_at(local_y, area.height)
                 };
@@ -622,15 +721,16 @@ impl ChatWidget {
         }
 
         if self.ambient_life
-            && let Some(ink) = self.ambient_ink
+            && let Some(inks) = self.ambient_inks
         {
             render_ambient_life(
                 area,
                 buf,
-                ink,
+                inks,
                 &self.lines,
                 self.ocean_elapsed_ms,
                 self.ocean_animated,
+                self.fish_flee_elapsed_ms,
             );
         }
     }
@@ -664,10 +764,11 @@ fn occupied_text_bounds(line: &Line<'_>) -> Option<(usize, usize)> {
 fn render_ambient_life(
     area: Rect,
     buf: &mut Buffer,
-    ink: Color,
+    inks: (Color, Color),
     lines: &[Line<'static>],
     elapsed_ms: u128,
     animated: bool,
+    fish_flee_elapsed_ms: Option<u128>,
 ) {
     if area.width < crate::tui::ocean::AMBIENT_MIN_WIDTH
         || area.height < crate::tui::ocean::AMBIENT_MIN_HEIGHT
@@ -703,19 +804,23 @@ fn render_ambient_life(
     } else {
         "°"
     };
+    let flee = fish_flee_elapsed_ms.map_or(0, fish_flee_offset);
     let marks = [
         (
-            area.width / 12 + drift_a,
+            (area.width / 12 + drift_a).saturating_sub(flee),
             area.height * 3 / 4,
             if fish_a_forward { "><>" } else { "<><" },
         ),
         (
-            (area.width * 5 / 6).saturating_sub(drift_b),
+            (area.width * 5 / 6)
+                .saturating_sub(drift_b)
+                .saturating_add(flee)
+                .min(area.width.saturating_sub(3)),
             area.height * 3 / 8,
             if fish_b_forward { "><>" } else { "<><" },
         ),
         (
-            area.width / 3 + drift_c,
+            (area.width / 3 + drift_c).saturating_sub(flee / 2),
             area.height / 6,
             if fish_c_forward { "><>" } else { "<><" },
         ),
@@ -725,7 +830,7 @@ fn render_ambient_life(
             bubble,
         ),
     ];
-    for (local_x, local_y, mark) in marks {
+    for (index, (local_x, local_y, mark)) in marks.into_iter().enumerate() {
         let protected = lines
             .get(usize::from(local_y))
             .and_then(occupied_text_bounds);
@@ -742,9 +847,18 @@ fn render_ambient_life(
         for (offset, ch) in mark.chars().enumerate() {
             buf[(area.x + local_x + offset as u16, area.y + local_y)]
                 .set_symbol(&ch.to_string())
-                .set_fg(ink);
+                .set_fg(if index == 1 { inks.1 } else { inks.0 });
         }
     }
+}
+
+/// One-shot flee arc: fish leave their ambient positions, peak halfway, then
+/// return to the same stable positions. The deterministic 800 ms envelope is
+/// keyed to the typed Working transition and never loops.
+fn fish_flee_offset(elapsed_ms: u128) -> u16 {
+    let progress = elapsed_ms.min(800) as f32 / 800.0;
+    let excursion = (progress * std::f32::consts::PI).sin() * 9.0;
+    excursion.round().clamp(0.0, 9.0) as u16
 }
 
 /// Discrete cells cannot use CSS easing, so continuity matters more than raw
@@ -1752,6 +1866,7 @@ impl Renderable for ApprovalWidget<'_> {
         // Collapsed mode: a single-line banner at the bottom of the area
         // so the user can still see the transcript behind it.
         if self.view.collapsed {
+            self.view.set_mouse_hitboxes(Vec::new());
             let bar_y = area.y.saturating_add(area.height.saturating_sub(1));
             let bar_area = Rect::new(area.x, bar_y, area.width, 1);
             Clear.render(bar_area, buf);
@@ -1845,6 +1960,25 @@ impl Renderable for ApprovalWidget<'_> {
             width: region.width,
             height: control_rows,
         };
+
+        let mut hitboxes = Vec::new();
+        let option_count = controls.len().saturating_sub(4);
+        for index in 0..option_count {
+            let first_line = 2 + index;
+            let y_offset = measure_wrapped_rows(&controls[..first_line], region.width);
+            let next_offset = measure_wrapped_rows(&controls[..first_line + 1], region.width);
+            let y = control_rect.y.saturating_add(y_offset);
+            let height = next_offset.saturating_sub(y_offset).min(
+                control_rect
+                    .y
+                    .saturating_add(control_rect.height)
+                    .saturating_sub(y),
+            );
+            if height > 0 {
+                hitboxes.push(Rect::new(control_rect.x, y, control_rect.width, height));
+            }
+        }
+        self.view.set_mouse_hitboxes(hitboxes);
 
         let body_rows = measure_wrapped_rows(&body, region.width);
         if body_rows > body_height && body_height > 0 {
@@ -2402,14 +2536,31 @@ pub struct ElevationWidget<'a> {
     request: &'a ElevationRequest,
     selected: usize,
     locale: Locale,
+    hitboxes: Option<&'a std::cell::RefCell<Vec<Rect>>>,
 }
 
 impl<'a> ElevationWidget<'a> {
+    #[allow(dead_code)]
     pub fn new(request: &'a ElevationRequest, selected: usize, locale: Locale) -> Self {
         Self {
             request,
             selected,
             locale,
+            hitboxes: None,
+        }
+    }
+
+    pub fn new_with_hitboxes(
+        request: &'a ElevationRequest,
+        selected: usize,
+        locale: Locale,
+        hitboxes: &'a std::cell::RefCell<Vec<Rect>>,
+    ) -> Self {
+        Self {
+            request,
+            selected,
+            locale,
+            hitboxes: Some(hitboxes),
         }
     }
 }
@@ -2505,6 +2656,7 @@ impl Renderable for ElevationWidget<'_> {
         )));
         lines.push(Line::from(""));
 
+        let option_start = lines.len();
         for (i, option) in self.request.options.iter().enumerate() {
             let is_selected = i == self.selected;
             let style = if is_selected {
@@ -2568,6 +2720,22 @@ impl Renderable for ElevationWidget<'_> {
             .border_style(Style::default().fg(palette::BORDER_COLOR))
             .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
+
+        if let Some(hitboxes) = self.hitboxes {
+            hitboxes.borrow_mut().clear();
+            let content = block.inner(popup_area);
+            for i in 0..self.request.options.len() {
+                let y = content
+                    .y
+                    .saturating_add(u16::try_from(option_start + i * 2).unwrap_or(u16::MAX));
+                let height = 2u16.min(content.y.saturating_add(content.height).saturating_sub(y));
+                if height > 0 {
+                    hitboxes
+                        .borrow_mut()
+                        .push(Rect::new(content.x, y, content.width, height));
+                }
+            }
+        }
 
         let paragraph = Paragraph::new(lines)
             .block(block)
@@ -2886,7 +3054,7 @@ pub fn composer_input_rows_budget(inner_height: u16, extra_lines: usize) -> usiz
 }
 
 fn composer_top_padding(content_lines: usize, rows_budget: usize) -> usize {
-    rows_budget.saturating_sub(content_lines.clamp(1, rows_budget))
+    crate::tui::composer_chrome::top_padding(content_lines, rows_budget)
 }
 
 /// Placeholder text shown when the composer input is empty.
@@ -2920,20 +3088,13 @@ pub(crate) fn empty_composer_visual_rows(
     1
 }
 
+#[cfg(test)]
 fn composer_min_input_rows(density: ComposerDensity) -> usize {
-    match density {
-        ComposerDensity::Compact => 2,
-        ComposerDensity::Comfortable => 3,
-        ComposerDensity::Spacious => 4,
-    }
+    crate::tui::composer_chrome::ComposerChrome::for_density(density, false).min_content_rows
 }
 
 fn composer_max_height(density: ComposerDensity) -> u16 {
-    match density {
-        ComposerDensity::Compact => 7,
-        ComposerDensity::Comfortable => 9,
-        ComposerDensity::Spacious => 12,
-    }
+    crate::tui::composer_chrome::ComposerChrome::for_density(density, false).max_total_rows
 }
 
 fn composer_height(
@@ -2945,26 +3106,18 @@ fn composer_height(
     show_panel: bool,
 ) -> u16 {
     let has_panel = show_panel && available_height >= 3 && width >= 12;
-    let chrome_height = if has_panel {
-        usize::from(COMPOSER_PANEL_HEIGHT)
-    } else if available_height >= 2 {
-        1
-    } else {
-        0
-    };
     let content_width = usize::from(width.max(1));
     let mut line_count = wrap_input_lines(input, content_width).len();
     if line_count == 0 {
         line_count = 1;
     }
-    if has_panel {
-        line_count = line_count.max(composer_min_input_rows(density));
-    }
-    line_count = line_count
-        .saturating_add(extra_lines)
-        .saturating_add(chrome_height);
-    let max_height = usize::from(available_height.clamp(1, composer_max_height(density)));
-    line_count.clamp(1, max_height).try_into().unwrap_or(1)
+    crate::tui::composer_chrome::desired_height(
+        line_count,
+        extra_lines,
+        available_height,
+        density,
+        has_panel,
+    )
 }
 
 /// A single entry in the slash-command autocomplete popup.
@@ -3769,9 +3922,10 @@ mod tests {
         ambient_ping_pong, apply_detail_target_highlight, apply_selection_to_line,
         apply_send_flash, build_empty_state_lines, composer_height, composer_max_height,
         composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
-        history_entry_revision, layout_input, pad_lines_to_bottom, placeholder_visual_lines,
-        push_command_entry, revision_in_domain, should_render_empty_state, slash_completion_hints,
-        tool_run_summary_revision, wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
+        fish_flee_offset, history_entry_revision, layout_input, pad_lines_to_bottom,
+        placeholder_visual_lines, push_command_entry, receipt_is_settling, revision_in_domain,
+        should_render_empty_state, slash_completion_hints, tool_run_summary_revision,
+        wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
@@ -4891,8 +5045,11 @@ mod tests {
         let with_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, true);
         let without_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, false);
 
+        // Quiet composer keeps a single top rule but still reserves the
+        // density baseline (3 content rows) so it never collapses to a
+        // one-line afterthought when height allows.
         assert_eq!(with_border, 5);
-        assert_eq!(without_border, 2);
+        assert_eq!(without_border, 4);
         assert!(without_border < with_border);
     }
 
@@ -5230,7 +5387,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_hold_freezes_the_whole_ocean_field() {
+    fn waiting_state_freezes_the_whole_ocean_field() {
         let mut app = create_test_app();
         app.low_motion = false;
         app.fancy_animations = true;
@@ -6554,5 +6711,22 @@ diff --git a/src/b.rs b/src/b.rs\n\
             has_placeholder_like_text,
             "some non-empty text should render as placeholder"
         );
+    }
+
+    #[test]
+    fn receipt_settle_cascade_is_bounded_and_ordered() {
+        assert!(receipt_is_settling(0, 0));
+        assert!(!receipt_is_settling(0, 140));
+        assert!(receipt_is_settling(1, 140));
+        assert!(!receipt_is_settling(6, 560));
+        assert!(!receipt_is_settling(60, 560));
+    }
+
+    #[test]
+    fn fish_flee_is_one_shot_and_returns_to_ambient_origin() {
+        assert_eq!(fish_flee_offset(0), 0);
+        assert!(fish_flee_offset(400) >= 8);
+        assert_eq!(fish_flee_offset(800), 0);
+        assert_eq!(fish_flee_offset(8_000), 0);
     }
 }

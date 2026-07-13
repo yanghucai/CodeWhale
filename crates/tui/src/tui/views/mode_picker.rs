@@ -1,6 +1,8 @@
 //! `/mode` picker for Act / Plan / Operate.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -21,6 +23,7 @@ use crate::tui::views::{
 pub struct ModePickerView {
     cursor: usize,
     locale: Locale,
+    row_hitboxes: RefCell<Vec<Rect>>,
 }
 
 impl ModePickerView {
@@ -30,7 +33,11 @@ impl ModePickerView {
             .iter()
             .position(|mode| *mode == current)
             .unwrap_or(0);
-        Self { cursor, locale }
+        Self {
+            cursor,
+            locale,
+            row_hitboxes: RefCell::new(Vec::new()),
+        }
     }
 
     fn selected_mode(&self) -> AppMode {
@@ -92,6 +99,30 @@ impl ModalView for ModePickerView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_up();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_down();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    self.cursor = index;
+                    return self.handle_key(KeyEvent::new(KeyCode::Enter, mouse.modifiers));
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let popup_height = u16::try_from(AppMode::CHOICES.len()).unwrap_or(3) + 7;
         let popup_area = centered_modal_area(area, 68, popup_height, 44, 8);
@@ -123,6 +154,8 @@ impl ModalView for ModePickerView {
             ],
         );
 
+        self.row_hitboxes.borrow_mut().clear();
+
         let mut lines = Vec::with_capacity(AppMode::CHOICES.len());
 
         for (idx, mode) in AppMode::CHOICES.iter().copied().enumerate() {
@@ -145,7 +178,7 @@ impl ModalView for ModePickerView {
             let pointer = if is_cursor { ">" } else { " " };
             let name = mode.display_name_localized(self.locale);
             let hint = if mode == AppMode::Operate {
-                "Coordinate a Fleet (preview); Workflow isn't ready.".into()
+                "Preview only — every message hits an Operate readiness wall until Fleet/Workflow dispatch exists.".into()
             } else {
                 mode.picker_hint_localized(self.locale)
             };
@@ -160,6 +193,14 @@ impl ModalView for ModePickerView {
                 ),
                 Span::styled(hint, hint_style),
             ]));
+            self.row_hitboxes.borrow_mut().push(Rect::new(
+                content.x,
+                content
+                    .y
+                    .saturating_add(u16::try_from(idx).unwrap_or(u16::MAX)),
+                content.width,
+                1,
+            ));
         }
 
         Paragraph::new(lines).render(content, buf);
@@ -170,6 +211,7 @@ impl ModalView for ModePickerView {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn opens_on_current_mode() {
@@ -261,8 +303,11 @@ mod tests {
     fn operate_copy_explains_the_user_benefit_at_eighty_columns() {
         let (buf, area) = render_at(80, 24);
         let text = rows(&buf, area).join("\n");
-        assert!(text.contains("Coordinate a Fleet (preview)"), "{text}");
-        assert!(text.contains("isn't ready"), "{text}");
+        assert!(text.contains("Operate"), "{text}");
+        assert!(
+            text.contains("readiness wall") || text.contains("Preview only"),
+            "Operate must stay annotated as blocked until Workflow exists: {text}"
+        );
         assert!(!text.contains("spawn, wait, verify"), "{text}");
         assert!(!text.contains("subagents/workflows"), "{text}");
     }
@@ -288,5 +333,27 @@ mod tests {
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
         assert!(matches!(action, ViewAction::None));
+    }
+
+    #[test]
+    fn mouse_click_renders_and_selects_mode_row() {
+        let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+            .expect("render mode picker");
+        let rect = view.row_hitboxes.borrow()[1];
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ModeSelected {
+                mode: AppMode::Plan
+            })
+        ));
     }
 }
