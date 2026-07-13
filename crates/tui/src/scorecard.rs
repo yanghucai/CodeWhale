@@ -15,7 +15,10 @@ use chrono::{DateTime, Utc};
 use codewhale_config::pricing::{Currency, OfferingPricing, TokenUsage};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ApiProvider, DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC};
+use crate::config::{
+    ApiProvider, DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC,
+    canonical_model_id_for_provider, canonical_model_name,
+};
 use crate::models::Usage;
 use crate::pricing::{
     calculate_turn_cost_estimate_for_provider, calculate_turn_cost_estimate_for_provider_at,
@@ -160,6 +163,18 @@ fn provider_scoped_cost(
     );
     let normalized_model = model.trim();
     let model_lower = normalized_model.to_ascii_lowercase();
+    let canonical_model = if direct_deepseek {
+        canonical_model_name(normalized_model)
+            .unwrap_or(normalized_model)
+            .to_string()
+    } else if provider == ApiProvider::Arcee {
+        // Keep the direct Arcee route separate from OpenRouter's
+        // `arcee-ai/...` namespace while accepting Arcee's own aliases.
+        canonical_model_id_for_provider(provider, normalized_model)
+            .unwrap_or_else(|| normalized_model.to_string())
+    } else {
+        normalized_model.to_string()
+    };
     let catalog_model = if direct_deepseek
         && matches!(model_lower.as_str(), "deepseek-chat" | "deepseek-reasoner")
     {
@@ -172,20 +187,21 @@ fn provider_scoped_cost(
         if created_at >= &retirement.with_timezone(&Utc) {
             return AvailableCost::default();
         }
-        DEEPSEEK_ALIAS_REPLACEMENT
+        DEEPSEEK_ALIAS_REPLACEMENT.to_string()
     } else {
-        normalized_model
+        canonical_model
     };
-    let Some(offering) = catalog_offering_for_model(provider, catalog_model) else {
+    let Some(offering) = catalog_offering_for_model(provider, &catalog_model) else {
         return AvailableCost::default();
     };
+    let catalog_model_lower = catalog_model.to_ascii_lowercase();
 
     // Direct DeepSeek routes retain the repository's hand-sourced, time-aware
     // USD+CNY table. Requiring an exact provider offering first prevents a
     // foreign wire id from matching merely because its text contains
     // "deepseek".
     if direct_deepseek {
-        return calculate_turn_cost_estimate_for_provider(provider, catalog_model, usage)
+        return calculate_turn_cost_estimate_for_provider(provider, &catalog_model, usage)
             .map_or_else(AvailableCost::default, |cost| AvailableCost {
                 usd: Some(cost.usd),
                 cny: Some(cost.cny),
@@ -201,7 +217,7 @@ fn provider_scoped_cost(
         };
         return calculate_turn_cost_estimate_for_provider_at(
             provider,
-            normalized_model,
+            &catalog_model,
             usage,
             created_at.to_owned(),
         )
@@ -212,16 +228,29 @@ fn provider_scoped_cost(
     }
 
     let Some(mut pricing) = OfferingPricing::from_catalog_offering(&offering) else {
-        return AvailableCost::default();
+        // The provider/model pair is already proven by the exact catalog gate
+        // above. Only fall back for the direct routes whose sourced legacy rows
+        // are authoritative; aggregator rows can bill the same family at a
+        // different rate and must remain unpriced when their own cost is absent.
+        let has_authoritative_legacy_row = matches!(
+            (provider, catalog_model_lower.as_str()),
+            (ApiProvider::Arcee, "trinity-mini") | (ApiProvider::Minimax, "minimax-m2.7")
+        );
+        if !has_authoritative_legacy_row {
+            return AvailableCost::default();
+        }
+        return calculate_turn_cost_estimate_for_provider(provider, &catalog_model, usage)
+            .map_or_else(AvailableCost::default, |cost| AvailableCost {
+                usd: Some(cost.usd),
+                cny: None,
+            });
     };
     // These exact first-party routes document that cache hits receive no
     // discount, so the offering's input rate is authoritative. Do not infer
     // this for arbitrary catalog rows: an omitted cache rate may be unknown.
     let cache_uses_input_rate = matches!(
-        (provider, model_lower.as_str()),
-        (ApiProvider::Openai, "gpt-5.5-pro")
-            | (ApiProvider::Arcee, "trinity-large-thinking")
-            | (ApiProvider::Arcee, "arcee-ai/trinity-large-thinking")
+        (provider, catalog_model_lower.as_str()),
+        (ApiProvider::Openai, "gpt-5.5-pro") | (ApiProvider::Arcee, "trinity-large-thinking")
     );
     if token_usage.cache_read > 0
         && pricing.cache_read_per_million.is_none()
@@ -727,6 +756,42 @@ mod tests {
     }
 
     #[test]
+    fn direct_deepseek_compact_aliases_use_canonical_pricing() {
+        let u = usage(1000, 500, 100);
+        let models = [
+            "deepseek-v4-pro",
+            "pro",
+            " DeepSeek-V4Pro ",
+            "deepseek-v4-flash",
+            "flash",
+            "DEEPSEEK-V4FLASH",
+        ];
+        let turns: Vec<_> = models
+            .iter()
+            .map(|model| TurnInput {
+                turn_id: (*model).into(),
+                created_at: None,
+                provider: Some("deepseek"),
+                model: (*model).into(),
+                usage: &u,
+            })
+            .collect();
+
+        let card = Scorecard::from_turns(&turns);
+
+        for alias in [1, 2] {
+            assert_eq!(card.per_turn[alias].cost_usd, card.per_turn[0].cost_usd);
+            assert_eq!(card.per_turn[alias].cost_cny, card.per_turn[0].cost_cny);
+        }
+        for alias in [4, 5] {
+            assert_eq!(card.per_turn[alias].cost_usd, card.per_turn[3].cost_usd);
+            assert_eq!(card.per_turn[alias].cost_cny, card.per_turn[3].cost_cny);
+        }
+        assert!(card.per_turn.iter().all(|turn| !turn.cost_unpriced));
+        assert!(card.per_turn.iter().all(|turn| !turn.cost_cny_unpriced));
+    }
+
+    #[test]
     fn direct_deepseek_compatibility_aliases_use_the_flash_route() {
         let u = usage(1000, 500, 100);
         let before_retirement: DateTime<Utc> =
@@ -786,6 +851,104 @@ mod tests {
         );
         assert!(card.per_turn[3].cost_unpriced);
         assert!(card.per_turn[4].cost_unpriced);
+    }
+
+    #[test]
+    fn direct_arcee_aliases_do_not_cross_the_openrouter_namespace() {
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            prompt_cache_hit_tokens: Some(250_000),
+            prompt_cache_write_tokens: Some(100_000),
+            ..Default::default()
+        };
+        let turns = [
+            TurnInput {
+                turn_id: "canonical-direct".into(),
+                created_at: None,
+                provider: Some("arcee"),
+                model: "trinity-large-thinking".into(),
+                usage: &u,
+            },
+            TurnInput {
+                turn_id: "direct-alias".into(),
+                created_at: None,
+                provider: Some("arcee"),
+                model: "arcee-trinity-large-thinking".into(),
+                usage: &u,
+            },
+            TurnInput {
+                turn_id: "openrouter-namespace".into(),
+                created_at: None,
+                provider: Some("arcee"),
+                model: "arcee-ai/trinity-large-thinking".into(),
+                usage: &u,
+            },
+        ];
+
+        let card = Scorecard::from_turns(&turns);
+
+        assert!(!card.per_turn[0].cost_unpriced);
+        assert!((card.per_turn[0].cost_usd - 0.65).abs() < f64::EPSILON);
+        assert_eq!(card.per_turn[1].cost_usd, card.per_turn[0].cost_usd);
+        assert!(!card.per_turn[1].cost_unpriced);
+        assert!(card.per_turn[2].cost_unpriced);
+    }
+
+    #[test]
+    fn costless_catalog_rows_fall_back_only_after_the_exact_route_gate() {
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            prompt_cache_hit_tokens: Some(250_000),
+            prompt_cache_write_tokens: Some(100_000),
+            ..Default::default()
+        };
+        let turns = [
+            TurnInput {
+                turn_id: "arcee-mini".into(),
+                created_at: None,
+                provider: Some("arcee"),
+                model: "trinity-mini".into(),
+                usage: &u,
+            },
+            TurnInput {
+                turn_id: "minimax-m2.7".into(),
+                created_at: None,
+                provider: Some("minimax"),
+                model: "minimax-m2.7".into(),
+                usage: &u,
+            },
+            TurnInput {
+                turn_id: "foreign-route".into(),
+                created_at: None,
+                provider: Some("ollama"),
+                model: "trinity-mini".into(),
+                usage: &u,
+            },
+            TurnInput {
+                turn_id: "openai-hosted-deepseek".into(),
+                created_at: None,
+                provider: Some("openai"),
+                model: "deepseek-v4-pro".into(),
+                usage: &u,
+            },
+            TurnInput {
+                turn_id: "openrouter-hosted-zai".into(),
+                created_at: None,
+                provider: Some("openrouter"),
+                model: "z-ai/glm-5.2".into(),
+                usage: &u,
+            },
+        ];
+
+        let card = Scorecard::from_turns(&turns);
+
+        assert!((card.per_turn[0].cost_usd - 0.12).abs() < f64::EPSILON);
+        assert!((card.per_turn[1].cost_usd - 0.90).abs() < f64::EPSILON);
+        assert!(card.per_turn[..2].iter().all(|turn| !turn.cost_unpriced));
+        assert!(card.per_turn[..2].iter().all(|turn| turn.cost_cny_unpriced));
+        assert!(card.per_turn[2..].iter().all(|turn| turn.cost_unpriced));
     }
 
     #[test]
