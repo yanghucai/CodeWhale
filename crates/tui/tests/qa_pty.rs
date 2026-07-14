@@ -579,15 +579,33 @@ fn approval_modal_real_rows_survive_wheel_resize_and_deny_without_side_effect() 
         .frame()
         .find_text("Deny this call")
         .expect("rendered denial option");
-    h.send(keys::mouse::wheel_up(deny_row, deny_col))?;
+    h.send(keys::mouse::wheel_down(deny_row, deny_col))?;
+    h.wait_for_text("❯ [2 / a]", KEY_TIMEOUT)?;
     h.resize(24, 80)?;
+    h.wait_for(
+        |frame| frame.rows() == 24 && frame.cols() == 80,
+        KEY_TIMEOUT,
+    )?;
+    h.wait_for_idle(Duration::from_millis(200), Duration::from_secs(3))?;
     h.wait_for_text("Deny this call", KEY_TIMEOUT)?;
     let (deny_row, deny_col) = h
         .frame()
         .find_text("Deny this call")
         .expect("denial option survived resize");
+    h.send(keys::mouse::wheel_down(deny_row, deny_col))?;
+    h.wait_for_text("❯ [3 / d / n]", KEY_TIMEOUT)?;
     h.send(keys::mouse::click(deny_row, deny_col))?;
-    h.wait_for_text("DENIAL-HONORED", Duration::from_secs(10))?;
+    if let Err(err) = h.wait_for_text("DENIAL-HONORED", Duration::from_secs(10)) {
+        let logs = std::fs::read_dir(ws.home().join(".codewhale/logs"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow::anyhow!("{err:#}\napproval logs:\n{logs}"));
+    }
     assert!(
         !denied_path.exists(),
         "denied approval executed its write_file side effect: {}",
@@ -676,6 +694,7 @@ fn work_and_permission_are_visible_at_release_terminal_sizes() -> anyhow::Result
             .env("CODEX_HOME", codex_home.to_string_lossy())
             .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
             .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+            .env("NO_ANIMATIONS", "1")
             .env("RUST_LOG", "warn")
             .args([
                 "--workspace",
@@ -744,6 +763,7 @@ fn cancelled_bang_shell_settles_transcript_card() -> anyhow::Result<()> {
         // cell, which is the cache-transition edge this regression covers.
         .env("DEEPSEEK_API_KEY", "")
         .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("NO_ANIMATIONS", "1")
         .env("RUST_LOG", "warn")
         .args([
             "--workspace",
@@ -819,6 +839,7 @@ fn skills_menu_shows_local_and_global_skills() -> anyhow::Result<()> {
         .seal_home(ws.home())
         .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
         .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("NO_ANIMATIONS", "1")
         .env("RUST_LOG", "warn")
         .args([
             "--workspace",

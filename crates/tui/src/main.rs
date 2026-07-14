@@ -1201,8 +1201,9 @@ enum SandboxCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const CODEWHALE_MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<()> {
     // Match the dispatcher entrypoint: Unix shells and supervisors may inherit
     // SIGPIPE ignored, which turns short pipelines such as `codewhale doctor |
     // head` into BrokenPipe panics once this delegated TUI binary prints.
@@ -1260,6 +1261,33 @@ async fn main() -> Result<()> {
         orig_hook(panic_info);
     }));
 
+    // The interactive runtime intentionally carries a large state machine:
+    // terminal rendering, modal dispatch, provider setup, and fleet/workflow
+    // events all share one async owner. Debug builds retain enough stack
+    // temporaries that nesting a modal event over the TUI loop can exceed the
+    // platform main-thread default (8 MiB on macOS). Give that owner an
+    // explicit stack while keeping process hardening and the global panic hook
+    // above this boundary, before Tokio or any worker thread exists.
+    let runtime_thread = std::thread::Builder::new()
+        .name("codewhale-main".to_string())
+        .stack_size(CODEWHALE_MAIN_STACK_BYTES)
+        .spawn(run_async_main)
+        .context("Failed to start the Codewhale runtime thread")?;
+    match runtime_thread.join() {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            Err(anyhow!("Codewhale runtime thread panicked: {message}"))
+        }
+    }
+}
+
+#[tokio::main]
+async fn run_async_main() -> Result<()> {
     // Install signal handlers that restore the terminal before the
     // process exits. Without this, Ctrl+C delivered while raw mode /
     // kitty keyboard enhancement / alt-screen are active (or in the
