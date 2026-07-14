@@ -1921,15 +1921,24 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
 }
 
 #[test]
-fn agent_tool_prompt_schema_prefers_structured_briefs() {
+fn agent_tool_prompt_schema_keeps_ordinary_starts_message_first() {
     let tmp = tempdir().expect("tempdir");
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
     let agent_schema = AgentTool::new(manager, stub_runtime()).input_schema();
     let prompt = schema_property_description(&agent_schema, "prompt");
-    assert!(prompt.contains("Subagent Brief"));
-    assert!(prompt.contains("QUESTION"));
-    assert!(prompt.contains("STOP_CONDITION"));
-    assert!(prompt.contains("ALREADY_KNOWN"));
+    assert!(prompt.contains("focused task"));
+    assert!(prompt.contains("only field needed"));
+    for ceremony in [
+        "Subagent Brief",
+        "QUESTION",
+        "STOP_CONDITION",
+        "ALREADY_KNOWN",
+    ] {
+        assert!(
+            !prompt.contains(ceremony),
+            "ordinary worker starts should not require structured brief ceremony {ceremony:?}: {prompt}"
+        );
+    }
 }
 
 #[test]
