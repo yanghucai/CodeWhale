@@ -18,12 +18,24 @@ section="$(awk -v version="${version}" '
   in_section { print }
 ' "${changelog}")"
 
+contributors="$(printf '%s\n' "${section}" | awk '
+  /^### Contributors[[:space:]]*$/ { in_contributors = 1; next }
+  in_contributors && /^### / { exit }
+  in_contributors { print }
+')"
+
+notes="$(printf '%s\n' "${section}" | awk '
+  /^### Contributors[[:space:]]*$/ { in_contributors = 1; next }
+  in_contributors && /^### / { in_contributors = 0 }
+  !in_contributors { print }
+')"
+
 cat <<EOF
-> **CodeWhale** is the canonical project, command, npm package, and
-> release-asset name. The legacy npm package \`deepseek-tui\` is
-> deprecated and receives no further releases. Users coming from
-> v0.8.x legacy \`deepseek\` / \`deepseek-tui\` names should migrate
-> with \`docs/REBRAND.md\`.
+> **Codewhale** is the public product from Shannon Labs. The \`codewhale\`
+> command, npm package, and release-asset names remain lowercase technical
+> identifiers. The legacy npm package \`deepseek-tui\` is deprecated and
+> receives no further releases. Users coming from v0.8.x legacy \`deepseek\` /
+> \`deepseek-tui\` names should migrate with \`docs/REBRAND.md\`.
 
 ## Install
 
@@ -104,16 +116,24 @@ shasum -a 256 -c codewhale-artifacts-sha256.txt
 ## What's in ${tag}
 EOF
 
-if [[ -n "${section}" ]]; then
-  printf '%s\n' "${section}"
+if [[ -n "${notes}" ]]; then
+  printf '%s\n' "${notes}"
 else
   printf '%s\n' "See the changelog link below for this release's notes."
 fi
 
 cat <<EOF
 
-Contributor credits for this release live in the changelog entry above —
-thank you to everyone whose reports, PRs, reviews, and reproductions shaped it.
+## Contributors
+EOF
+
+if [[ -n "${contributors}" ]]; then
+  printf '%s\n' "${contributors}"
+else
+  printf '%s\n' "Thank you to everyone whose reports, PRs, reviews, and reproductions shaped this release."
+fi
+
+cat <<EOF
 
 See [CHANGELOG.md](https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md) for full notes and [docs/CHANGELOG_ARCHIVE.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/CHANGELOG_ARCHIVE.md) for older releases.
 EOF

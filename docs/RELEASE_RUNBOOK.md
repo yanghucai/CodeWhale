@@ -14,18 +14,22 @@ Current packaging note:
   - `codewhale-tui`
   - `codewhale-cli`
 - Supporting crates published from this workspace:
-  - `codewhale-secrets`
-  - `codewhale-config`
+  - `codewhale-build-support`
+  - `codewhale-mcp`
   - `codewhale-protocol`
+  - `codewhale-release`
+  - `codewhale-secrets`
   - `codewhale-state`
-  - `codewhale-agent`
+  - `codewhale-workflow`
+  - `codewhale-workflow-js`
   - `codewhale-execpolicy`
   - `codewhale-hooks`
-  - `codewhale-mcp`
   - `codewhale-tools`
+  - `codewhale-config`
+  - `codewhale-lane`
+  - `codewhale-agent`
   - `codewhale-core`
   - `codewhale-app-server`
-  - `codewhale-workflow`
 
 ## Version Coordination
 

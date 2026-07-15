@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [0.8.68] - 2026-07-14
+
+Codewhale v0.8.68 replaces the default terminal shell with the underwater
+interaction system, makes Operate message-first, and hardens the Fleet,
+Workflow, routing, accounting, and release surfaces that support day-to-day
+agent work. The release also expands localization and gives the public site a
+quieter, docs-first community foundation.
+
+### Fixed — final integration
 
 - Anchor automatic compaction thresholds to the route's spendable input
   budget after output reservation and safety headroom, so large-output and
@@ -57,15 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   events remain visible to `turn_end` observers as explicitly non-model
   lifecycle records. This builds on the scorecard introduced by @findshan in
   #3388.
-
-## [0.8.68] - 2026-07-13
-
-Release-candidate notes for the underwater release: the TUI's default shell is
-replaced end to end, the runtime keeps its guarantees, and the new layer is
-prepared with localized coverage. These notes describe the code prepared for
-v0.8.68; they are not evidence that the public tag or package artifacts have
-been published. The pre-candidate section that follows records what had already
-landed on main for 0.8.68 by 2026-07-10.
 
 ### Changed — the underwater shell
 
@@ -139,7 +138,7 @@ landed on main for 0.8.68 by 2026-07-10.
   `Alt+[`, `Alt+]`, `Alt+L`, `Alt+?`), and give theme, Help, model, and
   config rows direct mouse paths with the same activation as Enter.
 
-### Changed — release-candidate integration
+### Changed — integrated runtime and TUI
 
 - Make worker delegation route-aware and identity-safe: workers receive a
   small role-scoped system prompt instead of stale parent/model boilerplate,
@@ -241,7 +240,7 @@ landed on main for 0.8.68 by 2026-07-10.
 - Refresh `docs/ACCESSIBILITY.md` for treatment-independent ambient life
   and the completed ASCII tier.
 
-### Changed (pre-candidate 2026-07-10)
+### Changed — runtime foundations
 
 - Make the advertised Android/Termux release target buildable by generating
   QuickJS bindings against the Android NDK instead of expecting an upstream
@@ -397,6 +396,39 @@ landed on main for 0.8.68 by 2026-07-10.
 - YOLO mode: `--yolo`, `default_mode = "yolo"`, and the hotbar YOLO action
   now map to Act + Full Access permissions via a compatibility shim and
   show a one-shot deprecation notice; removal is planned for 0.9.0.
+
+### Contributors
+
+Thank you to the international community whose code, reports, reviews, and
+reproductions shaped v0.8.68:
+
+- [@bistack](https://github.com/bistack),
+  [@bruce6135](https://github.com/bruce6135),
+  [@CCChisato](https://github.com/CCChisato),
+  [@ci4ic4](https://github.com/ci4ic4),
+  [@cyq1017](https://github.com/cyq1017), and
+  [@DarrellThomas](https://github.com/DarrellThomas).
+- [@eugenicum](https://github.com/eugenicum),
+  [@findshan](https://github.com/findshan),
+  [@gaord](https://github.com/gaord),
+  [@hmr-BH](https://github.com/hmr-BH),
+  [@hongqitai](https://github.com/hongqitai), and
+  [@idling11](https://github.com/idling11).
+- [@JayBeest](https://github.com/JayBeest),
+  [@knqiufan](https://github.com/knqiufan),
+  [@LeoLin990405](https://github.com/LeoLin990405),
+  [@moduvoice](https://github.com/moduvoice),
+  [@Mr-Moon121](https://github.com/Mr-Moon121), and
+  [@MXAntian](https://github.com/MXAntian).
+- [@nightt5879](https://github.com/nightt5879),
+  [@nsfoxer](https://github.com/nsfoxer),
+  [@octo-patch](https://github.com/octo-patch),
+  [@qinlinwang](https://github.com/qinlinwang),
+  [@SamhandsomeLee](https://github.com/SamhandsomeLee), and
+  [@taixinguo](https://github.com/taixinguo).
+- [@WavesMan](https://github.com/WavesMan),
+  [@wuisabel-gif](https://github.com/wuisabel-gif), and
+  [@yekern](https://github.com/yekern).
 
 ## [0.8.67] - 2026-07-06
 
