@@ -166,10 +166,32 @@ fn exec_shell_parallel_flags_are_input_aware() {
     );
 
     for input in [
+        json!({"command": "fd -e rs ."}),
+        json!({"command": "fd -H --type f src"}),
+        json!({"command": "git grep TODO crates/tui/src/tools"}),
+        json!({"command": "bash -lc 'fd -e toml .'"}),
+        json!({"command": "bash -lc 'git grep TODO crates/tui/src/tools'"}),
+    ] {
+        assert!(tool.supports_parallel_for(&input), "{input:?}");
+        assert!(tool.is_read_only_for(&input), "{input:?}");
+        assert_eq!(
+            tool.approval_requirement_for(&input),
+            ApprovalRequirement::Auto,
+            "{input:?}"
+        );
+    }
+
+    for input in [
         json!({"command": "git status -s", "background": true}),
         json!({"command": "git status -s", "stdin": ""}),
         json!({"command": "cargo build"}),
         json!({"command": "bash -lc 'rg TODO crates | head'"}),
+        json!({"command": "fd -x ./pwn.sh"}),
+        json!({"command": "fd --exec ./pwn.sh"}),
+        json!({"command": "fd -uHtx ./pwn.sh"}),
+        json!({"command": "rg --pre /tmp/evil.sh needle ."}),
+        json!({"command": "git grep -O needle"}),
+        json!({"command": "git grep -nO needle"}),
     ] {
         assert!(!tool.supports_parallel_for(&input), "{input:?}");
         assert!(!tool.is_read_only_for(&input), "{input:?}");

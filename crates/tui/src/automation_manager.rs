@@ -26,7 +26,7 @@ const CURRENT_RUN_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_AUTOMATION_MODE: &str = "agent";
 const DEFAULT_AUTOMATION_ALLOW_SHELL: bool = false;
 const DEFAULT_AUTOMATION_TRUST_MODE: bool = false;
-const DEFAULT_AUTOMATION_AUTO_APPROVE: bool = true;
+const DEFAULT_AUTOMATION_AUTO_APPROVE: bool = false;
 
 const fn default_automation_schema_version() -> u32 {
     CURRENT_AUTOMATION_SCHEMA_VERSION
@@ -1368,7 +1368,7 @@ mod tests {
         assert_eq!(record.task_mode(), "agent");
         assert!(!record.task_allow_shell());
         assert!(!record.task_trust_mode());
-        assert!(record.task_auto_approve());
+        assert!(!record.task_auto_approve());
     }
 
     #[tokio::test]
@@ -1389,10 +1389,10 @@ mod tests {
         assert_eq!(default_task.mode, "agent");
         assert!(!default_task.allow_shell);
         assert!(!default_task.trust_mode);
-        assert!(default_task.auto_approve);
+        assert!(!default_task.auto_approve);
 
         let explicit_automation =
-            automation_record_with_settings(Some("plan"), Some(true), Some(true), Some(false));
+            automation_record_with_settings(Some("plan"), Some(true), Some(true), Some(true));
         let mut explicit_run = queued_run_for(&explicit_automation);
         enqueue_run_task(&explicit_automation, &mut explicit_run, &task_manager).await;
         let explicit_task = task_manager
@@ -1401,7 +1401,7 @@ mod tests {
         assert_eq!(explicit_task.mode, "plan");
         assert!(explicit_task.allow_shell);
         assert!(explicit_task.trust_mode);
-        assert!(!explicit_task.auto_approve);
+        assert!(explicit_task.auto_approve);
 
         task_manager.shutdown();
         Ok(())

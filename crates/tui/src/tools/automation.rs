@@ -46,7 +46,7 @@ impl ToolSpec for AutomationCreateTool {
                 "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
                 "allow_shell": { "type": "boolean", "default": false },
                 "trust_mode": { "type": "boolean", "default": false },
-                "auto_approve": { "type": "boolean", "default": true },
+                "auto_approve": { "type": "boolean", "default": false },
                 "paused": { "type": "boolean", "default": false }
             },
             "required": ["name", "prompt", "rrule"],
@@ -402,5 +402,13 @@ mod tests {
         let schema = AutomationCreateTool.input_schema();
         assert!(schema["properties"]["rrule"].is_object());
         assert_eq!(schema["required"][0], "name");
+    }
+
+    #[test]
+    fn create_schema_auto_approve_defaults_to_false() {
+        let schema = AutomationCreateTool.input_schema();
+        let auto_approve = &schema["properties"]["auto_approve"];
+        assert_eq!(auto_approve["type"], "boolean");
+        assert_eq!(auto_approve["default"], false);
     }
 }
