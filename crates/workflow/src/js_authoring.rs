@@ -636,11 +636,11 @@ workflow({
             panic!("acceptance fixture should begin with one ordered role chain");
         };
         let expected_children = [
-            ("scout", 4, 480, 96_000),
-            ("implementer", 3, 420, 72_000),
-            ("reviewer", 3, 420, 72_000),
-            ("verifier", 3, 420, 72_000),
-            ("release_lead", 2, 300, 48_000),
+            ("scout", 6, 480, 96_000),
+            ("implementer", 4, 420, 72_000),
+            ("reviewer", 4, 420, 72_000),
+            ("verifier", 4, 420, 72_000),
+            ("release_lead", 3, 300, 48_000),
         ];
         let mut aggregate_token_cap = 0_u64;
         assert_eq!(sequence.children.len(), expected_children.len());
@@ -675,9 +675,9 @@ workflow({
             );
             assert_eq!(leaf.budget.max_steps, Some(max_steps), "{expected_role}");
             let response_budget = match max_steps {
+                6 => "at most six model responses",
                 4 => "at most four model responses",
                 3 => "at most three model responses",
-                2 => "at most two model responses",
                 _ => unreachable!("unexpected stopship model-response budget"),
             };
             assert!(
@@ -690,10 +690,9 @@ workflow({
                 "{expected_role}"
             );
             assert_eq!(leaf.budget.max_tokens, Some(max_tokens), "{expected_role}");
-            assert_eq!(
-                max_tokens,
-                u64::from(max_steps) * 24_000,
-                "{expected_role} must retain one bounded 24k envelope per model turn"
+            assert!(
+                max_tokens < u64::from(max_steps) * 24_000,
+                "{expected_role} verdict reserve must not raise its token ceiling"
             );
             aggregate_token_cap = aggregate_token_cap.saturating_add(max_tokens);
             assert!(
