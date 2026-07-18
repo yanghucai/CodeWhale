@@ -174,6 +174,9 @@ pub struct DeepSeekClient {
     model_bound_secret_values: Arc<Vec<String>>,
     pub(super) base_url: String,
     pub(super) api_provider: ApiProvider,
+    /// ChatGPT account id captured through the same consent-gated credential
+    /// resolution as the Codex bearer token.
+    pub(super) codex_account_id: Option<String>,
     retry: RetryPolicy,
     default_model: String,
     connection_health: Arc<AsyncMutex<ConnectionHealth>>,
@@ -397,6 +400,7 @@ impl Clone for DeepSeekClient {
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             base_url: self.base_url.clone(),
             api_provider: self.api_provider,
+            codex_account_id: self.codex_account_id.clone(),
             retry: self.retry.clone(),
             default_model: self.default_model.clone(),
             connection_health: self.connection_health.clone(),
@@ -894,6 +898,9 @@ impl DeepSeekClient {
             validate_route(api_provider, &default_model).map_err(anyhow::Error::msg)?;
         }
         let api_key = config.deepseek_api_key()?;
+        let codex_account_id = (api_provider == ApiProvider::OpenaiCodex)
+            .then(|| config.codex_account_id())
+            .flatten();
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
         validate_base_url_security(&base_url)?;
@@ -960,6 +967,7 @@ impl DeepSeekClient {
             model_bound_secret_values,
             base_url,
             api_provider,
+            codex_account_id,
             retry,
             default_model,
             connection_health: Arc::new(AsyncMutex::new(ConnectionHealth::default())),

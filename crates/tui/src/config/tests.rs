@@ -3596,6 +3596,55 @@ model = "managed-model"
 }
 
 #[test]
+fn managed_config_cannot_grant_external_credential_consent() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp_root.path());
+    let config_path = temp_root.path().join("config.toml");
+    let managed_path = temp_root.path().join("managed.toml");
+    let external_path = temp_root.path().join("codex-auth.json");
+    let external_raw = r#"{"tokens":{"access_token":"must-never-be-read"}}"#;
+    fs::write(&external_path, external_raw)?;
+    fs::write(
+        &managed_path,
+        format!(
+            r#"[providers.openai_codex.external_credentials]
+access = "read_only"
+provider = "openai-codex"
+source = "codex_cli"
+path = {:?}
+consent_version = 1
+"#,
+            external_path.display().to_string()
+        ),
+    )?;
+    fs::write(
+        &config_path,
+        format!(
+            "provider = \"openai-codex\"\nmanaged_config_path = {:?}\n",
+            managed_path.display().to_string()
+        ),
+    )?;
+
+    crate::external_credentials::reset_side_effect_trap();
+    let config = Config::load(Some(config_path), None)?;
+    assert!(
+        config
+            .provider_config_for(ApiProvider::OpenaiCodex)
+            .and_then(|provider| provider.external_credentials.as_ref())
+            .is_none()
+    );
+    assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "managed config must not consent to user-owned external credentials"
+    );
+    assert_eq!(fs::read_to_string(external_path)?, external_raw);
+    Ok(())
+}
+
+#[test]
 fn env_base_url_provenance_tracks_the_route_across_provider_switches() -> Result<()> {
     let _lock = lock_test_env();
     let temp_root = tempfile::tempdir()?;
@@ -7172,7 +7221,7 @@ api_key = "novita-table-key"
 }
 
 #[test]
-fn moonshot_kimi_import_reads_unexpired_token_without_mutation() -> Result<()> {
+fn moonshot_kimi_import_is_api_key_only_and_never_reads_external_credentials() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7191,19 +7240,17 @@ fn moonshot_kimi_import_reads_unexpired_token_without_mutation() -> Result<()> {
     fs::create_dir_all(&credential_dir)?;
     unsafe { env::set_var("KIMI_CODE_HOME", &kimi_code_home) };
 
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-        + 3600.0;
     let credential = json!({
-        "access_token": "fresh-kimi-code-oauth-token",
-        "refresh_token": "refresh-token",
-        "expires_at": expires_at,
+        "access_token": "must-never-be-read",
+        "refresh_token": "must-never-be-used",
+        "expires_at": SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs_f64()
+            + 3600.0,
         "scope": "openid profile email",
         "token_type": "Bearer",
     });
-    let credential_path = credential_dir.join(KIMI_CODE_CREDENTIAL_FILE);
+    let credential_path = credential_dir.join("kimi-code.json");
     let credential_raw = serde_json::to_string(&credential)?;
     fs::write(&credential_path, &credential_raw)?;
 
@@ -7223,122 +7270,159 @@ api_key = "stale-api-key"
     assert_eq!(config.api_provider(), ApiProvider::Moonshot);
     assert_eq!(config.deepseek_base_url(), DEFAULT_KIMI_CODE_BASE_URL);
     assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
-    assert_eq!(config.deepseek_api_key()?, "fresh-kimi-code-oauth-token");
-    assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+    let error = config
+        .deepseek_api_key()
+        .expect_err("Kimi external OAuth credentials are never imported");
+    assert!(error.to_string().contains("does not impersonate"));
+    assert!(
+        error
+            .to_string()
+            .contains("https://platform.kimi.ai/console/api-keys")
+    );
+    assert!(!has_api_key_for(&config, ApiProvider::Moonshot));
     assert_eq!(
         fs::read_to_string(credential_path)?,
         credential_raw,
-        "CodeWhale must never rewrite imported Kimi CLI credentials"
+        "Codewhale must never read, refresh, or rewrite Kimi CLI credentials"
     );
     Ok(())
 }
 
 #[test]
-fn moonshot_kimi_import_falls_back_to_legacy_share_dir_credential() -> Result<()> {
+fn codex_external_credentials_are_disabled_by_default_and_managed_fails_before_io() -> Result<()> {
     let _lock = lock_test_env();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let temp_root = env::temp_dir().join(format!(
-        "codewhale-tui-kimi-oauth-key-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    fs::create_dir_all(&temp_root)?;
-    let _guard = EnvGuard::new(&temp_root);
+    let temp = tempfile::tempdir()?;
+    let auth_path = temp.path().join("codex-auth.json");
+    let token = crate::test_support::future_test_jwt("codex");
+    let raw = serde_json::to_string_pretty(&json!({
+        "tokens": {
+            "access_token": token.clone(),
+            "account_id": "acct-must-not-be-read",
+            "refresh_token": "must-never-be-used"
+        },
+        "unknown": {"preserve": true}
+    }))?;
+    fs::write(&auth_path, &raw)?;
+    let ambient_decoy = temp.path().join("ambient-decoy.json");
+    let ambient_decoy_raw = r#"{"tokens":{"access_token":"must-not-be-read"}}"#;
+    fs::write(&ambient_decoy, ambient_decoy_raw)?;
+    let _auth_path = EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &ambient_decoy);
+    let _access = EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+    let _legacy_access = EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+    let _account = EnvVarGuard::remove("OPENAI_CODEX_ACCOUNT_ID");
+    let _legacy_account = EnvVarGuard::remove("CODEX_ACCOUNT_ID");
 
-    let kimi_share_dir = temp_root.join(".kimi");
-    let credential_dir = kimi_share_dir.join("credentials");
-    fs::create_dir_all(&credential_dir)?;
-    unsafe { env::set_var("KIMI_SHARE_DIR", &kimi_share_dir) };
+    let disabled = Config {
+        provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        ..Default::default()
+    };
+    crate::external_credentials::reset_side_effect_trap();
+    assert!(!has_api_key_for(&disabled, ApiProvider::OpenaiCodex));
+    let error = disabled
+        .deepseek_api_key()
+        .expect_err("external credentials default to disabled");
+    assert!(error.to_string().contains("are disabled"));
+    assert_eq!(disabled.codex_account_id(), None);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0)
+    );
 
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-        + 3600.0;
-    let credential = json!({
-        "access_token": "fresh-oauth-token",
-        "refresh_token": "refresh-token",
-        "expires_at": expires_at,
-        "scope": "openid profile email",
-        "token_type": "Bearer",
-    });
-    fs::write(
-        credential_dir.join(KIMI_CODE_CREDENTIAL_FILE),
-        serde_json::to_string(&credential)?,
-    )?;
-
-    let config_path = temp_root.join(".deepseek").join("config.toml");
-    ensure_parent_dir(&config_path)?;
-    fs::write(
-        &config_path,
-        r#"provider = "moonshot"
-
-[providers.moonshot]
-auth_mode = "kimi_oauth"
-api_key = "stale-api-key"
-"#,
-    )?;
-
-    let config = Config::load(None, None)?;
-    assert_eq!(config.api_provider(), ApiProvider::Moonshot);
-    assert_eq!(config.deepseek_base_url(), DEFAULT_KIMI_CODE_BASE_URL);
-    assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
-    assert_eq!(config.deepseek_api_key()?, "fresh-oauth-token");
-    assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+    let mut managed_consent = codewhale_config::ExternalCredentialConsentToml::read_only(
+        codewhale_config::ProviderKind::OpenaiCodex,
+        codewhale_config::ExternalCredentialSource::CodexCli,
+        auth_path.clone(),
+    );
+    managed_consent.access = codewhale_config::ExternalCredentialAccess::Managed;
+    let managed = Config {
+        provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(managed_consent),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::external_credentials::reset_side_effect_trap();
+    assert!(!has_api_key_for(&managed, ApiProvider::OpenaiCodex));
+    let error = managed
+        .deepseek_api_key()
+        .expect_err("managed access needs a preservation adapter");
+    assert!(
+        error
+            .to_string()
+            .contains("schema-safe preservation adapter")
+    );
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0)
+    );
+    assert_eq!(fs::read_to_string(&auth_path)?, raw);
     Ok(())
 }
 
 #[test]
-fn moonshot_kimi_import_expired_token_fails_closed_without_refresh_or_mutation() -> Result<()> {
+fn codex_read_only_consent_reads_exact_file_without_mutation() -> Result<()> {
     let _lock = lock_test_env();
-    let temp_root = tempfile::tempdir()?;
-    let _guard = EnvGuard::new(temp_root.path());
+    let temp = tempfile::tempdir()?;
+    let auth_path = temp.path().join("codex-auth.json");
+    let token = crate::test_support::future_test_jwt("codex");
+    let raw = serde_json::to_string_pretty(&json!({
+        "tokens": {
+            "access_token": token.clone(),
+            "account_id": "acct-read-only",
+            "refresh_token": "must-never-be-used",
+            "future_field": ["preserve"]
+        },
+        "future_top_level": true
+    }))?;
+    fs::write(&auth_path, &raw)?;
+    let ambient_decoy = temp.path().join("ambient-decoy.json");
+    let ambient_decoy_raw = r#"{"tokens":{"access_token":"must-not-be-read"}}"#;
+    fs::write(&ambient_decoy, ambient_decoy_raw)?;
+    let _auth_path = EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &ambient_decoy);
+    let _access = EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+    let _legacy_access = EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+    let config = Config {
+        provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(
+                    codewhale_config::ExternalCredentialConsentToml::read_only(
+                        codewhale_config::ProviderKind::OpenaiCodex,
+                        codewhale_config::ExternalCredentialSource::CodexCli,
+                        auth_path.clone(),
+                    ),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
 
-    let kimi_code_home = temp_root.path().join(".kimi-code");
-    let credential_dir = kimi_code_home.join("credentials");
-    fs::create_dir_all(&credential_dir)?;
-    unsafe { env::set_var("KIMI_CODE_HOME", &kimi_code_home) };
-
-    let credential = json!({
-        "access_token": "expired-imported-token",
-        "refresh_token": "must-never-be-used",
-        "expires_at": SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs_f64()
-            - 3600.0,
-        "token_type": "Bearer",
-    });
-    let credential_path = credential_dir.join(KIMI_CODE_CREDENTIAL_FILE);
-    let credential_raw = serde_json::to_string(&credential)?;
-    fs::write(&credential_path, &credential_raw)?;
-
-    let config_path = temp_root.path().join(".deepseek").join("config.toml");
-    ensure_parent_dir(&config_path)?;
-    fs::write(
-        &config_path,
-        r#"provider = "moonshot"
-
-[providers.moonshot]
-auth_mode = "kimi_oauth"
-"#,
-    )?;
-
-    let config = Config::load(None, None)?;
-    let err = config
-        .deepseek_api_key()
-        .expect_err("an expired imported token must not refresh");
-    let message = err.to_string();
-    assert!(message.contains("cannot refresh Kimi OAuth"));
-    assert!(message.contains("Kimi Code API key"));
-    assert!(message.contains("#4417"));
-    assert!(!has_api_key_for(&config, ApiProvider::Moonshot));
+    crate::external_credentials::reset_side_effect_trap();
+    assert_eq!(config.deepseek_api_key()?, token);
     assert_eq!(
-        fs::read_to_string(credential_path)?,
-        credential_raw,
-        "the unusable import must remain read-only"
+        crate::external_credentials::side_effect_trap_counts(),
+        (1, 1)
+    );
+    assert_eq!(fs::read_to_string(&auth_path)?, raw);
+    assert_eq!(fs::read_to_string(&ambient_decoy)?, ambient_decoy_raw);
+
+    drop(_access);
+    let _process_access = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "process-token");
+    crate::external_credentials::reset_side_effect_trap();
+    assert_eq!(config.deepseek_api_key()?, "process-token");
+    assert_eq!(config.codex_account_id(), None);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "process-scoped Codex auth must not be mixed with external-file metadata"
     );
     Ok(())
 }
@@ -7699,7 +7783,7 @@ fn provider_auth_source_metadata_is_not_a_runtime_credential() -> Result<()> {
 }
 
 #[test]
-fn has_api_key_for_accepts_xai_oauth_without_masking_api_keys() -> Result<()> {
+fn xai_oauth_selection_falls_back_to_explicit_api_key_without_external_io() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7713,17 +7797,26 @@ fn has_api_key_for_accepts_xai_oauth_without_masking_api_keys() -> Result<()> {
     fs::create_dir_all(&temp_root)?;
     let auth_path = temp_root.join("auth.json");
     let _auth_path = EnvVarGuard::set("GROK_AUTH_PATH", auth_path.as_os_str());
+    let _xai_key = EnvVarGuard::remove("XAI_API_KEY");
 
     let mut providers = ProvidersConfig::default();
     providers.xai.api_key = Some("xai-api-key".to_string());
+    providers.xai.auth_mode = Some("oauth".to_string());
     let api_key_config = Config {
+        provider: Some("xai".to_string()),
         providers: Some(providers),
         ..Config::default()
     };
+    crate::external_credentials::reset_side_effect_trap();
     assert!(has_api_key_for(&api_key_config, ApiProvider::Xai));
+    assert_eq!(api_key_config.deepseek_api_key()?, "xai-api-key");
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0)
+    );
 
     fs::write(&auth_path, "{}")?;
-    assert!(has_api_key_for(&Config::default(), ApiProvider::Xai));
+    assert!(!has_api_key_for(&Config::default(), ApiProvider::Xai));
     fs::remove_dir_all(temp_root)?;
     Ok(())
 }
@@ -9394,4 +9487,37 @@ fn provider_auth_mode_save_uses_requested_path_and_preserves_comments() {
     assert!(contents.contains("# keep this operator note"));
     assert!(contents.contains("model = \"grok-code-fast-1\" # keep model note"));
     assert!(contents.contains("auth_mode = \"oauth\""));
+}
+
+#[test]
+fn native_login_consent_revoke_preserves_provider_config_and_comments() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"# keep this operator note
+[providers.xai]
+model = "grok-code-fast-1" # keep model note
+auth_mode = "oauth"
+
+[providers.xai.external_credentials]
+access = "read_only"
+provider = "xai"
+source = "grok_cli"
+path = "/external/grok-auth.json"
+consent_version = 1
+"#,
+    )
+    .expect("seed config");
+
+    let saved = revoke_external_credential_consent_for_at(ApiProvider::Xai, Some(&path))
+        .expect("revoke external consent");
+
+    assert_eq!(saved, path);
+    let contents = std::fs::read_to_string(&saved).expect("read config");
+    assert!(contents.contains("# keep this operator note"));
+    assert!(contents.contains("model = \"grok-code-fast-1\" # keep model note"));
+    assert!(contents.contains("auth_mode = \"oauth\""));
+    assert!(!contents.contains("external_credentials"));
+    assert!(!contents.contains("/external/grok-auth.json"));
 }

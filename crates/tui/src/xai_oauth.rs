@@ -2,11 +2,12 @@
 //!
 //! Two paths, matching [#4257](https://github.com/Hmbown/CodeWhale/issues/4257):
 //!
-//! 1. **Delegate-login** — reuse the official Grok CLI token file at
-//!    `~/.grok/auth.json` (or `$GROK_HOME/auth.json` / `$GROK_AUTH_PATH`).
+//! 1. **Read-only external login** — reuse one exact official Grok CLI token
+//!    file only after provider-scoped consent. External tokens are never
+//!    refreshed or rewritten.
 //! 2. **Native device-code** — request a code from `auth.x.ai`, print the
 //!    verification URL + user code, poll the token endpoint, and write tokens
-//!    back to the Grok CLI auth file shape (so both tools stay compatible).
+//!    to Codewhale-owned storage.
 //!
 //! Access tokens are sent as `Authorization: Bearer` on the OpenAI-compatible
 //! xAI Chat Completions route (`https://api.x.ai/v1`). Token values are never
@@ -23,6 +24,8 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::config::{ApiProvider, Config};
 
 /// Official Grok CLI public OIDC client id (public client; no secret).
 pub const GROK_OIDC_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -155,61 +158,113 @@ pub fn auth_file_path() -> PathBuf {
         if let Ok(path) = std::env::var(key) {
             let p = PathBuf::from(path.trim());
             if !p.as_os_str().is_empty() {
-                return p;
+                return codewhale_config::resolve_external_credential_path(&p).unwrap_or(p);
             }
         }
     }
     if let Ok(home) = std::env::var("GROK_HOME") {
         let p = PathBuf::from(home.trim());
         if !p.as_os_str().is_empty() {
-            return p.join("auth.json");
+            let path = p.join("auth.json");
+            return codewhale_config::resolve_external_credential_path(&path).unwrap_or(path);
         }
     }
-    dirs::home_dir()
+    let path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".grok")
-        .join("auth.json")
+        .join("auth.json");
+    codewhale_config::resolve_external_credential_path(&path).unwrap_or(path)
+}
+
+/// Codewhale-owned xAI token file. Native login and refresh never target the
+/// Grok CLI's file.
+pub fn codewhale_auth_file_path() -> Result<PathBuf> {
+    Ok(codewhale_config::codewhale_home()?
+        .join("credentials")
+        .join("xai-auth.json"))
 }
 
 #[must_use]
-pub fn credentials_present() -> bool {
-    auth_file_path().exists()
+pub fn credentials_present(config: &Config) -> bool {
+    credentials_valid(config)
 }
 
-/// Prompt-free structural check for Grok/xAI OAuth material. Never refreshes
-/// or writes: a fresh access token or a non-empty refresh token is enough to
-/// keep the route selectable, while malformed/empty files count as missing.
+/// Prompt-free structural check for xAI OAuth material. Never refreshes,
+/// writes, or makes network requests. External storage is not inspected until
+/// exact read-only consent has been validated.
 #[must_use]
-pub fn credentials_valid() -> bool {
-    let path = auth_file_path();
-    let Ok(mut file) = load_auth_file(&path) else {
-        return false;
-    };
-    let Some((_, entry)) = select_entry(&mut file) else {
-        return false;
-    };
-    entry_access_token_is_fresh(&entry)
-        || entry
-            .refresh_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty())
-}
-
-/// Load + refresh OAuth credentials from the Grok CLI auth file.
-pub fn get_access_token() -> Result<String> {
-    Ok(get_credentials()?.access_token)
-}
-
-pub fn get_credentials() -> Result<XaiOAuthCredentials> {
-    let path = auth_file_path();
-    if !path.exists() {
-        bail!("{}", missing_auth_message());
+pub fn credentials_valid(config: &Config) -> bool {
+    if let Ok(path) = codewhale_auth_file_path()
+        && path.exists()
+        && let Ok(mut file) = load_auth_file(&path)
+        && let Some((_, entry)) = select_entry(&mut file)
+        && (entry_access_token_is_fresh(&entry)
+            || entry
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()))
+    {
+        return true;
     }
-    let mut file = load_auth_file(&path)?;
+
+    let path = auth_file_path();
+    let Ok(grant) = config.external_credential_read_grant(
+        ApiProvider::Xai,
+        codewhale_config::ExternalCredentialSource::GrokCli,
+        &path,
+    ) else {
+        return false;
+    };
+    let Ok(mut file) = load_external_auth_file(&grant) else {
+        return false;
+    };
+    select_entry(&mut file).is_some_and(|(_, entry)| entry_access_token_is_fresh(&entry))
+}
+
+/// Load xAI OAuth credentials. Codewhale-owned credentials may refresh and
+/// rewrite Codewhale-owned storage. External credentials are read-only.
+pub fn get_access_token(config: &Config) -> Result<String> {
+    Ok(get_credentials(config)?.access_token)
+}
+
+pub fn get_credentials(config: &Config) -> Result<XaiOAuthCredentials> {
+    let owned_path = codewhale_auth_file_path()?;
+    if owned_path.exists() {
+        return get_owned_credentials(&owned_path);
+    }
+
+    let external_path = auth_file_path();
+    let grant = config.external_credential_read_grant(
+        ApiProvider::Xai,
+        codewhale_config::ExternalCredentialSource::GrokCli,
+        &external_path,
+    )?;
+    let mut file = load_external_auth_file(&grant)?;
+    let (scope, entry) = select_entry(&mut file).ok_or_else(|| {
+        anyhow::anyhow!(
+            "xAI OAuth credentials at {} have no usable entry. Run `grok login` again or use `codewhale auth xai-device` for Codewhale-owned storage.",
+            grant.path().display()
+        )
+    })?;
+    if !entry_access_token_is_fresh(&entry) {
+        bail!(
+            "xAI OAuth access token in {} is expired. Read-only consent never refreshes or rewrites another CLI's credentials. Run `grok login` again or use `codewhale auth xai-device`.",
+            grant.path().display()
+        );
+    }
+    let token = entry
+        .key
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+        .context("xAI OAuth access token is empty")?;
+    Ok(credentials_from_entry(scope, &entry, token))
+}
+
+fn get_owned_credentials(path: &Path) -> Result<XaiOAuthCredentials> {
+    let mut file = load_auth_file(path)?;
     let (scope, mut entry) = select_entry(&mut file).ok_or_else(|| {
         anyhow::anyhow!(
-            "xAI OAuth credentials at {} have no usable entry. Run `grok login` \
-             or `codewhale auth xai-device` (device-code).",
+            "Codewhale-owned xAI OAuth credentials at {} have no usable entry. Run `codewhale auth xai-device` again.",
             path.display()
         )
     })?;
@@ -245,7 +300,7 @@ pub fn get_credentials() -> Result<XaiOAuthCredentials> {
     let refreshed = refresh_access_token(&issuer, &client_id, refresh)?;
     apply_token_response(&mut entry, &issuer, &client_id, &refreshed)?;
     file.insert(scope.clone(), entry.clone());
-    write_auth_file(&path, &file)?;
+    write_auth_file(path, &file)?;
 
     let token = entry
         .key
@@ -256,7 +311,7 @@ pub fn get_credentials() -> Result<XaiOAuthCredentials> {
 }
 
 /// Interactive device-code login. Prints verification URL + user code to
-/// `stderr`, polls until approved, and writes `~/.grok/auth.json`.
+/// `stderr`, polls until approved, and writes Codewhale-owned storage.
 ///
 /// Public residual entry point for CLI/TUI wiring (`codewhale auth` /
 /// slash command). Call from a headless or TUI surface that can print the
@@ -271,7 +326,7 @@ pub async fn device_code_login() -> Result<XaiOAuthCredentials> {
     let scopes = std::env::var("GROK_OIDC_SCOPES")
         .or_else(|_| std::env::var("XAI_OIDC_SCOPES"))
         .unwrap_or_else(|_| DEFAULT_SCOPES.to_string());
-    let auth_path = auth_file_path();
+    let auth_path = codewhale_auth_file_path()?;
     let open_browser = std::env::var_os("CODEWHALE_XAI_OAUTH_NO_BROWSER").is_none();
 
     device_code_login_on_blocking_thread(issuer, client_id, scopes, auth_path, open_browser).await
@@ -383,12 +438,11 @@ pub fn missing_auth_message() -> String {
     format!(
         "xAI OAuth credentials not found.\n\
          Options:\n\
-         1. Run `grok login` (or `grok login --device-auth`) and set \
-         [providers.xai] auth_mode = \"oauth\"\n\
-         2. Run device-code login, then set auth_mode = \"oauth\"\n\
+         1. Run `codewhale auth xai-device` for Codewhale-owned OAuth storage\n\
+         2. To read an existing Grok CLI login without changing it, run \
+         `codewhale auth external-consent --provider xai --mode read-only --path {}`\n\
          3. Or use API-key auth: export XAI_API_KEY=... / \
-         codewhale auth set --provider xai\n\
-         Looked for: {}",
+         codewhale auth set --provider xai",
         auth_file_path().display()
     )
 }
@@ -400,7 +454,24 @@ type AuthFile = BTreeMap<String, GrokAuthEntry>;
 fn load_auth_file(path: &Path) -> Result<AuthFile> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("reading xAI/Grok auth file {}", path.display()))?;
-    let value: Value = serde_json::from_str(&raw)
+    parse_auth_file(&raw, path)
+}
+
+fn load_external_auth_file(
+    grant: &codewhale_config::ExternalCredentialReadGrant,
+) -> Result<AuthFile> {
+    if !crate::external_credentials::exists(grant) {
+        bail!(
+            "external xAI/Grok credential file not found at {}",
+            grant.path().display()
+        );
+    }
+    let raw = crate::external_credentials::read_to_string(grant)?;
+    parse_auth_file(&raw, grant.path())
+}
+
+fn parse_auth_file(raw: &str, path: &Path) -> Result<AuthFile> {
+    let value: Value = serde_json::from_str(raw)
         .with_context(|| format!("parsing xAI/Grok auth file {}", path.display()))?;
     let obj = value.as_object().with_context(|| {
         format!(
@@ -955,18 +1026,88 @@ mod tests {
             }
         });
         fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
-        // SAFETY: serialized by the process-wide test environment lock;
-        // restored below.
-        unsafe {
-            std::env::set_var("GROK_AUTH_PATH", &path);
-        }
-        let result = get_credentials();
-        unsafe {
-            std::env::remove_var("GROK_AUTH_PATH");
-        }
+        let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
+        let config = Config {
+            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::Xai,
+                            codewhale_config::ExternalCredentialSource::GrokCli,
+                            path.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        crate::external_credentials::reset_side_effect_trap();
+        let result = get_credentials(&config);
         let creds = result.expect("load");
         assert_eq!(creds.access_token, "test-access-token");
         assert_eq!(creds.client_id, GROK_OIDC_CLIENT_ID);
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn disabled_external_grok_credentials_cause_zero_external_io() {
+        let _guard = crate::test_support::lock_test_env();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("external-grok-auth.json");
+        let raw = serde_json::json!({
+            format!("{XAI_OIDC_ISSUER}::{GROK_OIDC_CLIENT_ID}"): {
+                "key": "must-never-be-read",
+                "refresh_token": "must-never-be-used",
+                "expires_at": rfc3339_from_now(3600),
+                "future_field": {"preserve": true}
+            }
+        })
+        .to_string();
+        fs::write(&path, &raw).unwrap();
+        let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
+        let config = Config {
+            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        crate::external_credentials::reset_side_effect_trap();
+        assert!(!credentials_valid(&config));
+        let error = get_credentials(&config).expect_err("external access is disabled");
+        assert!(error.to_string().contains("are disabled"));
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    #[test]
+    fn native_login_storage_is_codewhale_owned() {
+        let _guard = crate::test_support::lock_test_env();
+        let dir = TempDir::new().unwrap();
+        let grok_path = dir.path().join("external-grok-auth.json");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _grok = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &grok_path);
+
+        let owned = codewhale_auth_file_path().expect("Codewhale-owned auth path");
+        assert_eq!(owned, dir.path().join("credentials/xai-auth.json"));
+        assert_ne!(owned, auth_file_path());
     }
 
     #[test]
@@ -974,7 +1115,8 @@ mod tests {
         let _guard = crate::test_support::lock_test_env();
         let msg = missing_auth_message();
         assert!(msg.contains("xAI OAuth credentials not found"), "{msg}");
-        assert!(msg.contains("auth_mode"), "{msg}");
+        assert!(msg.contains("external-consent"), "{msg}");
+        assert!(msg.contains("Codewhale-owned OAuth storage"), "{msg}");
         assert!(msg.contains("XAI_API_KEY"), "{msg}");
     }
 

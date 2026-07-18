@@ -47,6 +47,7 @@ mod dependencies;
 mod error_taxonomy;
 mod eval;
 mod execpolicy;
+mod external_credentials;
 mod fast_hash;
 mod features;
 mod fleet;
@@ -3011,6 +3012,7 @@ enum ApiKeySource {
     Env,
     Config,
     Keyring,
+    OAuth,
     NoAuth,
     Missing,
 }
@@ -3022,6 +3024,25 @@ fn resolve_api_key_source(config: &Config) -> ApiKeySource {
         return ApiKeySource::NoAuth;
     }
     let custom_endpoint = config.provider_uses_custom_endpoint(provider);
+    if !custom_endpoint && provider == crate::config::ApiProvider::OpenaiCodex {
+        if crate::oauth::credentials_from_env().is_some() {
+            return ApiKeySource::Env;
+        }
+        return if crate::config::has_api_key_for(config, provider) {
+            ApiKeySource::OAuth
+        } else {
+            ApiKeySource::Missing
+        };
+    }
+    if !custom_endpoint
+        && provider == crate::config::ApiProvider::Xai
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
+        && crate::xai_oauth::credentials_valid(config)
+    {
+        return ApiKeySource::OAuth;
+    }
     if std::env::var("DEEPSEEK_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())
@@ -3154,6 +3175,10 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
         ),
         ApiKeySource::Config => println!(
             "  {} api_key: set via config",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
+        ApiKeySource::OAuth => println!(
+            "  {} oauth: ready via Codewhale-owned or explicitly consented read-only storage",
             "✓".truecolor(aqua_r, aqua_g, aqua_b)
         ),
         ApiKeySource::NoAuth => println!(
@@ -3362,6 +3387,30 @@ fn doctor_should_probe_api(
     !local || probe_local
 }
 
+/// Doctor must never turn credential inspection into a refresh/write path.
+/// OAuth connectivity is exercised by an ordinary user request instead;
+/// doctor limits itself to non-mutating readiness inspection.
+fn doctor_should_probe_auth(config: &Config) -> bool {
+    let provider = config.api_provider();
+    if provider == crate::config::ApiProvider::OpenaiCodex
+        && !config.provider_uses_custom_endpoint(provider)
+    {
+        return false;
+    }
+    let auth_mode = config.auth_mode_for_provider(provider);
+    if provider == crate::config::ApiProvider::Xai
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
+    {
+        return false;
+    }
+    !(provider == crate::config::ApiProvider::Moonshot
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token))
+}
+
 /// Run system diagnostics
 async fn run_doctor(
     config: &Config,
@@ -3550,11 +3599,12 @@ async fn run_doctor(
     println!("  · credential precedence: ~/.codewhale/config.toml, OS keyring, then env");
 
     let api_key_source = resolve_api_key_source(config);
-    let has_api_key = if config.deepseek_api_key().is_ok() {
+    let has_api_key = if crate::config::has_api_key_for(config, config.api_provider()) {
         let source_label = match api_key_source {
             ApiKeySource::Config => "config.toml",
             ApiKeySource::Keyring => "OS keyring",
             ApiKeySource::Env => "environment",
+            ApiKeySource::OAuth => "non-mutating OAuth readiness",
             ApiKeySource::NoAuth => "no-auth route",
             ApiKeySource::Missing
                 if matches!(
@@ -3620,6 +3670,7 @@ async fn run_doctor(
         );
     }
     if has_api_key
+        && doctor_should_probe_auth(config)
         && doctor_should_probe_api(config.api_provider(), &api_target.base_url, probe_local)
     {
         print!("  {} Testing connection...", "·".dimmed());
@@ -3675,6 +3726,14 @@ async fn run_doctor(
                 }
             }
         }
+    } else if has_api_key && !doctor_should_probe_auth(config) {
+        println!(
+            "  {} Live OAuth connectivity not checked by non-mutating doctor",
+            "·".dimmed()
+        );
+        println!(
+            "    Doctor never refreshes or rewrites credentials; exercise the route with a normal request."
+        );
     } else if has_api_key {
         println!(
             "  {} Live connectivity not checked for this local endpoint",
@@ -5050,6 +5109,7 @@ fn run_doctor_json(
         ApiKeySource::Env => "env",
         ApiKeySource::Config => "config",
         ApiKeySource::Keyring => "keyring",
+        ApiKeySource::OAuth => "oauth",
         ApiKeySource::NoAuth => "none",
         ApiKeySource::Missing => "missing",
     };
@@ -5427,6 +5487,7 @@ fn doctor_api_key_source_label(source: ApiKeySource) -> &'static str {
         ApiKeySource::Env => "env",
         ApiKeySource::Config => "config",
         ApiKeySource::Keyring => "keyring",
+        ApiKeySource::OAuth => "oauth",
         ApiKeySource::NoAuth => "none",
         ApiKeySource::Missing => "missing",
     }
@@ -6085,6 +6146,7 @@ fn run_logout() -> Result<()> {
 
 async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
     let _credentials = xai_oauth::device_code_login().await?;
+    config::revoke_external_credential_consent_for_at(config::ApiProvider::Xai, config_path)?;
     let saved =
         config::save_provider_auth_mode_for_at(config::ApiProvider::Xai, "oauth", config_path)?;
     println!(
@@ -10275,6 +10337,19 @@ mod doctor_setup_state_tests {
         let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
         let _codex_key = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
         let _codex_legacy_key = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let codex_auth_path = tmp.path().join("external-codex-auth.json");
+        let codex_auth_raw = serde_json::json!({
+            "tokens": {
+                "access_token": crate::test_support::future_test_jwt("doctor"),
+                "account_id": "acct-doctor-read-only",
+                "refresh_token": "must-never-be-used",
+                "unknown": {"preserve": true}
+            }
+        })
+        .to_string();
+        fs::write(&codex_auth_path, &codex_auth_raw).expect("Codex auth trap fixture");
+        let _codex_auth =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &codex_auth_path);
         let workspace = tmp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
 
@@ -10306,6 +10381,7 @@ mod doctor_setup_state_tests {
             provider: Some("openai-codex".to_string()),
             ..Config::default()
         };
+        crate::external_credentials::reset_side_effect_trap();
         let codex_report = doctor_setup_report_json(&codex_config, &workspace);
         assert_eq!(
             codex_report["provider_model"]["provider"]["id"],
@@ -10320,6 +10396,77 @@ mod doctor_setup_state_tests {
         assert_eq!(
             codex_report["provider_model"]["health"]["next_action"],
             "/setup provider or /provider setup <name>"
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "doctor must not stat or read external credentials without consent"
+        );
+
+        let mut consent = codewhale_config::ExternalCredentialConsentToml::read_only(
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            codex_auth_path.clone(),
+        );
+        let codex_read_only = Config {
+            provider: Some("openai-codex".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai_codex: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(consent.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        crate::external_credentials::reset_side_effect_trap();
+        let codex_read_only_report = doctor_setup_report_json(&codex_read_only, &workspace);
+        assert_eq!(
+            codex_read_only_report["provider_model"]["auth"]["present_or_local"],
+            true
+        );
+        assert_eq!(
+            codex_read_only_report["provider_model"]["auth"]["source"],
+            "oauth"
+        );
+        let (stats, reads) = crate::external_credentials::side_effect_trap_counts();
+        assert!(
+            stats > 0 && reads > 0,
+            "read-only doctor should inspect only after consent"
+        );
+        assert_eq!(
+            fs::read_to_string(&codex_auth_path).expect("unchanged Codex auth fixture"),
+            codex_auth_raw
+        );
+
+        consent.access = codewhale_config::ExternalCredentialAccess::Managed;
+        let codex_managed = Config {
+            provider: Some("openai-codex".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai_codex: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(consent),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        crate::external_credentials::reset_side_effect_trap();
+        let codex_managed_report = doctor_setup_report_json(&codex_managed, &workspace);
+        assert_eq!(
+            codex_managed_report["provider_model"]["auth"]["present_or_local"],
+            false
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "unsupported managed mode must fail before external I/O"
+        );
+        assert_eq!(
+            fs::read_to_string(&codex_auth_path).expect("unchanged managed auth fixture"),
+            codex_auth_raw
         );
 
         let local_config = Config {
@@ -13844,6 +13991,29 @@ mod doctor_live_probe_tests {
             "https://api.deepseek.com/beta",
             false,
         ));
+    }
+
+    #[test]
+    fn oauth_routes_skip_live_probe_to_keep_doctor_non_mutating() {
+        let codex = Config {
+            provider: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        assert!(!doctor_should_probe_auth(&codex));
+
+        let xai = Config {
+            provider: Some("xai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        assert!(!doctor_should_probe_auth(&xai));
+        assert!(doctor_should_probe_auth(&Config::default()));
     }
 }
 

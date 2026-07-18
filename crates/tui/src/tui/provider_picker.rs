@@ -157,7 +157,6 @@ pub enum ProviderAuthStatus {
     Optional,
     OAuthReady,
     OAuthMissing,
-    ImportedToken,
     ImportedTokenUnavailable,
     Local,
     Legacy,
@@ -416,6 +415,9 @@ impl ProviderDashboardRow {
         let no_auth = crate::config::auth_mode_disables_api_key(auth_mode.as_deref());
         let api_key_required = crate::config::auth_mode_requires_api_key(auth_mode.as_deref());
         let official_endpoint = !config.provider_uses_custom_endpoint(provider);
+        let xai_oauth_ready = provider == ApiProvider::Xai
+            && official_endpoint
+            && crate::xai_oauth::credentials_valid(config);
         let auth_status = auth_status_for(
             provider,
             has_key,
@@ -423,12 +425,10 @@ impl ProviderDashboardRow {
             no_auth,
             api_key_required,
             official_endpoint,
+            xai_oauth_ready,
         );
-        let usage_meter = if matches!(
-            auth_status,
-            ProviderAuthStatus::ImportedToken | ProviderAuthStatus::ImportedTokenUnavailable
-        ) {
-            "usage: Kimi imported token".to_string()
+        let usage_meter = if matches!(auth_status, ProviderAuthStatus::ImportedTokenUnavailable) {
+            "usage: Kimi API key required".to_string()
         } else {
             usage_meter_for(provider)
         };
@@ -564,14 +564,12 @@ impl ProviderDashboardRow {
                 )
             }
         };
-        let resolved_pricing = if matches!(
-            auth_status,
-            ProviderAuthStatus::ImportedToken | ProviderAuthStatus::ImportedTokenUnavailable
-        ) {
-            usage_meter
-        } else {
-            resolved_pricing
-        };
+        let resolved_pricing =
+            if matches!(auth_status, ProviderAuthStatus::ImportedTokenUnavailable) {
+                usage_meter
+            } else {
+                resolved_pricing
+            };
 
         if matches!(
             auth_status,
@@ -838,7 +836,6 @@ impl ProviderAuthStatus {
             Self::Optional => "key:optional",
             Self::OAuthReady => "auth:oauth-ready",
             Self::OAuthMissing => "auth:oauth-missing",
-            Self::ImportedToken => "auth:imported-token",
             Self::ImportedTokenUnavailable => "auth:imported-token-unavailable",
             Self::Local => "local",
             Self::Legacy => "legacy",
@@ -1005,6 +1002,7 @@ fn auth_status_for(
     no_auth: bool,
     api_key_required: bool,
     official_endpoint: bool,
+    xai_oauth_ready: bool,
 ) -> ProviderAuthStatus {
     if no_auth {
         return ProviderAuthStatus::NoAuth;
@@ -1039,11 +1037,7 @@ fn auth_status_for(
         && official_endpoint
         && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token)
     {
-        return if crate::config::kimi_imported_access_token_valid() {
-            ProviderAuthStatus::ImportedToken
-        } else {
-            ProviderAuthStatus::ImportedTokenUnavailable
-        };
+        return ProviderAuthStatus::ImportedTokenUnavailable;
     }
     if provider == ApiProvider::OpenaiCodex && official_endpoint {
         return if has_key {
@@ -1054,7 +1048,7 @@ fn auth_status_for(
     }
     if provider == ApiProvider::Xai
         && official_endpoint
-        && let Some(status) = xai_oauth_status(configured, crate::xai_oauth::credentials_valid())
+        && let Some(status) = xai_oauth_status(configured, xai_oauth_ready)
     {
         return status;
     }
@@ -1067,7 +1061,7 @@ fn auth_status_for(
 
 fn xai_oauth_status(
     configured: Option<&crate::config::ProviderConfig>,
-    credentials_present: bool,
+    oauth_credentials_present: bool,
 ) -> Option<ProviderAuthStatus> {
     let oauth_selected = configured
         .and_then(|entry| entry.auth_mode.as_deref())
@@ -1075,8 +1069,10 @@ fn xai_oauth_status(
     if !oauth_selected {
         return None;
     }
-    Some(if credentials_present {
+    Some(if oauth_credentials_present {
         ProviderAuthStatus::OAuthReady
+    } else if has_explicit_credential(ApiProvider::Xai, configured) {
+        ProviderAuthStatus::Configured
     } else {
         ProviderAuthStatus::OAuthMissing
     })
@@ -1137,7 +1133,7 @@ fn missing_auth_message(
     if provider == ApiProvider::Moonshot
         && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token)
     {
-        return "imported Kimi token unavailable; configure a Kimi Code API key".to_string();
+        return "Kimi OAuth is unavailable; configure a Kimi API key".to_string();
     }
     if provider == ApiProvider::Custom {
         if let Some(env_name) = configured
@@ -2027,9 +2023,9 @@ impl ProviderPickerView {
 
         let masked = mask_key(&self.api_key_input);
         let display = if codex_oauth {
-            "(run codex login; no token is stored here)".to_string()
+            "(run codex login; then explicitly grant read-only access)".to_string()
         } else if xai_oauth {
-            "(browser/device-code sign-in; tokens stay in ~/.grok/auth.json)".to_string()
+            "(browser/device-code sign-in; tokens use Codewhale-owned storage)".to_string()
         } else if masked.is_empty() {
             "(paste key here)".to_string()
         } else {
@@ -2053,13 +2049,19 @@ impl ProviderPickerView {
             "/provider"
         };
         let mut hint_lines = if codex_oauth {
-            vec![Line::from(Span::styled(
-                format!(
-                    "Run `codex login`, or set {} / CODEX_ACCESS_TOKEN and re-open {reopen_command}.",
-                    self.env_var_for_selected_row(),
-                ),
-                Style::default().fg(palette::TEXT_MUTED),
-            ))]
+            vec![
+                Line::from(Span::styled(
+                    "After `codex login`, run `codewhale auth external-consent --provider openai-codex --mode read-only`.",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "Or set {} / CODEX_ACCESS_TOKEN and re-open {reopen_command}.",
+                        self.env_var_for_selected_row(),
+                    ),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+            ]
         } else if xai_oauth {
             vec![Line::from(Span::styled(
                 "Press Enter for xAI device login, or use XAI_API_KEY and re-open this picker.",
@@ -3229,6 +3231,7 @@ mod tests {
             codex_text.contains("OPENAI_CODEX_ACCESS_TOKEN"),
             "{codex_text}"
         );
+        assert!(codex_text.contains("external-consent"), "{codex_text}");
         assert!(!codex_text.contains("Credentials:"), "{codex_text}");
         assert!(!codex_text.contains("(paste key here)"), "{codex_text}");
 
@@ -4773,7 +4776,7 @@ mod tests {
         let rendered = render_text(&picker, 96, 20);
         assert!(rendered.contains("OAuth login"));
         assert!(rendered.contains("device login"));
-        assert!(rendered.contains("~/.grok/auth.json"));
+        assert!(rendered.contains("Codewhale-owned storage"));
         assert!(!rendered.contains("(paste key here)"));
 
         assert!(picker.handle_paste("xai-token"));
@@ -4800,6 +4803,16 @@ mod tests {
         );
         assert_eq!(xai_oauth_status(None, true), None);
         assert_eq!(xai_oauth_status(None, false), None);
+
+        let fallback_key = crate::config::ProviderConfig {
+            auth_mode: Some("oauth".to_string()),
+            api_key: Some("xai-api-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            xai_oauth_status(Some(&fallback_key), false),
+            Some(ProviderAuthStatus::Configured)
+        );
     }
 
     #[test]
@@ -4849,7 +4862,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_kimi_import_is_labeled_and_usable_only_while_unexpired() {
+    fn explicit_legacy_kimi_import_is_unavailable_and_routes_to_api_key_setup() {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("Kimi import fixture root");
         let kimi_home = temp.path().join("kimi-code");
@@ -4888,25 +4901,23 @@ mod tests {
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
         move_to_provider(&mut picker, ApiProvider::Moonshot);
         let row = &picker.rows[picker.selected_idx];
-        assert_eq!(row.auth_status, ProviderAuthStatus::ImportedToken);
-        assert_eq!(row.credential_state, CredentialState::ImportedToken);
+        assert_eq!(
+            row.auth_status,
+            ProviderAuthStatus::ImportedTokenUnavailable
+        );
+        assert_eq!(row.credential_state, CredentialState::MissingKey);
         assert_eq!(row.base_url, crate::config::DEFAULT_KIMI_CODE_BASE_URL);
         assert_eq!(
             row.default_route.logical_model,
             crate::config::DEFAULT_KIMI_CODE_MODEL
         );
-        assert_eq!(row.usage_meter, "usage: Kimi imported token");
-        assert_eq!(
-            row.readiness,
-            ResolvedProviderReadiness::ImportedTokenUnchecked
-        );
+        assert_eq!(row.usage_meter, "usage: Kimi API key required");
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
         assert!(matches!(
             picker.handle_key(key(KeyCode::Enter)),
-            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
-                provider: ApiProvider::Moonshot,
-                ..
-            })
+            ViewAction::None
         ));
+        assert_eq!(picker.stage, Stage::KeyEntry);
     }
 
     #[test]

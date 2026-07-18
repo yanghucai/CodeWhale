@@ -122,6 +122,7 @@ pub(crate) fn auth_class_for_provider(
         && auth_mode
             .as_deref()
             .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
+        && crate::xai_oauth::credentials_valid(config)
     {
         return ProviderAuthClass::OAuth;
     }
@@ -243,14 +244,9 @@ pub(crate) fn credential_state_for_provider(
             .as_deref()
             .is_some_and(crate::config::auth_mode_uses_kimi_imported_token);
     if uses_kimi_imported_token {
-        return if crate::config::kimi_imported_access_token_valid() {
-            CredentialState::ImportedToken
-        } else {
-            // CodeWhale cannot refresh or create Kimi OAuth credentials without
-            // its own vendor registration. The actionable supported recovery is
-            // a Kimi Code API key, not another CodeWhale login attempt (#4417).
-            CredentialState::MissingKey
-        };
+        // Kimi remains API-key-only until Codewhale has its own registered
+        // OAuth client identity. Never inspect Kimi CLI storage here.
+        return CredentialState::MissingKey;
     }
     if provider == ApiProvider::OpenaiCodex && official_endpoint {
         return if crate::config::has_api_key_for(config, provider) {
@@ -265,7 +261,9 @@ pub(crate) fn credential_state_for_provider(
             .as_deref()
             .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth);
     if xai_oauth_selected {
-        return if crate::xai_oauth::credentials_valid() {
+        return if crate::xai_oauth::credentials_valid(config)
+            || explicit_provider_credential_present(config, provider)
+        {
             CredentialState::Saved
         } else {
             CredentialState::MissingLogin
@@ -910,9 +908,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_import_and_oauth_files_are_not_ready() {
+    fn disabled_external_imports_are_not_probed_by_readiness() {
         let _lock = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("oauth fixture root");
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
         let kimi_home = temp.path().join("kimi");
         std::fs::create_dir_all(kimi_home.join("credentials")).expect("kimi credentials dir");
         std::fs::write(kimi_home.join("credentials/kimi-code.json"), "{not-json")
@@ -943,6 +942,7 @@ mod tests {
             ..Default::default()
         };
 
+        crate::external_credentials::reset_side_effect_trap();
         assert_eq!(
             credential_state_for_provider(&config, ApiProvider::Moonshot),
             CredentialState::MissingKey,
@@ -951,6 +951,20 @@ mod tests {
         assert_eq!(
             credential_state_for_provider(&config, ApiProvider::Xai),
             CredentialState::MissingLogin
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "readiness must not inspect external OAuth files without consent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(kimi_home.join("credentials/kimi-code.json"))
+                .expect("Kimi fixture unchanged"),
+            "{not-json"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&grok_path).expect("Grok fixture unchanged"),
+            "{}"
         );
 
         let api_key_config = crate::config::Config {

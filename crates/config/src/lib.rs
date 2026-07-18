@@ -1,5 +1,6 @@
 pub mod auth_source;
 pub mod catalog;
+pub mod external_credentials;
 mod harness;
 pub mod model_reference;
 pub mod models_dev;
@@ -42,6 +43,10 @@ pub use codewhale_execpolicy::ToolAskRule;
 use codewhale_execpolicy::{ExecPolicyEngine, Ruleset};
 use codewhale_secrets::SecretSource;
 pub use codewhale_secrets::Secrets;
+pub use external_credentials::{
+    EXTERNAL_CREDENTIAL_CONSENT_VERSION, ExternalCredentialAccess, ExternalCredentialConsentToml,
+    ExternalCredentialReadGrant, ExternalCredentialSource, resolve_external_credential_path,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -102,6 +107,10 @@ pub struct ProviderConfigToml {
     pub path_suffix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ProviderAuthSourceToml>,
+    /// Explicit consent for reading one exact credential file owned by
+    /// another CLI. Absence means disabled and must not trigger discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_credentials: Option<ExternalCredentialConsentToml>,
 }
 
 impl ProviderConfigToml {
@@ -119,6 +128,7 @@ impl ProviderConfigToml {
             && http_headers_are_effectively_empty(&self.http_headers)
             && blank(self.path_suffix.as_ref())
             && self.auth.is_none()
+            && self.external_credentials.is_none()
     }
 }
 
