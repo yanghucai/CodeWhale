@@ -1502,6 +1502,11 @@ async fn submit_user_input(
         .submit_user_input(&thread_id, &input_id, response)
         .await
         .map_err(map_thread_err)?;
+    if !delivered {
+        return Err(ApiError::not_found(format!(
+            "no pending user-input request with id '{input_id}'"
+        )));
+    }
     Ok(Json(SubmitUserInputResponse {
         ok: true,
         input_id,

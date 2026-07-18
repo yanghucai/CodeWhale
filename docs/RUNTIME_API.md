@@ -421,7 +421,15 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 
 Submitted values are delivered to the active model turn but are deliberately
 excluded from durable Runtime items and events. The settled tool item contains
-only a neutral receipt and a machine-readable `response_redacted` marker.
+only a neutral receipt and a machine-readable `response_redacted` marker. The
+Runtime accepts only an exact pending `(thread_id, input_id)` request; an
+unknown, concurrently settling, or already settled id returns 404 and is never
+placed in the engine mailbox. It commits the secret-free
+`user_input.answered` receipt before removing the snapshot-authoritative prompt
+or delivering the answer to the engine. That settlement runs independently of
+the HTTP connection, so disconnecting after submission cannot leave a prompt
+half accepted. Terminal-turn cancellation follows the same receipt-before-
+removal ordering through `user_input.canceled`.
 
 **Client-executed dynamic tools**
 - `POST /v1/threads/{thread_id}/turns/{turn_id}/tool-calls/{call_id}/result`

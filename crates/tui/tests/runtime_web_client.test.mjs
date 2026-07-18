@@ -437,6 +437,30 @@ test("hydrates pending attention from a reload snapshot and clears cancellation 
   assert.equal(state.userInputs.has("input-reload"), false);
 });
 
+test("turn completion defensively clears attention owned by that turn", () => {
+  const state = createThreadState("thread-a");
+  assert.equal(applySnapshot(state, {
+    ...snapshot(),
+    pending_approvals: [{ id: "approval-terminal", turn_id: "turn-1" }],
+    pending_user_inputs: [{ id: "input-terminal", turn_id: "turn-1", request: { questions: [] } }],
+    pending_dynamic_tool_calls: [{ call_id: "call-terminal", turn_id: "turn-1", tool: "lookup" }],
+  }), true);
+  state.approvals.set("approval-other", { id: "approval-other", turn_id: "turn-other" });
+  state.userInputs.set("input-other", { id: "input-other", turn_id: "turn-other" });
+  state.dynamicToolCalls.set("call-other", { call_id: "call-other", turn_id: "turn-other" });
+
+  assert.equal(applyRuntimeEvent(
+    state,
+    runtimeEvent(8, "turn.completed", { turn: { id: "turn-1", status: "completed" } }),
+  ), true);
+  assert.equal(state.approvals.has("approval-terminal"), false);
+  assert.equal(state.userInputs.has("input-terminal"), false);
+  assert.equal(state.dynamicToolCalls.has("call-terminal"), false);
+  assert.equal(state.approvals.has("approval-other"), true);
+  assert.equal(state.userInputs.has("input-other"), true);
+  assert.equal(state.dynamicToolCalls.has("call-other"), true);
+});
+
 test("dynamic tool calls hydrate and disappear exactly once across terminal variants", () => {
   const state = createThreadState("thread-a");
   assert.equal(applySnapshot(state, {

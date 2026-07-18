@@ -101,6 +101,9 @@ export function applyRuntimeEvent(state, envelope) {
     state.thread = payload.thread;
   } else if (eventName === "turn.started" || eventName === "turn.completed") {
     if (payload.turn) upsertTurn(state, payload.turn);
+    if (eventName === "turn.completed") {
+      clearTurnAttention(state, envelope.turn_id || payload.turn?.id || "");
+    }
   } else if (eventName === "turn.lifecycle") {
     const turnId = envelope.turn_id;
     const turn = turnId ? state.turns.get(turnId) : null;
@@ -126,18 +129,33 @@ export function applyRuntimeEvent(state, envelope) {
     appendItemDelta(state, envelope.item_id, payload);
   } else if (eventName === "approval.required") {
     const approvalId = payload.approval_id || payload.id;
-    if (approvalId) state.approvals.set(approvalId, payload);
+    if (approvalId) {
+      state.approvals.set(approvalId, {
+        ...payload,
+        turn_id: payload.turn_id || envelope.turn_id || "",
+      });
+    }
   } else if (eventName === "approval.decided" || eventName === "approval.timeout") {
     const approvalId = payload.approval_id || payload.id;
     if (approvalId) state.approvals.delete(approvalId);
   } else if (eventName === "user_input.required") {
     const inputId = payload.id;
-    if (inputId) state.userInputs.set(inputId, payload);
+    if (inputId) {
+      state.userInputs.set(inputId, {
+        ...payload,
+        turn_id: payload.turn_id || envelope.turn_id || "",
+      });
+    }
   } else if (eventName === "user_input.answered" || eventName === "user_input.canceled") {
     const inputId = payload.input_id || payload.id;
     if (inputId) state.userInputs.delete(inputId);
   } else if (eventName === "tool_call.requested") {
-    if (payload.call_id) state.dynamicToolCalls.set(payload.call_id, payload);
+    if (payload.call_id) {
+      state.dynamicToolCalls.set(payload.call_id, {
+        ...payload,
+        turn_id: payload.turn_id || envelope.turn_id || "",
+      });
+    }
   } else if (
     eventName === "tool_call.resolved"
     || eventName === "tool_call.canceled"
@@ -146,6 +164,18 @@ export function applyRuntimeEvent(state, envelope) {
     if (payload.call_id) state.dynamicToolCalls.delete(payload.call_id);
   }
   return true;
+}
+
+function clearTurnAttention(state, turnId) {
+  for (const [id, approval] of state.approvals) {
+    if (!approval?.turn_id || approval.turn_id === turnId) state.approvals.delete(id);
+  }
+  for (const [id, input] of state.userInputs) {
+    if (!input?.turn_id || input.turn_id === turnId) state.userInputs.delete(id);
+  }
+  for (const [id, call] of state.dynamicToolCalls) {
+    if (!call?.turn_id || call.turn_id === turnId) state.dynamicToolCalls.delete(id);
+  }
 }
 
 export function runtimeEventContinuity(state, envelope) {

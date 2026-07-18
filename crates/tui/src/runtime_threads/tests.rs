@@ -3649,6 +3649,287 @@ async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Re
 }
 
 #[tokio::test]
+async fn unknown_user_input_id_is_not_delivered_to_engine() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let delivered = manager
+        .submit_user_input(
+            &thread.id,
+            "input_missing",
+            crate::tools::user_input::UserInputResponse {
+                answers: vec![crate::tools::user_input::UserInputAnswer {
+                    id: "choice".to_string(),
+                    label: "Missing".to_string(),
+                    value: "must-not-enter-engine-mailbox".to_string(),
+                }],
+            },
+        )
+        .await?;
+    assert!(!delivered);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            harness.recv_user_input_submission()
+        )
+        .await
+        .is_err(),
+        "unknown request entered the engine mailbox"
+    );
+    assert!(manager.events_since(&thread.id, None)?.iter().all(|event| {
+        !matches!(
+            event.event.as_str(),
+            "user_input.answered" | "user_input.canceled"
+        )
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_receipt_append_failure_restores_request_without_delivery() -> Result<()> {
+    const SECRET: &str = "answer-only-for-engine-after-retry";
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager.register_pending_user_input(
+        &thread.id,
+        PendingUserInputRequest {
+            id: "input_retry".to_string(),
+            turn_id: "turn_retry".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        },
+    );
+    let response = || crate::tools::user_input::UserInputResponse {
+        answers: vec![crate::tools::user_input::UserInputAnswer {
+            id: "choice".to_string(),
+            label: "Retry".to_string(),
+            value: SECRET.to_string(),
+        }],
+    };
+
+    let fault_guard = EventAppendFaultGuard::arm(&thread.id, EventAppendTestFault::AfterSync);
+    let error = manager
+        .submit_user_input(&thread.id, "input_retry", response())
+        .await
+        .expect_err("injected receipt append unexpectedly succeeded");
+    drop(fault_guard);
+    assert!(format!("{error:#}").contains("rolled back"));
+    assert_eq!(
+        manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .pending_user_inputs
+            .len(),
+        1,
+        "retry-safe append failure removed the authoritative prompt"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            harness.recv_user_input_submission()
+        )
+        .await
+        .is_err(),
+        "answer reached the engine before its receipt was durable"
+    );
+
+    assert!(
+        manager
+            .submit_user_input(&thread.id, "input_retry", response())
+            .await?,
+        "restored request was not retryable"
+    );
+    let (_, delivered) =
+        tokio::time::timeout(Duration::from_secs(2), harness.recv_user_input_submission())
+            .await
+            .context("retried answer did not reach the engine")?
+            .context("retried answer was canceled")?;
+    assert_eq!(delivered.answers[0].value, SECRET);
+    let events = manager.events_since(&thread.id, None)?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event == "user_input.answered")
+            .count(),
+        1
+    );
+    assert!(!serde_json::to_string(&events)?.contains(SECRET));
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_settlement_outlives_canceled_api_future() -> Result<()> {
+    const SECRET: &str = "answer-survives-request-disconnect";
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager.register_pending_user_input(
+        &thread.id,
+        PendingUserInputRequest {
+            id: "input_detached".to_string(),
+            turn_id: "turn_detached".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        },
+    );
+
+    let emit_guard = manager.event_emit.lock().await;
+    let submit_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let submission = tokio::spawn(async move {
+        submit_manager
+            .submit_user_input(
+                &thread_id,
+                "input_detached",
+                crate::tools::user_input::UserInputResponse {
+                    answers: vec![crate::tools::user_input::UserInputAnswer {
+                        id: "choice".to_string(),
+                        label: "Continue".to_string(),
+                        value: SECRET.to_string(),
+                    }],
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager
+                .pending_user_inputs
+                .lock()
+                .get(&(thread.id.clone(), "input_detached".to_string()))
+                .is_some_and(|entry| entry.settling)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("submission did not claim the pending request")?;
+    submission.abort();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            harness.recv_user_input_submission()
+        )
+        .await
+        .is_err(),
+        "answer reached the engine before its receipt append was released"
+    );
+    drop(emit_guard);
+
+    let (_, delivered) =
+        tokio::time::timeout(Duration::from_secs(2), harness.recv_user_input_submission())
+            .await
+            .context("detached settlement did not reach the engine")?
+            .context("detached settlement was canceled")?;
+    assert_eq!(delivered.answers[0].value, SECRET);
+    let detail = manager.get_thread_detail(&thread.id).await?;
+    assert!(detail.pending_user_inputs.is_empty());
+    let events = manager.events_since(&thread.id, None)?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event == "user_input.answered")
+            .count(),
+        1
+    );
+    assert!(!serde_json::to_string(&events)?.contains(SECRET));
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_user_input_cancellation_is_durable_before_engine_delivery() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager.register_pending_user_input(
+        &thread.id,
+        PendingUserInputRequest {
+            id: "input_terminal_order".to_string(),
+            turn_id: "turn_terminal_order".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        },
+    );
+
+    let emit_guard = manager.event_emit.lock().await;
+    let engine = harness.handle.clone();
+    let settle_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let settlement = tokio::spawn(async move {
+        settle_manager
+            .settle_user_inputs_for_terminal_turn(&thread_id, "turn_terminal_order", Some(engine))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager
+                .pending_user_inputs
+                .lock()
+                .get(&(thread.id.clone(), "input_terminal_order".to_string()))
+                .is_some_and(|entry| entry.settling)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("terminal cancellation did not claim the request")?;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            harness.recv_user_input_submission()
+        )
+        .await
+        .is_err(),
+        "terminal cancellation reached the engine before durable append"
+    );
+    drop(emit_guard);
+    settlement
+        .await
+        .context("terminal settlement task panicked")??;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), harness.recv_user_input_submission())
+            .await
+            .context("engine did not receive terminal cancellation")?
+            .is_none(),
+        "terminal cancellation delivered a submitted response"
+    );
+    let events = manager.events_since(&thread.id, None)?;
+    let canceled = events
+        .iter()
+        .find(|event| {
+            event.event == "user_input.canceled"
+                && event.payload.get("input_id").and_then(Value::as_str)
+                    == Some("input_terminal_order")
+        })
+        .context("missing terminal cancellation receipt")?;
+    assert_eq!(canceled.payload["terminal"], true);
+    assert!(
+        manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .pending_user_inputs
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_detail_cursor_precedes_projection_reads_at_terminal_boundary() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager

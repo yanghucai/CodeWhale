@@ -560,6 +560,14 @@ impl std::fmt::Display for RuntimeEventAppendError {
 
 impl std::error::Error for RuntimeEventAppendError {}
 
+fn event_append_is_indeterminate(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<RuntimeEventAppendError>()
+            .is_some_and(|append| !append.retry_safe())
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeThreadStore {
     threads_dir: PathBuf,
@@ -1309,8 +1317,7 @@ pub struct RuntimeThreadManager {
     automations:
         Arc<parking_lot::Mutex<Option<crate::automation_manager::SharedAutomationManager>>>,
     pending_approvals: Arc<parking_lot::Mutex<HashMap<String, PendingApprovalEntry>>>,
-    pending_user_inputs:
-        Arc<parking_lot::Mutex<HashMap<(String, String), PendingUserInputRequest>>>,
+    pending_user_inputs: Arc<parking_lot::Mutex<HashMap<(String, String), PendingUserInputEntry>>>,
     pending_dynamic_tools: Arc<parking_lot::Mutex<HashMap<String, PendingDynamicToolEntry>>>,
     recovery_receipts: Arc<parking_lot::Mutex<HashMap<String, Vec<RecoveredTurnReceipt>>>>,
     recovery_flush: Arc<Mutex<()>>,
@@ -1368,6 +1375,31 @@ struct PendingApprovalEntry {
     thread_id: String,
     request: PendingApprovalRequest,
     sender: oneshot::Sender<ExternalApprovalDecision>,
+}
+
+struct PendingUserInputEntry {
+    request: PendingUserInputRequest,
+    /// A request remains snapshot-visible while its winner appends the
+    /// secret-free terminal receipt. This prevents a snapshot cursor from
+    /// observing neither the pending prompt nor its settlement event.
+    settling: bool,
+    settlement_tx: watch::Sender<u64>,
+    /// An append whose rollback failed may or may not be durable. Never send
+    /// the answer or allow a retry in that state: either could disclose or
+    /// duplicate a response whose receipt cannot be established safely.
+    indeterminate: bool,
+}
+
+enum PendingUserInputClaim {
+    Claimed(PendingUserInputRequest),
+    Settling,
+    Indeterminate,
+    Missing,
+}
+
+enum UserInputTerminalOutcome {
+    Answered(crate::tools::user_input::UserInputResponse),
+    Canceled { terminal: bool },
 }
 
 struct PendingDynamicToolEntry {
@@ -1655,19 +1687,129 @@ impl RuntimeThreadManager {
     }
 
     fn register_pending_user_input(&self, thread_id: &str, request: PendingUserInputRequest) {
-        self.pending_user_inputs
-            .lock()
-            .insert((thread_id.to_string(), request.id.clone()), request);
+        let (settlement_tx, _settlement_rx) = watch::channel(0);
+        self.pending_user_inputs.lock().insert(
+            (thread_id.to_string(), request.id.clone()),
+            PendingUserInputEntry {
+                request,
+                settling: false,
+                settlement_tx,
+                indeterminate: false,
+            },
+        );
     }
 
-    fn take_pending_user_input(
+    fn claim_pending_user_input(&self, thread_id: &str, input_id: &str) -> PendingUserInputClaim {
+        let mut pending = self.pending_user_inputs.lock();
+        let Some(entry) = pending.get_mut(&(thread_id.to_string(), input_id.to_string())) else {
+            return PendingUserInputClaim::Missing;
+        };
+        if entry.indeterminate {
+            return PendingUserInputClaim::Indeterminate;
+        }
+        if entry.settling {
+            return PendingUserInputClaim::Settling;
+        }
+        entry.settling = true;
+        PendingUserInputClaim::Claimed(entry.request.clone())
+    }
+
+    fn discard_pending_user_input_registration(&self, thread_id: &str, input_id: &str) {
+        let key = (thread_id.to_string(), input_id.to_string());
+        let mut pending = self.pending_user_inputs.lock();
+        if pending.get(&key).is_some_and(|entry| !entry.settling) {
+            pending.remove(&key);
+        }
+    }
+
+    fn claim_pending_user_inputs_for_turn(
         &self,
         thread_id: &str,
-        input_id: &str,
-    ) -> Option<PendingUserInputRequest> {
-        self.pending_user_inputs
+        turn_id: &str,
+    ) -> Result<(Vec<PendingUserInputRequest>, Vec<watch::Receiver<u64>>)> {
+        let mut pending = self.pending_user_inputs.lock();
+        if let Some((_, entry)) = pending.iter().find(|((pending_thread_id, _), entry)| {
+            pending_thread_id == thread_id
+                && entry.request.turn_id == turn_id
+                && entry.indeterminate
+        }) {
+            bail!(
+                "User-input request '{}' has an indeterminate terminal receipt; inspect Runtime storage before completing turn '{turn_id}'",
+                entry.request.id
+            );
+        }
+        let mut claims = Vec::new();
+        let mut settling = Vec::new();
+        for ((pending_thread_id, _), entry) in pending.iter_mut() {
+            if pending_thread_id != thread_id || entry.request.turn_id != turn_id {
+                continue;
+            }
+            if entry.settling {
+                settling.push(entry.settlement_tx.subscribe());
+                continue;
+            }
+            entry.settling = true;
+            claims.push(entry.request.clone());
+        }
+        Ok((claims, settling))
+    }
+
+    fn restore_pending_user_input_claim(&self, thread_id: &str, request: &PendingUserInputRequest) {
+        let settlement_tx = if let Some(entry) = self
+            .pending_user_inputs
             .lock()
-            .remove(&(thread_id.to_string(), input_id.to_string()))
+            .get_mut(&(thread_id.to_string(), request.id.clone()))
+            && entry.request.turn_id == request.turn_id
+        {
+            entry.settling = false;
+            entry.indeterminate = false;
+            Some(entry.settlement_tx.clone())
+        } else {
+            None
+        };
+        if let Some(settlement_tx) = settlement_tx {
+            settlement_tx.send_modify(|epoch| *epoch = epoch.saturating_add(1));
+        }
+    }
+
+    fn mark_pending_user_input_indeterminate(
+        &self,
+        thread_id: &str,
+        request: &PendingUserInputRequest,
+    ) {
+        let settlement_tx = if let Some(entry) = self
+            .pending_user_inputs
+            .lock()
+            .get_mut(&(thread_id.to_string(), request.id.clone()))
+            && entry.request.turn_id == request.turn_id
+        {
+            entry.settling = true;
+            entry.indeterminate = true;
+            Some(entry.settlement_tx.clone())
+        } else {
+            None
+        };
+        if let Some(settlement_tx) = settlement_tx {
+            settlement_tx.send_modify(|epoch| *epoch = epoch.saturating_add(1));
+        }
+    }
+
+    fn finish_pending_user_input_settlement(
+        &self,
+        thread_id: &str,
+        request: &PendingUserInputRequest,
+    ) -> Option<watch::Sender<u64>> {
+        let mut pending = self.pending_user_inputs.lock();
+        let key = (thread_id.to_string(), request.id.clone());
+        let settlement_tx = if pending.get(&key).is_some_and(|entry| {
+            entry.request.turn_id == request.turn_id && entry.settling && !entry.indeterminate
+        }) {
+            pending.remove(&key).map(|entry| entry.settlement_tx)
+        } else {
+            None
+        };
+        drop(pending);
+        settlement_tx
     }
 
     fn pending_requests_for_thread(
@@ -1692,7 +1834,7 @@ impl RuntimeThreadManager {
             .lock()
             .iter()
             .filter(|((pending_thread_id, _), _)| pending_thread_id == thread_id)
-            .map(|(_, request)| request.clone())
+            .map(|(_, entry)| entry.request.clone())
             .collect::<Vec<_>>();
         user_inputs.sort_by(|left, right| {
             left.turn_id
@@ -1700,24 +1842,6 @@ impl RuntimeThreadManager {
                 .then_with(|| left.id.cmp(&right.id))
         });
         (approvals, user_inputs)
-    }
-
-    fn clear_pending_user_inputs_for_turn(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-    ) -> Vec<PendingUserInputRequest> {
-        let mut pending = self.pending_user_inputs.lock();
-        let keys = pending
-            .iter()
-            .filter(|((pending_thread_id, _), request)| {
-                pending_thread_id == thread_id && request.turn_id == turn_id
-            })
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        keys.into_iter()
-            .filter_map(|key| pending.remove(&key))
-            .collect()
     }
 
     fn register_pending_dynamic_tool(
@@ -1933,18 +2057,35 @@ impl RuntimeThreadManager {
             };
             state.engine.clone()
         };
-        engine.submit_user_input(input_id, response).await?;
-        if let Some(pending) = self.take_pending_user_input(thread_id, input_id) {
-            self.emit_event(
-                thread_id,
-                Some(&pending.turn_id),
-                None,
-                "user_input.answered",
-                json!({ "id": input_id, "input_id": input_id }),
-            )
-            .await?;
-        }
-        Ok(true)
+        let request = match self.claim_pending_user_input(thread_id, input_id) {
+            PendingUserInputClaim::Claimed(request) => request,
+            PendingUserInputClaim::Missing | PendingUserInputClaim::Settling => {
+                return Ok(false);
+            }
+            PendingUserInputClaim::Indeterminate => {
+                bail!(
+                    "User-input request '{input_id}' has an indeterminate terminal receipt; inspect Runtime storage before retrying"
+                );
+            }
+        };
+
+        // This child task deliberately outlives the HTTP future. Once a
+        // request is claimed, client disconnect/cancellation cannot strand it
+        // between durable acceptance and engine delivery.
+        let manager = self.clone();
+        let thread_id = thread_id.to_string();
+        tokio::spawn(async move {
+            manager
+                .settle_claimed_user_input(
+                    &thread_id,
+                    Some(engine),
+                    request,
+                    UserInputTerminalOutcome::Answered(response),
+                )
+                .await
+        })
+        .await
+        .context("User-input settlement task failed")?
     }
 
     #[allow(dead_code)]
@@ -1956,18 +2097,118 @@ impl RuntimeThreadManager {
             };
             state.engine.clone()
         };
-        engine.cancel_user_input(input_id).await?;
-        if let Some(pending) = self.take_pending_user_input(thread_id, input_id) {
-            self.emit_event(
-                thread_id,
-                Some(&pending.turn_id),
-                None,
+        let request = match self.claim_pending_user_input(thread_id, input_id) {
+            PendingUserInputClaim::Claimed(request) => request,
+            PendingUserInputClaim::Missing | PendingUserInputClaim::Settling => {
+                return Ok(false);
+            }
+            PendingUserInputClaim::Indeterminate => {
+                bail!(
+                    "User-input request '{input_id}' has an indeterminate terminal receipt; inspect Runtime storage before retrying"
+                );
+            }
+        };
+        let manager = self.clone();
+        let thread_id = thread_id.to_string();
+        tokio::spawn(async move {
+            manager
+                .settle_claimed_user_input(
+                    &thread_id,
+                    Some(engine),
+                    request,
+                    UserInputTerminalOutcome::Canceled { terminal: false },
+                )
+                .await
+        })
+        .await
+        .context("User-input cancellation task failed")?
+    }
+
+    async fn settle_claimed_user_input(
+        &self,
+        thread_id: &str,
+        engine: Option<EngineHandle>,
+        request: PendingUserInputRequest,
+        outcome: UserInputTerminalOutcome,
+    ) -> Result<bool> {
+        let projection_lock = self.projection_lock(thread_id);
+        let _projection = projection_lock.lock().await;
+        let (event, payload) = match &outcome {
+            UserInputTerminalOutcome::Answered(_) => (
+                "user_input.answered",
+                json!({ "id": &request.id, "input_id": &request.id }),
+            ),
+            UserInputTerminalOutcome::Canceled { terminal } => (
                 "user_input.canceled",
-                json!({ "id": input_id, "input_id": input_id }),
-            )
-            .await?;
+                json!({
+                    "id": &request.id,
+                    "input_id": &request.id,
+                    "terminal": terminal,
+                }),
+            ),
+        };
+        if let Err(error) = self
+            .emit_event(thread_id, Some(&request.turn_id), None, event, payload)
+            .await
+        {
+            if event_append_is_indeterminate(&error) {
+                self.mark_pending_user_input_indeterminate(thread_id, &request);
+            } else {
+                self.restore_pending_user_input_claim(thread_id, &request);
+            }
+            return Err(error);
         }
+        let settlement_tx = self.finish_pending_user_input_settlement(thread_id, &request);
+        drop(_projection);
+
+        let delivery_result = match (engine, outcome) {
+            (Some(engine), UserInputTerminalOutcome::Answered(response)) => {
+                engine.submit_user_input(&request.id, response).await
+            }
+            (Some(engine), UserInputTerminalOutcome::Canceled { .. }) => {
+                if let Err(error) = engine.cancel_user_input(&request.id).await {
+                    tracing::debug!(
+                        thread_id,
+                        input_id = %request.id,
+                        "User-input cancellation was durable after engine mailbox closed: {error}"
+                    );
+                }
+                Ok(())
+            }
+            (None, _) => Ok(()),
+        };
+        if let Some(settlement_tx) = settlement_tx {
+            settlement_tx.send_modify(|epoch| *epoch = epoch.saturating_add(1));
+        }
+        delivery_result?;
         Ok(true)
+    }
+
+    async fn settle_user_inputs_for_terminal_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        engine: Option<EngineHandle>,
+    ) -> Result<()> {
+        loop {
+            let (requests, settling) =
+                self.claim_pending_user_inputs_for_turn(thread_id, turn_id)?;
+            for request in requests {
+                self.settle_claimed_user_input(
+                    thread_id,
+                    engine.clone(),
+                    request,
+                    UserInputTerminalOutcome::Canceled { terminal: true },
+                )
+                .await?;
+            }
+            if settling.is_empty() {
+                return Ok(());
+            }
+            for mut progress in settling {
+                let _ = progress.changed().await;
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -2186,6 +2427,15 @@ impl RuntimeThreadManager {
             // static restart-recovery receipts below. Startup recovery has no
             // live registry entries, so this is a no-op in that case.
             self.settle_dynamic_tools_for_terminal_turn(thread_id, &receipt.turn.id)
+                .await?;
+            let engine = {
+                let active = self.active.lock().await;
+                active
+                    .engines
+                    .get(thread_id)
+                    .map(|state| state.engine.clone())
+            };
+            self.settle_user_inputs_for_terminal_turn(thread_id, &receipt.turn.id, engine)
                 .await?;
 
             let projection_lock = self.projection_lock(thread_id);
@@ -3657,9 +3907,7 @@ impl RuntimeThreadManager {
         }
 
         // A failed turn can no longer answer an outstanding prompt. Mirror the
-        // happy terminal path: clear pending user inputs before publishing the
-        // terminal receipt so fresh snapshots never resurrect stale attention
-        // UI, and notify already-connected clients as well.
+        // happy terminal path's receipt-before-removal ordering.
         let engine_for_cancel = {
             let active = self.active.lock().await;
             active
@@ -3667,29 +3915,21 @@ impl RuntimeThreadManager {
                 .get(thread_id)
                 .map(|state| state.engine.clone())
         };
-        if let Some(engine) = engine_for_cancel {
-            for pending in self.clear_pending_user_inputs_for_turn(thread_id, turn_id) {
-                let _ = engine.cancel_user_input(&pending.id).await;
-                if let Err(err) = self
-                    .emit_event(
-                        thread_id,
-                        Some(turn_id),
-                        None,
-                        "user_input.canceled",
-                        json!({ "id": pending.id, "input_id": pending.id, "terminal": true }),
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to emit user-input cancellation after monitor failure: {err}"
-                    );
-                }
+        let user_inputs_settled = if let Err(err) = self
+            .settle_user_inputs_for_terminal_turn(thread_id, turn_id, engine_for_cancel)
+            .await
+        {
+            tracing::error!("Failed to emit user-input cancellation after monitor failure: {err}");
+            if let Some(turn) = terminal_turn.as_ref() {
+                self.queue_recovery_receipt(RecoveredTurnReceipt {
+                    turn: turn.clone(),
+                    unresolved_dynamic_tools: Vec::new(),
+                });
             }
+            false
         } else {
-            // The engine is already gone; still drop the registrations so
-            // snapshots stop advertising prompts nobody can answer.
-            let _ = self.clear_pending_user_inputs_for_turn(thread_id, turn_id);
-        }
+            true
+        };
 
         let dynamic_tools_settled = if let Err(err) = self
             .settle_dynamic_tools_for_terminal_turn(thread_id, turn_id)
@@ -3709,7 +3949,8 @@ impl RuntimeThreadManager {
             true
         };
 
-        if dynamic_tools_settled
+        if user_inputs_settled
+            && dynamic_tools_settled
             && let Some(turn) = terminal_turn.as_ref()
             && let Err(err) = self.emit_turn_completed_if_missing(turn, false).await
         {
@@ -5585,7 +5826,7 @@ impl RuntimeThreadManager {
                         )
                         .await
                     {
-                        self.take_pending_user_input(&thread_id, &id);
+                        self.discard_pending_user_input_registration(&thread_id, &id);
                         let _ = engine.cancel_user_input(&id).await;
                         return Err(err);
                     }
@@ -5795,20 +6036,11 @@ impl RuntimeThreadManager {
             self.store.save_thread(&thread)?;
         }
 
-        // A terminal turn can no longer answer an outstanding prompt. Clear
-        // it before publishing completion so fresh snapshots never resurrect
-        // stale attention UI, and notify already-connected clients as well.
-        for pending in self.clear_pending_user_inputs_for_turn(&thread_id, &turn_id) {
-            let _ = engine.cancel_user_input(&pending.id).await;
-            self.emit_event(
-                &thread_id,
-                Some(&turn_id),
-                None,
-                "user_input.canceled",
-                json!({ "id": pending.id, "input_id": pending.id, "terminal": true }),
-            )
+        // A terminal turn can no longer answer an outstanding prompt. Commit
+        // each cancellation while the request remains snapshot-authoritative,
+        // then remove and notify the engine before publishing completion.
+        self.settle_user_inputs_for_terminal_turn(&thread_id, &turn_id, Some(engine.clone()))
             .await?;
-        }
 
         self.settle_dynamic_tools_for_terminal_turn(&thread_id, &turn_id)
             .await?;
