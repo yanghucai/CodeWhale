@@ -718,8 +718,12 @@ impl ReviewedPluginMcpSource {
         Ok(())
     }
 
-    fn state_is_current(&self) -> bool {
-        crate::plugins::registry::verify_plugin_state_authority(&self.authority).is_ok()
+    fn catalog_is_current(&self) -> bool {
+        // Catalog exposure is an authority boundary too: stale tool, prompt,
+        // or resource descriptions can steer the model even when the later
+        // operation would be denied. Revalidate both the mutable reviewed
+        // source and the Codewhale-owned stage before publishing any entry.
+        crate::plugins::registry::verify_plugin_authority(&self.authority).is_ok()
     }
 }
 
@@ -2527,7 +2531,7 @@ impl McpConnection {
         self.config
             .reviewed_plugin
             .as_ref()
-            .is_none_or(ReviewedPluginMcpSource::state_is_current)
+            .is_none_or(ReviewedPluginMcpSource::catalog_is_current)
     }
 
     async fn finish_guarded_error<T>(&mut self, error: anyhow::Error) -> Result<T> {

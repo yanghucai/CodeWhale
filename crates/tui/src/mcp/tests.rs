@@ -1546,6 +1546,118 @@ async fn revoked_plugin_mcp_denies_catalog_tool_resource_and_prompt_operations()
     );
 }
 
+fn cached_reviewed_plugin_catalog_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, McpPool) {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("catalog-drift");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(dir.path().join("project")).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"catalog-drift\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("catalog-drift").unwrap();
+    registry.enable("catalog-drift").unwrap();
+    let authority = registry.authority_for("catalog-drift").unwrap();
+    let staged_manifest = authority.staged_manifest.clone();
+
+    let mut connection = test_connection(Box::new(ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::new(),
+    }));
+    let source = ReviewedPluginMcpSource::from_authority(
+        authority,
+        None,
+        Arc::new(crate::plugins::HostEnvironment::capture()),
+    )
+    .unwrap();
+    connection.config.reviewed_plugin = Some(source.clone());
+    connection.tools.push(McpTool {
+        name: "echo".to_string(),
+        description: None,
+        input_schema: serde_json::json!({}),
+    });
+    connection.resources.push(McpResource {
+        uri: "memory://one".to_string(),
+        name: "one".to_string(),
+        description: None,
+        mime_type: None,
+    });
+    connection.resource_templates.push(McpResourceTemplate {
+        uri_template: "memory://{id}".to_string(),
+        name: "memory".to_string(),
+        description: None,
+        mime_type: None,
+    });
+    connection.prompts.push(McpPrompt {
+        name: "review".to_string(),
+        description: None,
+        arguments: Vec::new(),
+    });
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.reviewed_plugin = Some(source);
+    config.servers.insert("guarded".to_string(), server);
+    let mut pool = McpPool::new(config);
+    pool.connections.insert("guarded".to_string(), connection);
+    assert_eq!(pool.all_tools().len(), 1);
+    assert_eq!(pool.all_resources().len(), 1);
+    assert_eq!(pool.all_resource_templates().len(), 1);
+    assert_eq!(pool.all_prompts().len(), 1);
+
+    (dir, plugin_base, staged_manifest, pool)
+}
+
+fn assert_reviewed_plugin_catalog_hidden(pool: &McpPool, boundary: &str) {
+    assert!(pool.all_tools().is_empty());
+    assert!(pool.all_resources().is_empty());
+    assert!(pool.all_resource_templates().is_empty());
+    assert!(pool.all_prompts().is_empty());
+    assert!(
+        pool.to_api_tools()
+            .iter()
+            .all(|tool| tool.name != "mcp_guarded_echo"),
+        "{boundary} drift must remove cached reviewed tools from the model API catalog"
+    );
+    assert!(pool.parse_prefixed_name("mcp_guarded_echo").is_err());
+}
+
+#[test]
+fn reviewed_plugin_source_drift_hides_every_cached_catalog_surface() {
+    let (_dir, plugin_base, _staged_manifest, pool) = cached_reviewed_plugin_catalog_fixture();
+
+    fs::write(plugin_base.join("unreviewed-companion.txt"), b"drift").unwrap();
+
+    assert_reviewed_plugin_catalog_hidden(&pool, "source");
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_plugin_stage_drift_hides_every_cached_catalog_surface() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_dir, _plugin_base, staged_manifest, pool) = cached_reviewed_plugin_catalog_fixture();
+    std::fs::set_permissions(&staged_manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&staged_manifest)
+        .unwrap()
+        .write_all(b"\n# test-only staged drift\n")
+        .unwrap();
+
+    assert_reviewed_plugin_catalog_hidden(&pool, "staged-tree");
+}
+
 #[tokio::test]
 async fn reviewed_plugin_oauth_is_disabled_without_network_or_token_mutation() {
     let dir = tempfile::tempdir().unwrap();
