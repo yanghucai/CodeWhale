@@ -584,6 +584,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_and_matrix_cells_keep_effective_mode_colors() {
+        for (theme_id, theme) in [
+            (ThemeId::Terminal, palette::TERMINAL_UI_THEME),
+            (ThemeId::Matrix, palette::MATRIX_UI_THEME),
+        ] {
+            for (source, expected, role) in [
+                (palette::MODE_AGENT, theme.mode_agent, "agent"),
+                (palette::MODE_PLAN, theme.mode_plan, "plan"),
+                (palette::MODE_YOLO, theme.mode_yolo, "full access"),
+            ] {
+                let mut cell = Cell::default();
+                cell.set_fg(source);
+                adapt_cell_colors(
+                    &mut cell,
+                    ColorDepth::TrueColor,
+                    theme.mode,
+                    theme_id,
+                    &theme,
+                );
+                assert_eq!(
+                    cell.fg,
+                    expected,
+                    "theme '{}' rendered the {role} token through the wrong slot",
+                    theme_id.name(),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn backend_palette_mode_can_follow_runtime_theme_changes() {
         let writer = SharedWriter::default();
         let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);

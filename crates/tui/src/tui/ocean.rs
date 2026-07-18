@@ -1,4 +1,4 @@
-//! Terminal-native underwater field for the CodeWhale transcript.
+//! Terminal-native underwater field for the Codewhale transcript.
 //!
 //! The field is atmosphere, never content: ordinary shell cells share its
 //! water column while semantic surfaces such as selections, errors, and code
@@ -178,7 +178,7 @@ impl OceanRamp {
             return None;
         }
 
-        // The canonical Whale pair gets the authored Blue Stage water column.
+        // The canonical Whale pair gets the authored Codewhale water column.
         // Match both name and surface so a user-supplied `background_color`
         // remains the source of truth and still receives the generic ramp.
         if theme.name == crate::palette::UI_THEME.name
@@ -197,7 +197,7 @@ impl OceanRamp {
             return Some(Self {
                 surface: Color::Rgb(0xff, 0xfd, 0xf8),
                 middle: Color::Rgb(0xf4, 0xf7, 0xfb),
-                deep: Color::Rgb(0xdb, 0xe4, 0xf2),
+                deep: Color::Rgb(0xf0, 0xf4, 0xf9),
                 ambient: Color::Rgb(0x9a, 0xb8, 0xe0),
             });
         }
@@ -343,6 +343,30 @@ mod tests {
         ar.abs_diff(br) as u16 + ag.abs_diff(bg) as u16 + ab.abs_diff(bb) as u16
     }
 
+    fn relative_luminance(value: Color) -> f64 {
+        let (r, g, b) = rgb(value).expect("contrast colors must be RGB");
+        let linearize = |component: u8| {
+            let srgb = f64::from(component) / 255.0;
+            if srgb <= 0.04045 {
+                srgb / 12.92
+            } else {
+                ((srgb + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
+    }
+
+    fn contrast_ratio(foreground: Color, background: Color) -> f64 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        let (lighter, darker) = if foreground >= background {
+            (foreground, background)
+        } else {
+            (background, foreground)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
     #[test]
     fn whale_ramp_is_perceptibly_deep_not_merely_non_equal() {
         let ramp = OceanRamp::for_theme(&crate::palette::UI_THEME).expect("RGB theme");
@@ -361,9 +385,44 @@ mod tests {
         let ramp = OceanRamp::for_theme(&crate::palette::LIGHT_UI_THEME).expect("RGB theme");
         assert_eq!(ramp.surface, Color::Rgb(0xff, 0xfd, 0xf8));
         assert_eq!(ramp.middle, Color::Rgb(0xf4, 0xf7, 0xfb));
-        assert_eq!(ramp.deep, Color::Rgb(0xdb, 0xe4, 0xf2));
+        assert_eq!(ramp.deep, Color::Rgb(0xf0, 0xf4, 0xf9));
         let (r, g, b) = rgb(ramp.deep).expect("RGB color");
         assert!(u16::from(r) + u16::from(g) + u16::from(b) > 420);
+    }
+
+    #[test]
+    fn light_ocean_and_selection_keep_text_and_semantic_roles_readable() {
+        let theme = crate::palette::LIGHT_UI_THEME;
+        let ramp = OceanRamp::for_theme(&theme).expect("RGB theme");
+        let foregrounds = [
+            ("body", theme.text_body),
+            ("soft", theme.text_soft),
+            ("muted", theme.text_muted),
+            ("hint", theme.text_hint),
+            ("action", theme.accent_primary),
+            ("live", theme.status_working),
+            ("human", theme.accent_action),
+            ("warning", theme.warning),
+            ("danger", theme.error_fg),
+            ("operate", theme.mode_operate),
+            ("success", theme.success),
+        ];
+        let backgrounds = [
+            ("ocean surface", ramp.surface),
+            ("ocean middle", ramp.middle),
+            ("ocean deep", ramp.deep),
+            ("selection", theme.selection_bg),
+        ];
+
+        for (background_name, background) in backgrounds {
+            for (foreground_name, foreground) in foregrounds {
+                let ratio = contrast_ratio(foreground, background);
+                assert!(
+                    ratio >= 4.5,
+                    "light {foreground_name} on {background_name} contrast {ratio:.2} is below 4.50"
+                );
+            }
+        }
     }
 
     #[test]

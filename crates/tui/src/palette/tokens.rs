@@ -2,11 +2,10 @@
 
 use ratatui::style::Color;
 
-// Blue Stage Whale palette. The neutral field follows the Blue Devils-derived
-// stage study; semantic colors below own state, never decoration alone.
-pub const WHALE_BG_RGB: (u8, u8, u8) = (3, 7, 13); // #03070D Stage Black
+// Codewhale Whale palette. Semantic colors own state, never decoration alone.
+pub const WHALE_BG_RGB: (u8, u8, u8) = (3, 7, 13); // #03070D Deep field
 pub const WHALE_CHROME_RGB: (u8, u8, u8) = (8, 17, 28); // #08111C Ink / chrome
-pub const WHALE_PANEL_RGB: (u8, u8, u8) = (14, 23, 41); // #0E1729 Stage surface
+pub const WHALE_PANEL_RGB: (u8, u8, u8) = (14, 23, 41); // #0E1729 Panel surface
 pub const WHALE_COMPOSER_RGB: (u8, u8, u8) = (22, 34, 56); // #162238 Plate
 pub const WHALE_ELEVATED_RGB: (u8, u8, u8) = (24, 39, 66); // #182742 Raised
 pub const WHALE_SELECTION_RGB: (u8, u8, u8) = (31, 50, 77); // #1F324D Action-blue tint
@@ -16,7 +15,7 @@ pub const WHALE_TEXT_MUTED_RGB: (u8, u8, u8) = (147, 160, 184); // #93A0B8
 pub const WHALE_TEXT_HINT_RGB: (u8, u8, u8) = (132, 145, 170); // #8491AA
 #[allow(dead_code)]
 pub const WHALE_TEXT_DIM_RGB: (u8, u8, u8) = (105, 119, 145); // #697791
-pub const WHALE_ACTION_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Blue Devil Sky
+pub const WHALE_ACTION_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Cobalt action blue
 pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
 pub const WHALE_ACCENT_SECONDARY_RGB: (u8, u8, u8) = (79, 209, 197); // #4FD1C5 Seafoam
 pub const WHALE_HUMAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
@@ -60,16 +59,19 @@ pub const WHALE_DIFF_ADDED_RGB: (u8, u8, u8) = (87, 199, 133); // #57C785
 #[allow(dead_code)]
 pub const WHALE_DIFF_DELETED_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
 pub const WHALE_DIFF_ADDED_BG_RGB: (u8, u8, u8) = (18, 42, 34); // #122A22
-pub const WHALE_DIFF_DELETED_BG_RGB: (u8, u8, u8) = WHALE_ERROR_SURFACE_RGB;
-pub const WHALE_MODE_AGENT_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
-pub const WHALE_MODE_YOLO_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
-pub const WHALE_MODE_PLAN_RGB: (u8, u8, u8) = WHALE_HUMAN_RGB;
+// Raw colors that are remapped by equality must remain distinct across roles.
+// These stay in the same perceptual families as action, danger, and human asks
+// while preserving mode identity for Terminal and community themes.
+pub const WHALE_DIFF_DELETED_BG_RGB: (u8, u8, u8) = (52, 24, 39); // #341827
+pub const WHALE_MODE_AGENT_RGB: (u8, u8, u8) = (118, 181, 245); // #76B5F5
+pub const WHALE_MODE_YOLO_RGB: (u8, u8, u8) = (255, 112, 160); // #FF70A0
+pub const WHALE_MODE_PLAN_RGB: (u8, u8, u8) = (255, 208, 106); // #FFD06A
 pub const WHALE_MODE_OPERATE_RGB: (u8, u8, u8) = (173, 136, 255); // #AD88FF
 pub const WHALE_TOOL_LIVE_RGB: (u8, u8, u8) = WHALE_ACCENT_SECONDARY_RGB;
 pub const WHALE_TOOL_ISSUE_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
 pub const WHALE_TOOL_OUTPUT_RGB: (u8, u8, u8) = WHALE_TEXT_SOFT_RGB;
 pub const WHALE_TOOL_SURFACE_RGB: (u8, u8, u8) = (18, 29, 50); // #121D32
-pub const WHALE_TOOL_ACTIVE_RGB: (u8, u8, u8) = WHALE_SELECTION_RGB;
+pub const WHALE_TOOL_ACTIVE_RGB: (u8, u8, u8) = (27, 44, 68); // #1B2C44
 
 pub const LIGHT_SURFACE_RGB: (u8, u8, u8) = (244, 247, 251); // #F4F7FB
 pub const LIGHT_PANEL_RGB: (u8, u8, u8) = (255, 253, 248); // #FFFDF8
@@ -183,7 +185,7 @@ pub const SOLARIZED_COMPOSER: Color = Color::Rgb(
 );
 
 pub const LIGHT_BORDER_RGB: (u8, u8, u8) = (169, 184, 207); // #A9B8CF
-pub const LIGHT_SELECTION_RGB: (u8, u8, u8) = (221, 230, 247); // #DDE6F7
+pub const LIGHT_SELECTION_RGB: (u8, u8, u8) = (238, 246, 255); // #EEF6FF
 pub const GRAYSCALE_SURFACE_RGB: (u8, u8, u8) = (10, 10, 10); // #0A0A0A
 pub const GRAYSCALE_PANEL_RGB: (u8, u8, u8) = (18, 18, 18); // #121212
 pub const GRAYSCALE_ELEVATED_RGB: (u8, u8, u8) = (31, 31, 31); // #1F1F1F

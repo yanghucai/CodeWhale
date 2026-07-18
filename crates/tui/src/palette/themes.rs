@@ -727,8 +727,8 @@ impl ThemeId {
         match self {
             Self::System => "Follow terminal background (COLORFGBG / macOS appearance)",
             Self::Terminal => "Inherit terminal colors fully (transparent surfaces, ANSI accents)",
-            Self::Whale => "Blue Stage — Blue Devil focus, seafoam live, Signal Gold asks",
-            Self::WhaleLight => "Blue Stage light — ivory field, cobalt focus",
+            Self::Whale => "Whale dark — deep navy & gold",
+            Self::WhaleLight => "DeepSeek light, paper-ish",
             Self::Grayscale => "Color-minimal high contrast",
             Self::CatppuccinMocha => "Soft pastels on warm dark",
             Self::TokyoNight => "Deep blue/violet night palette",
@@ -881,7 +881,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blue_stage_refresh_keeps_theme_ids_and_default_compatibility() {
+    fn whale_refresh_keeps_theme_ids_and_default_compatibility() {
         let names = SELECTABLE_THEMES
             .iter()
             .map(|theme| theme.name())
@@ -908,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn whale_pair_uses_blue_stage_semantic_grammar() {
+    fn whale_pair_uses_codewhale_semantic_grammar() {
         assert_eq!(UI_THEME.accent_primary, WHALE_ACTION);
         assert_eq!(UI_THEME.status_working, WHALE_LIVE);
         assert_eq!(UI_THEME.accent_action, WHALE_HUMAN);

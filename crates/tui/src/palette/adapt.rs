@@ -3,7 +3,7 @@
 use ratatui::style::Color;
 
 use super::detect::PaletteMode;
-use super::themes::{ThemeId, UiTheme};
+use super::themes::{LIGHT_UI_THEME, SOLARIZED_LIGHT_UI_THEME, ThemeId, UiTheme};
 use super::tokens::*;
 
 #[must_use]
@@ -41,16 +41,18 @@ fn adapt_fg_for_light_palette(color: Color) -> Color {
         LIGHT_LIVE
     } else if color == WHALE_INFO || color == WHALE_ACCENT_PRIMARY {
         LIGHT_ACTION
-    } else if color == WHALE_HUMAN || color == MODE_PLAN {
+    } else if color == MODE_AGENT {
+        LIGHT_UI_THEME.mode_agent
+    } else if color == WHALE_HUMAN {
         LIGHT_HUMAN
+    } else if color == MODE_PLAN {
+        LIGHT_UI_THEME.mode_plan
     } else if color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
         Color::Rgb(146, 64, 14)
-    } else if color == ACCENT_TOOL_ISSUE
-        || color == WHALE_ERROR
-        || color == STATUS_ERROR
-        || color == MODE_YOLO
-    {
+    } else if color == ACCENT_TOOL_ISSUE || color == WHALE_ERROR || color == STATUS_ERROR {
         LIGHT_DANGER
+    } else if color == MODE_YOLO {
+        LIGHT_UI_THEME.mode_yolo
     } else if color == STATUS_WARNING {
         LIGHT_WARNING
     } else if color == STATUS_SUCCESS {
@@ -112,19 +114,18 @@ fn adapt_fg_for_solarized_light_palette(color: Color) -> Color {
         SOLARIZED_CYAN
     } else if color == WHALE_INFO || color == WHALE_ACCENT_PRIMARY {
         SOLARIZED_BLUE
-    } else if color == WHALE_HUMAN
-        || color == MODE_PLAN
-        || color == STATUS_WARNING
-        || color == TEXT_REASONING
-        || color == ACCENT_REASONING_LIVE
-    {
+    } else if color == MODE_AGENT {
+        SOLARIZED_LIGHT_UI_THEME.mode_agent
+    } else if color == WHALE_HUMAN {
         SOLARIZED_ORANGE
-    } else if color == ACCENT_TOOL_ISSUE
-        || color == WHALE_ERROR
-        || color == STATUS_ERROR
-        || color == MODE_YOLO
-    {
+    } else if color == MODE_PLAN {
+        SOLARIZED_LIGHT_UI_THEME.mode_plan
+    } else if color == STATUS_WARNING || color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
+        SOLARIZED_ORANGE
+    } else if color == ACCENT_TOOL_ISSUE || color == WHALE_ERROR || color == STATUS_ERROR {
         SOLARIZED_RED
+    } else if color == MODE_YOLO {
+        SOLARIZED_LIGHT_UI_THEME.mode_yolo
     } else if color == DIFF_ADDED || color == USER_BODY || color == STATUS_SUCCESS {
         SOLARIZED_GREEN
     } else if color == MODE_OPERATE {
@@ -249,22 +250,24 @@ pub fn adapt_fg_for_theme(color: Color, theme: ThemeId, ui: &UiTheme) -> Color {
         ui.border
     } else if color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
         ui.status_working
-    } else if color == WHALE_INFO || color == WHALE_ACCENT_PRIMARY || color == MODE_AGENT {
+    } else if color == WHALE_INFO || color == WHALE_ACCENT_PRIMARY {
         ui.accent_primary
-    } else if color == WHALE_HUMAN || color == MODE_PLAN {
+    } else if color == MODE_AGENT {
+        ui.mode_agent
+    } else if color == WHALE_HUMAN {
         ui.accent_action
+    } else if color == MODE_PLAN {
+        ui.mode_plan
     } else if color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
         if theme == ThemeId::Matrix {
             Color::Rgb(0x00, 0x55, 0x00) // #005500
         } else {
             ui.mode_plan
         }
-    } else if color == ACCENT_TOOL_ISSUE
-        || color == STATUS_ERROR
-        || color == WHALE_ERROR
-        || color == MODE_YOLO
-    {
+    } else if color == ACCENT_TOOL_ISSUE || color == STATUS_ERROR || color == WHALE_ERROR {
         ui.error_fg
+    } else if color == MODE_YOLO {
+        ui.mode_yolo
     } else if color == STATUS_WARNING {
         ui.warning
     } else if color == STATUS_SUCCESS {

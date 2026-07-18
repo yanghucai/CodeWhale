@@ -5,21 +5,22 @@ use super::adapt::{
 };
 use super::detect::{PaletteMode, palette_mode_from_apple_interface_style};
 use super::themes::{
-    GRAYSCALE_UI_THEME, LIGHT_UI_THEME, SOLARIZED_LIGHT_UI_THEME, TERMINAL_UI_THEME, ThemeId,
-    UI_THEME, UiTheme, normalize_hex_rgb_color, normalize_theme_name, parse_hex_rgb_color,
-    theme_label_for_mode, ui_theme_from_settings,
+    GRAYSCALE_UI_THEME, LIGHT_UI_THEME, MATRIX_UI_THEME, SOLARIZED_LIGHT_UI_THEME,
+    TERMINAL_UI_THEME, TOKYO_NIGHT_UI_THEME, ThemeId, UI_THEME, UiTheme, normalize_hex_rgb_color,
+    normalize_theme_name, parse_hex_rgb_color, theme_label_for_mode, ui_theme_from_settings,
 };
 use super::tokens::{
-    ACCENT_REASONING_LIVE, DIFF_ADDED, DIFF_ADDED_BG, GRAYSCALE_BORDER, GRAYSCALE_ELEVATED,
-    GRAYSCALE_PANEL, GRAYSCALE_REASONING, GRAYSCALE_SURFACE, GRAYSCALE_TEXT_BODY,
-    GRAYSCALE_TEXT_HINT, GRAYSCALE_TEXT_SOFT, LIGHT_ACTION, LIGHT_BORDER, LIGHT_DANGER,
-    LIGHT_ELEVATED, LIGHT_HUMAN, LIGHT_LIVE, LIGHT_PANEL, LIGHT_REASONING, LIGHT_SUCCESS_FG,
-    LIGHT_SURFACE, LIGHT_TEXT_BODY, LIGHT_TEXT_BODY_RGB, LIGHT_TEXT_HINT, LIGHT_WARNING,
+    ACCENT_REASONING_LIVE, DIFF_ADDED, DIFF_ADDED_BG, DIFF_DELETED_BG, GRAYSCALE_BORDER,
+    GRAYSCALE_ELEVATED, GRAYSCALE_PANEL, GRAYSCALE_REASONING, GRAYSCALE_SURFACE,
+    GRAYSCALE_TEXT_BODY, GRAYSCALE_TEXT_HINT, GRAYSCALE_TEXT_SOFT, LIGHT_ACTION, LIGHT_BORDER,
+    LIGHT_DANGER, LIGHT_ELEVATED, LIGHT_HUMAN, LIGHT_LIVE, LIGHT_PANEL, LIGHT_REASONING,
+    LIGHT_SELECTION_BG, LIGHT_SUCCESS_FG, LIGHT_SURFACE, LIGHT_TEXT_BODY, LIGHT_TEXT_BODY_RGB,
+    LIGHT_TEXT_HINT, LIGHT_WARNING, MODE_AGENT, MODE_PLAN, MODE_YOLO, SELECTION_BG,
     SOLARIZED_PANEL, SOLARIZED_SURFACE, SOLARIZED_TEXT_BODY, SOLARIZED_TEXT_HINT, STATUS_ERROR,
-    STATUS_WARNING, SURFACE_REASONING, SURFACE_REASONING_TINT, TEXT_BODY, TEXT_HINT,
-    TEXT_REASONING, TEXT_TOOL_OUTPUT, WHALE_ACTION, WHALE_BG, WHALE_ERROR, WHALE_HUMAN, WHALE_INFO,
-    WHALE_LIVE, WHALE_PANEL, WHALE_REASONING_TEXT_RGB, WHALE_REASONING_TINT_RGB,
-    WHALE_TEXT_BODY_RGB,
+    STATUS_WARNING, SURFACE_ERROR, SURFACE_REASONING, SURFACE_REASONING_TINT, SURFACE_TOOL_ACTIVE,
+    TEXT_BODY, TEXT_HINT, TEXT_REASONING, TEXT_TOOL_OUTPUT, WHALE_ACTION, WHALE_BG, WHALE_ERROR,
+    WHALE_HUMAN, WHALE_INFO, WHALE_LIVE, WHALE_PANEL, WHALE_REASONING_TEXT_RGB,
+    WHALE_REASONING_TINT_RGB, WHALE_TEXT_BODY_RGB,
 };
 use ratatui::style::Color;
 
@@ -146,11 +147,59 @@ fn terminal_theme_resets_surfaces_and_remaps_direct_palette_constants() {
 }
 
 #[test]
+fn terminal_and_matrix_preserve_agent_plan_and_full_access_mode_slots() {
+    for (theme_id, theme) in [
+        (ThemeId::Terminal, TERMINAL_UI_THEME),
+        (ThemeId::Matrix, MATRIX_UI_THEME),
+    ] {
+        for (source, expected, role) in [
+            (MODE_AGENT, theme.mode_agent, "agent"),
+            (MODE_PLAN, theme.mode_plan, "plan"),
+            (MODE_YOLO, theme.mode_yolo, "full access"),
+        ] {
+            assert_eq!(
+                adapt_fg_for_theme(source, theme_id, &theme),
+                expected,
+                "theme '{}' must map the raw {role} token to its mode slot",
+                theme_id.name(),
+            );
+        }
+    }
+}
+
+#[test]
+fn community_remap_keeps_selection_tool_and_error_background_domains() {
+    let mut theme = TOKYO_NIGHT_UI_THEME;
+    theme.selection_bg = Color::Rgb(1, 2, 3);
+    theme.elevated_bg = Color::Rgb(4, 5, 6);
+    theme.error_surface = Color::Rgb(7, 8, 9);
+    theme.diff_deleted_bg = Color::Rgb(10, 11, 12);
+
+    assert_eq!(
+        adapt_bg_for_theme(SELECTION_BG, ThemeId::TokyoNight, &theme),
+        theme.selection_bg
+    );
+    assert_eq!(
+        adapt_bg_for_theme(SURFACE_TOOL_ACTIVE, ThemeId::TokyoNight, &theme),
+        theme.elevated_bg
+    );
+    assert_eq!(
+        adapt_bg_for_theme(SURFACE_ERROR, ThemeId::TokyoNight, &theme),
+        theme.error_surface
+    );
+    assert_eq!(
+        adapt_bg_for_theme(DIFF_DELETED_BG, ThemeId::TokyoNight, &theme),
+        theme.diff_deleted_bg
+    );
+}
+
+#[test]
 fn light_palette_has_quiet_layer_separation() {
     assert_eq!(LIGHT_SURFACE, Color::Rgb(244, 247, 251));
     assert_eq!(LIGHT_PANEL, Color::Rgb(255, 253, 248));
     assert_eq!(LIGHT_ELEVATED, Color::Rgb(232, 238, 248));
     assert_eq!(LIGHT_BORDER, Color::Rgb(169, 184, 207));
+    assert_eq!(LIGHT_SELECTION_BG, Color::Rgb(238, 246, 255));
     assert_ne!(LIGHT_SURFACE, LIGHT_PANEL);
     assert_ne!(LIGHT_PANEL, LIGHT_ELEVATED);
 }
@@ -465,14 +514,14 @@ fn pulse_passes_named_colors_unchanged() {
 
 #[test]
 fn nearest_ansi16_routes_known_brand_colors() {
-    // Blue Stage keeps action, live, human, and danger distinct where ANSI-16 allows it.
-    assert_eq!(nearest_ansi16(106, 174, 242), Color::LightBlue); // Blue Devil action
+    // Codewhale keeps action, live, human, and danger distinct where ANSI-16 allows it.
+    assert_eq!(nearest_ansi16(106, 174, 242), Color::LightBlue); // Cobalt action
     assert_eq!(nearest_ansi16(246, 196, 83), Color::LightYellow); // Signal Gold
     assert_eq!(nearest_ansi16(79, 209, 197), Color::LightCyan); // Seafoam
-    assert_eq!(nearest_ansi16(42, 74, 127), Color::Blue); // Border
+    assert_eq!(nearest_ansi16(38, 62, 92), Color::Blue); // Border
     assert_eq!(nearest_ansi16(54, 187, 212), Color::LightCyan); // Aqua
     assert_eq!(nearest_ansi16(255, 134, 178), Color::LightRed); // Rose danger
-    assert_eq!(nearest_ansi16(3, 7, 13), Color::Black); // Stage Black
+    assert_eq!(nearest_ansi16(3, 7, 13), Color::Black); // Deep field
 }
 
 #[test]

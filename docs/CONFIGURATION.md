@@ -1115,11 +1115,11 @@ Common settings keys:
 - `theme` (`system`, `terminal`, `dark`, `light`, `grayscale`,
   `catppuccin-mocha`, `tokyo-night`, `dracula`, `gruvbox-dark`, `claude`,
   `matrix`, `solarized-light`; default `system`): `system` follows terminal
-  background detection, `dark`/`light` use the Blue Stage Whale pair,
+  background detection, `dark`/`light` use the Codewhale Whale pair,
   `terminal` inherits the host terminal, `grayscale` is the low-opinion
   black/white theme, and the named community presets apply across the TUI.
   Aliases such as `whale`, `mono`, `black-white`, `tokyonight`, and `gruvbox`
-  are accepted. In Whale, Blue Devil blue owns action/focus, seafoam owns live
+  are accepted. In Whale, cobalt blue owns action/focus, seafoam owns live
   work, Signal Gold owns human decisions and the whale, coral owns warnings,
   rose owns danger, violet owns Operate, and green remains completed/verified.
   Text labels, markers, and motion policy carry the same states when color is

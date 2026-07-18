@@ -1,9 +1,9 @@
-//! Whale terminal theme tokens (legacy module path).
+//! Codewhale terminal theme tokens (legacy module path).
 //!
 //! A small, deliberately flat module that names the color, border, and
-//! padding choices the TUI is making. Values follow the Blue Stage semantic
-//! grammar exposed by [`crate::palette`], keeping the older module path for
-//! source compatibility.
+//! padding choices the TUI is making. Values follow the semantic grammar
+//! exposed by [`crate::palette`], keeping the older module path for source
+//! compatibility.
 //!
 //! The only consumers today are the plan and tool cell renderers in
 //! [`crate::tui::history`] and the sidebar section chrome in
@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_theme_uses_blue_stage_semantic_roles() {
+    fn dark_theme_uses_codewhale_semantic_roles() {
         let theme = Theme::dark();
         assert_eq!(theme.variant, Variant::Dark);
         assert_eq!(theme.section_border_color, palette::BORDER_COLOR);
