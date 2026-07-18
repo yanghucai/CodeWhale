@@ -646,6 +646,7 @@ fn state_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+#[cfg(not(windows))]
 fn open_state_lock(path: &Path, create: bool) -> Result<fs::File, String> {
     let mut options = OpenOptions::new();
     options
@@ -660,19 +661,6 @@ fn open_state_lock(path: &Path, create: bool) -> Result<fs::File, String> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        // Open the reparse point itself. `validate_opened_regular_file` then
-        // rejects it instead of following it to an unrelated ACL target.
-        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
-        if create {
-            // Keep the writer handle used for the lock and grant it exactly
-            // the control rights needed to harden that same validated object.
-            // This avoids reopening the path with a conflicting share mode.
-            options.access_mode(0x001e_019f); // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER
-        }
-    }
     let file = options
         .open(path)
         .map_err(|e| format!("failed to open plugin state lock: {e}"))?;
@@ -681,12 +669,78 @@ fn open_state_lock(path: &Path, create: bool) -> Result<fs::File, String> {
     // byte-for-byte and descriptor-for-descriptor non-mutating. ACL/mode
     // hardening belongs only to trust/enable/disable/revoke updates.
     if create {
-        #[cfg(windows)]
-        harden_opened_plugin_state_file(path, &file)?;
-        #[cfg(not(windows))]
         harden_plugin_state_file(path)?;
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_state_lock(path: &Path, create: bool) -> Result<fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const LOCK_ACCESS_WITH_OWNER: u32 = 0x001e_019f;
+    const LOCK_ACCESS_WITHOUT_OWNER: u32 = 0x0016_019f;
+
+    let (file, owner_mode) = if create {
+        match open_windows_state_lock(path, true, LOCK_ACCESS_WITH_OWNER) {
+            Ok(file) => (file, WindowsAclOwnerMode::NormalizeCurrentUser),
+            Err(error) if is_windows_access_denied(&error) => {
+                // The first attempt can only be retried when Windows denied
+                // WRITE_OWNER. Do not recreate the entry here: a disappeared
+                // lock is a concurrent mutation that must fail closed instead
+                // of turning into a fresh object with an unchecked owner.
+                let file = open_windows_state_lock(path, false, LOCK_ACCESS_WITHOUT_OWNER)
+                    .map_err(|error| format!("failed to open plugin state lock: {error}"))?;
+                (file, WindowsAclOwnerMode::VerifyCurrentUser)
+            }
+            Err(error) => {
+                return Err(format!("failed to open plugin state lock: {error}"));
+            }
+        }
+    } else {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .truncate(false)
+            // Open the reparse point itself. `validate_opened_regular_file`
+            // then rejects it instead of following it to an unrelated target.
+            .custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        let file = options
+            .open(path)
+            .map_err(|error| format!("failed to open plugin state lock: {error}"))?;
+        (file, WindowsAclOwnerMode::VerifyCurrentUser)
+    };
+
+    validate_opened_regular_file(path, &file)?;
+    // Discovery/doctor opens existing locks with `create=false` and must be
+    // byte-for-byte and descriptor-for-descriptor non-mutating. ACL/mode
+    // hardening belongs only to trust/enable/disable/revoke updates.
+    if create {
+        harden_opened_plugin_state_file(path, &file, owner_mode)?;
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_windows_state_lock(
+    path: &Path,
+    create: bool,
+    access_mode: u32,
+) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        // Open the reparse point itself. `validate_opened_regular_file` then
+        // rejects it instead of following it to an unrelated ACL target.
+        .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+        .access_mode(access_mode)
+        .open(path)
 }
 
 fn path_entry_exists(path: &Path) -> Result<bool, String> {
@@ -865,10 +919,14 @@ fn harden_plugin_state_file(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn harden_opened_plugin_state_file(path: &Path, file: &fs::File) -> Result<(), String> {
+fn harden_opened_plugin_state_file(
+    path: &Path,
+    file: &fs::File,
+    owner_mode: WindowsAclOwnerMode,
+) -> Result<(), String> {
     validate_opened_regular_file(path, file)?;
     ensure_windows_registry_path_still_opened(path, file)?;
-    apply_windows_owner_only_acl(file, 0x001f_01ff)
+    apply_windows_owner_only_acl(file, 0x001f_01ff, owner_mode)
 }
 
 #[cfg(unix)]
@@ -1509,8 +1567,83 @@ fn set_windows_owner_only_acl(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum WindowsAclOwnerMode {
+    // The handle has WRITE_OWNER, so restoring the current-user ownership and
+    // DACL together keeps the authority boundary atomic.
+    NormalizeCurrentUser,
+    // A previously hardened current-user-owned object may deliberately deny
+    // WRITE_OWNER. Re-hardening may replace its DACL only after proving the
+    // existing owner is still the current user.
+    VerifyCurrentUser,
+}
+
+#[cfg(windows)]
+enum WindowsAclTargetOpenError {
+    Io(std::io::Error),
+    Validation(String),
+}
+
+#[cfg(windows)]
+impl WindowsAclTargetOpenError {
+    fn should_retry_without_write_owner(&self) -> bool {
+        matches!(self, Self::Io(error) if is_windows_access_denied(error))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Io(error) => format!("failed to open Windows plugin ACL target safely: {error}"),
+            Self::Validation(message) => message,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_access_denied(error: &std::io::Error) -> bool {
+    // Only retry the expected access denial from a missing WRITE_OWNER grant.
+    // A sharing violation, missing path, reparse validation failure, or any
+    // other open failure must remain fail-closed without opening a new handle.
+    error.raw_os_error() == Some(5) // ERROR_ACCESS_DENIED
+}
+
+#[cfg(windows)]
+fn open_windows_acl_target(
+    path: &Path,
+    access_mode: u32,
+) -> Result<fs::File, WindowsAclTargetOpenError> {
     use std::os::windows::fs::OpenOptionsExt as _;
+
+    let target = OpenOptions::new()
+        .access_mode(access_mode)
+        .share_mode(0x0000_0001) // FILE_SHARE_READ
+        .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        .open(path)
+        .map_err(WindowsAclTargetOpenError::Io)?;
+    let opened = target.metadata().map_err(|error| {
+        WindowsAclTargetOpenError::Validation(format!(
+            "failed to inspect opened Windows plugin ACL target: {error}"
+        ))
+    })?;
+    let opened_identity = windows_file_identity(&target).map_err(|error| {
+        WindowsAclTargetOpenError::Validation(format!(
+            "failed to identify opened Windows plugin ACL target: {error}"
+        ))
+    })?;
+    if opened_identity.attributes & 0x0000_0400 != 0 || !(opened.is_file() || opened.is_dir()) {
+        return Err(WindowsAclTargetOpenError::Validation(
+            "Windows plugin ACL target changed into a reparse point or unsupported object"
+                .to_string(),
+        ));
+    }
+    ensure_windows_registry_path_still_opened(path, &target)
+        .map_err(WindowsAclTargetOpenError::Validation)?;
+    Ok(target)
+}
+
+#[cfg(windows)]
+fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result<(), String> {
+    const ACL_ACCESS_WITH_OWNER: u32 = 0x0002_0000 | 0x0004_0000 | 0x0008_0000;
+    const ACL_ACCESS_WITHOUT_OWNER: u32 = 0x0002_0000 | 0x0004_0000;
 
     // Bind ACL mutation to the exact object opened without following a
     // reparse point. A pathname-only SetNamedSecurityInfoW call could inspect
@@ -1522,30 +1655,25 @@ fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result
             "Windows plugin ACL target must be a regular non-reparse file or directory".to_string(),
         );
     }
-    let target = OpenOptions::new()
-        .access_mode(0x0002_0000 | 0x0004_0000 | 0x0008_0000) // READ_CONTROL | WRITE_DAC | WRITE_OWNER
-        .share_mode(0x0000_0001) // FILE_SHARE_READ
-        .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
-        .open(path)
-        .map_err(|error| format!("failed to open Windows plugin ACL target safely: {error}"))?;
-    let opened = target
-        .metadata()
-        .map_err(|error| format!("failed to inspect opened Windows plugin ACL target: {error}"))?;
-    let opened_identity = windows_file_identity(&target)
-        .map_err(|error| format!("failed to identify opened Windows plugin ACL target: {error}"))?;
-    if opened_identity.attributes & 0x0000_0400 != 0 || !(opened.is_file() || opened.is_dir()) {
-        return Err(
-            "Windows plugin ACL target changed into a reparse point or unsupported object"
-                .to_string(),
-        );
-    }
-    ensure_windows_registry_path_still_opened(path, &target)?;
+    let (target, owner_mode) = match open_windows_acl_target(path, ACL_ACCESS_WITH_OWNER) {
+        Ok(target) => (target, WindowsAclOwnerMode::NormalizeCurrentUser),
+        Err(error) if error.should_retry_without_write_owner() => {
+            let target = open_windows_acl_target(path, ACL_ACCESS_WITHOUT_OWNER)
+                .map_err(WindowsAclTargetOpenError::into_message)?;
+            (target, WindowsAclOwnerMode::VerifyCurrentUser)
+        }
+        Err(error) => return Err(error.into_message()),
+    };
 
-    apply_windows_owner_only_acl(&target, access_mask)
+    apply_windows_owner_only_acl(&target, access_mask, owner_mode)
 }
 
 #[cfg(windows)]
-fn apply_windows_owner_only_acl(target: &fs::File, access_mask: u32) -> Result<(), String> {
+fn apply_windows_owner_only_acl(
+    target: &fs::File,
+    access_mask: u32,
+    owner_mode: WindowsAclOwnerMode,
+) -> Result<(), String> {
     use std::mem::{MaybeUninit, size_of};
     use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WIN32_ERROR};
@@ -1613,18 +1741,34 @@ fn apply_windows_owner_only_acl(target: &fs::File, access_mask: u32) -> Result<(
         }
         .map_err(|error| format!("failed to grant the current Windows user access: {error}"))?;
 
-        // SAFETY: `target` retains the exact validated non-reparse object and
-        // the ACL/SID buffers remain alive through the call. Set the owner as
-        // well as a protected DACL: otherwise a different inherited owner can
-        // use its implicit WRITE_DAC authority to undo the owner-only ACL.
-        let status = unsafe {
-            SetSecurityInfo(
-                HANDLE(target.as_raw_handle()),
-                SE_FILE_OBJECT,
+        let (security_information, owner) = match owner_mode {
+            WindowsAclOwnerMode::NormalizeCurrentUser => (
                 OWNER_SECURITY_INFORMATION
                     | DACL_SECURITY_INFORMATION
                     | PROTECTED_DACL_SECURITY_INFORMATION,
                 Some(sid),
+            ),
+            WindowsAclOwnerMode::VerifyCurrentUser => {
+                // The caller could not obtain WRITE_OWNER. Mutate only an
+                // exact handle whose current owner is already the token user.
+                ensure_windows_plugin_target_owner(target, sid)?;
+                (
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    None,
+                )
+            }
+        };
+
+        // SAFETY: `target` retains the exact validated non-reparse object and
+        // the ACL/SID buffers remain alive through the call. The normalization
+        // path writes owner and DACL together; the fallback path has already
+        // verified the owner through this retained handle.
+        let status = unsafe {
+            SetSecurityInfo(
+                HANDLE(target.as_raw_handle()),
+                SE_FILE_OBJECT,
+                security_information,
+                owner,
                 None,
                 Some(acl),
                 None,
@@ -1636,11 +1780,75 @@ fn apply_windows_owner_only_acl(target: &fs::File, access_mask: u32) -> Result<(
                 status.0
             ));
         }
+        if let WindowsAclOwnerMode::VerifyCurrentUser = owner_mode {
+            // A handle that predated our restrictive share barrier may still
+            // mutate the descriptor. Do not hand out authority if it changed
+            // ownership around the DACL-only fallback.
+            ensure_windows_plugin_target_owner(target, sid)?;
+        }
         Ok(())
     })();
     // SAFETY: token is the unique real handle returned by OpenProcessToken.
     let _ = unsafe { CloseHandle(token) };
     result
+}
+
+/// Require a current-user-owned target before changing its DACL. The caller
+/// has already opened the exact non-reparse object with a restrictive sharing
+/// barrier, so this does not reintroduce a path-following race.
+#[cfg(windows)]
+fn ensure_windows_plugin_target_owner(
+    target: &fs::File,
+    expected_owner: windows::Win32::Security::PSID,
+) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree, WIN32_ERROR};
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // SAFETY: `target` remains open for the complete call, all requested
+    // output locations are valid, and Windows allocates `descriptor` for the
+    // caller to free with LocalFree below.
+    let status = unsafe {
+        GetSecurityInfo(
+            HANDLE(target.as_raw_handle()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status != WIN32_ERROR(0) {
+        if !descriptor.0.is_null() {
+            // SAFETY: a non-null descriptor came from GetSecurityInfo and is
+            // documented to be released by LocalFree exactly once.
+            let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+        }
+        return Err(format!(
+            "failed to inspect Windows plugin ACL target owner: error {}",
+            status.0
+        ));
+    }
+    let owner_matches = !owner.0.is_null() && unsafe { EqualSid(owner, expected_owner) }.is_ok();
+    if !descriptor.0.is_null() {
+        // SAFETY: the successful GetSecurityInfo allocation is released only
+        // after the owner SID comparison above completes.
+        let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    }
+    if !owner_matches {
+        return Err(
+            "Windows plugin ACL target owner is not the current user; refusing to harden a foreign-owned object"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1866,9 +2074,10 @@ mod unix_state_directory_tests {
 #[cfg(all(test, windows))]
 mod windows_acl_tests {
     use super::{
-        PluginStateFile, ensure_private_runtime_parent, harden_plugin_state_file,
-        harden_staged_tree_contents, open_state_lock, save_state_with_hardener,
-        set_windows_owner_only_acl, state_lock_path,
+        PluginStateFile, WindowsAclOwnerMode, apply_windows_owner_only_acl,
+        ensure_private_runtime_parent, ensure_windows_plugin_target_owner,
+        harden_plugin_state_file, harden_staged_tree_contents, open_state_lock,
+        save_state_with_hardener, set_windows_owner_only_acl, state_lock_path,
     };
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
@@ -1951,6 +2160,134 @@ mod windows_acl_tests {
         let lock = open_state_lock(&lock_path, true)
             .expect("state lock ACL hardening must not conflict with its writer handle");
         assert!(lock.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn owner_only_acl_rehardens_without_write_owner_access() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("state");
+        std::fs::create_dir(&target).unwrap();
+        set_windows_owner_only_acl(&target).unwrap();
+
+        // Simulate an already-private Codewhale object whose owner is still
+        // the current user, but whose DACL intentionally does not grant
+        // WRITE_OWNER. Rehardening must restore the full owner-only ACL
+        // rather than assuming it may take ownership again.
+        let reduced = std::fs::OpenOptions::new()
+            .access_mode(0x001f_01ff) // FILE_ALL_ACCESS for this setup only
+            .share_mode(0x0000_0001)
+            .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            .open(&target)
+            .unwrap();
+        apply_windows_owner_only_acl(
+            &reduced,
+            0x0017_01ff,
+            WindowsAclOwnerMode::VerifyCurrentUser,
+        )
+        .expect("current owner may restrict its DACL without changing ownership");
+        drop(reduced);
+
+        let denied = std::fs::OpenOptions::new()
+            .access_mode(0x0002_0000 | 0x0004_0000 | 0x0008_0000)
+            .share_mode(0x0000_0001)
+            .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            .open(&target)
+            .unwrap_err();
+        assert_eq!(
+            denied.raw_os_error(),
+            Some(5),
+            "the full-owner path must be unavailable before exercising the fallback"
+        );
+
+        set_windows_owner_only_acl(&target)
+            .expect("rehardening must verify the current owner without requesting WRITE_OWNER");
+        let restored = std::fs::OpenOptions::new()
+            .access_mode(0x001f_01ff)
+            .share_mode(0x0000_0001)
+            .custom_flags(0x0220_0000)
+            .open(&target);
+        assert!(
+            restored.is_ok(),
+            "rehardening must restore the current user's full owner-only ACL"
+        );
+    }
+
+    #[test]
+    fn state_lock_rehardens_without_write_owner_access() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state");
+        std::fs::create_dir(&state_directory).unwrap();
+        set_windows_owner_only_acl(&state_directory).unwrap();
+        let lock_path = state_lock_path(&state_directory.join("state.json"));
+        drop(open_state_lock(&lock_path, true).unwrap());
+
+        let reduced = std::fs::OpenOptions::new()
+            .access_mode(0x001f_01ff) // FILE_ALL_ACCESS for this setup only
+            .share_mode(0x0000_0001)
+            .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            .open(&lock_path)
+            .unwrap();
+        apply_windows_owner_only_acl(
+            &reduced,
+            0x0016_019f, // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC
+            WindowsAclOwnerMode::VerifyCurrentUser,
+        )
+        .expect("current owner may remove WRITE_OWNER from an existing state lock");
+        drop(reduced);
+
+        let denied = std::fs::OpenOptions::new()
+            .access_mode(0x001e_019f) // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER
+            .share_mode(0x0000_0001)
+            .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(&lock_path)
+            .unwrap_err();
+        assert_eq!(
+            denied.raw_os_error(),
+            Some(5),
+            "the state-lock fallback must run only after WRITE_OWNER is denied"
+        );
+
+        let lock = open_state_lock(&lock_path, true)
+            .expect("state-lock hardening must fall back to DACL-only rehardening");
+        assert!(lock.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn owner_only_acl_rejects_an_owner_identity_mismatch() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows::Win32::Security::{CreateWellKnownSid, WinWorldSid};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state");
+        std::fs::create_dir(&path).unwrap();
+        set_windows_owner_only_acl(&path).unwrap();
+        let target = std::fs::OpenOptions::new()
+            .access_mode(0x0002_0000) // READ_CONTROL
+            .share_mode(0x0000_0001)
+            .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            .open(&path)
+            .unwrap();
+
+        // World is a valid SID that cannot match this user's object owner.
+        // Supply it directly to the exact-handle verifier without changing
+        // the fixture's real owner or relying on privileged owner mutation.
+        let mut required = 0_u32;
+        let _ = unsafe { CreateWellKnownSid(WinWorldSid, None, None, &mut required) };
+        assert!(required > 0, "Windows did not report the world SID size");
+        let words = (required as usize).div_ceil(size_of::<usize>());
+        let mut sid_buffer = vec![MaybeUninit::<usize>::zeroed(); words];
+        let world = PSID(sid_buffer.as_mut_ptr().cast());
+        unsafe { CreateWellKnownSid(WinWorldSid, None, Some(world), &mut required) }.unwrap();
+
+        let error = ensure_windows_plugin_target_owner(&target, world).unwrap_err();
+        assert!(
+            error.contains("not the current user"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
