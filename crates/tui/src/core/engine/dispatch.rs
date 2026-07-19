@@ -18,7 +18,7 @@
 use serde_json::json;
 
 use crate::models::{Tool, ToolCaller};
-use crate::tools::spec::{ResourceClaim, ToolError, ToolResult};
+use crate::tools::spec::{ResourceClaim, ToolError, ToolResult, schedule_non_conflicting};
 use crate::tui::app::AppMode;
 
 use super::ToolUseState;
@@ -496,13 +496,17 @@ pub(super) fn parse_parallel_tool_calls(
 
 #[cfg(test)]
 pub(super) fn should_parallelize_tool_batch(plans: &[ToolExecutionPlan]) -> bool {
-    !plans.is_empty()
-        && plans.iter().all(tool_plan_can_join_parallel_batch)
-        && plans.iter().enumerate().all(|(index, plan)| {
-            plans[index + 1..]
-                .iter()
-                .all(|other| !tool_plans_conflict(plan, other))
-        })
+    if plans.is_empty() || !plans.iter().all(tool_plan_can_join_parallel_batch) {
+        return false;
+    }
+    schedule_non_conflicting(
+        plans
+            .iter()
+            .map(|plan| ((), plan.resources.clone()))
+            .collect(),
+    )
+    .len()
+        == 1
 }
 
 pub(super) fn tool_plan_is_parallel_safe(plan: &ToolExecutionPlan) -> bool {
@@ -515,48 +519,31 @@ pub(super) fn tool_plan_can_join_parallel_batch(plan: &ToolExecutionPlan) -> boo
             || (plan.detached_start && !plan.approval_required && !plan.interactive))
 }
 
-pub(super) fn tool_plans_conflict(left: &ToolExecutionPlan, right: &ToolExecutionPlan) -> bool {
-    left.resources.contains(&ResourceClaim::GlobalExclusive)
-        || right.resources.contains(&ResourceClaim::GlobalExclusive)
-        || left.resources.iter().any(|left_claim| {
-            right
-                .resources
-                .iter()
-                .any(|right_claim| left_claim.conflicts_with(right_claim))
-        })
-}
-
 pub(super) fn plan_tool_execution_batches(
     plans: Vec<ToolExecutionPlan>,
 ) -> Vec<ToolExecutionBatch> {
     let mut batches = Vec::new();
-    let mut parallel_chunk = Vec::new();
+    let mut parallel_candidates = Vec::new();
+
+    let flush_parallel = |parallel_candidates: &mut Vec<_>,
+                          batches: &mut Vec<ToolExecutionBatch>| {
+        for chunk in schedule_non_conflicting(std::mem::take(parallel_candidates)) {
+            batches.push(ToolExecutionBatch::Parallel(chunk));
+        }
+    };
 
     for plan in plans {
         if tool_plan_can_join_parallel_batch(&plan) {
-            if parallel_chunk
-                .iter()
-                .any(|existing| tool_plans_conflict(existing, &plan))
-            {
-                batches.push(ToolExecutionBatch::Parallel(std::mem::take(
-                    &mut parallel_chunk,
-                )));
-            }
-            parallel_chunk.push(plan);
+            let resources = plan.resources.clone();
+            parallel_candidates.push((plan, resources));
             continue;
         }
 
-        if !parallel_chunk.is_empty() {
-            batches.push(ToolExecutionBatch::Parallel(std::mem::take(
-                &mut parallel_chunk,
-            )));
-        }
+        flush_parallel(&mut parallel_candidates, &mut batches);
         batches.push(ToolExecutionBatch::Serial(Box::new(plan)));
     }
 
-    if !parallel_chunk.is_empty() {
-        batches.push(ToolExecutionBatch::Parallel(parallel_chunk));
-    }
+    flush_parallel(&mut parallel_candidates, &mut batches);
 
     batches
 }
