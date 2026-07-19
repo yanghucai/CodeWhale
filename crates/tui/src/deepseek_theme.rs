@@ -82,7 +82,7 @@ impl Theme {
             plan_summary_color: palette::TEXT_MUTED,
             plan_explanation_color: palette::TEXT_DIM,
             plan_pending_color: palette::TEXT_MUTED,
-            plan_in_progress_color: palette::WHALE_HUMAN,
+            plan_in_progress_color: palette::MODE_PLAN,
             plan_completed_color: palette::STATUS_SUCCESS,
         }
     }
@@ -108,7 +108,7 @@ impl Theme {
             plan_summary_color: palette::LIGHT_TEXT_MUTED,
             plan_explanation_color: palette::LIGHT_TEXT_HINT,
             plan_pending_color: palette::LIGHT_TEXT_MUTED,
-            plan_in_progress_color: palette::LIGHT_HUMAN,
+            plan_in_progress_color: palette::LIGHT_MODE_PLAN,
             plan_completed_color: palette::LIGHT_SUCCESS_FG,
         }
     }
@@ -134,7 +134,7 @@ impl Theme {
             plan_summary_color: palette::SOLARIZED_TEXT_MUTED,
             plan_explanation_color: palette::SOLARIZED_TEXT_DIM,
             plan_pending_color: palette::SOLARIZED_TEXT_MUTED,
-            plan_in_progress_color: palette::SOLARIZED_ORANGE,
+            plan_in_progress_color: palette::SOLARIZED_CYAN,
             plan_completed_color: palette::SOLARIZED_BLUE,
         }
     }
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(theme.tool_running_accent, palette::ACCENT_TOOL_LIVE);
         assert_eq!(theme.tool_success_accent, palette::STATUS_SUCCESS);
         assert_eq!(theme.tool_failed_accent, palette::STATUS_ERROR);
-        assert_eq!(theme.plan_in_progress_color, palette::WHALE_HUMAN);
+        assert_eq!(theme.plan_in_progress_color, palette::MODE_PLAN);
     }
 
     #[test]
@@ -269,6 +269,21 @@ mod tests {
         assert_eq!(theme.tool_running_accent, palette::GRAYSCALE_TEXT_SOFT);
         assert_eq!(theme.tool_failed_accent, palette::GRAYSCALE_TEXT_BODY);
         assert_eq!(theme.plan_summary_color, palette::GRAYSCALE_TEXT_MUTED);
+    }
+
+    #[test]
+    fn every_theme_distinguishes_active_and_completed_plan_steps() {
+        for (name, theme) in [
+            ("dark", Theme::dark()),
+            ("light", Theme::light()),
+            ("solarized-light", Theme::solarized_light()),
+            ("grayscale", Theme::grayscale()),
+        ] {
+            assert_ne!(
+                theme.plan_in_progress_color, theme.plan_completed_color,
+                "{name} must keep active and completed Plan steps visually distinct"
+            );
+        }
     }
 
     #[test]
