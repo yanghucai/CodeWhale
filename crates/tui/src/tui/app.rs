@@ -1649,6 +1649,9 @@ pub struct App {
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
     pub is_loading: bool,
+    /// Sender for spawned dispatch tasks to report errors back to the event
+    /// loop without blocking the render thread (#4605).
+    pub dispatch_error_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Timestamp of the most recent Enter while the engine was busy.
     /// Used by `enter_with_double_tap()` to detect a double-tap within 500 ms.
     pub last_enter_instant: Option<Instant>,
@@ -2790,6 +2793,7 @@ impl App {
             next_history_revision: 1,
             api_messages: Vec::new(),
             is_loading: false,
+            dispatch_error_tx: None,
             last_enter_instant: None,
             provider_wait_incident_logged: false,
             prompt_suggestion: None,

@@ -3461,6 +3461,10 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     let config = Config::default();
     drop(engine.rx_op);
 
+    // #4605: dispatch now spawns the async phase and reports errors via channel.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    app.dispatch_error_tx = Some(tx);
+
     let result = dispatch_user_message(
         &mut app,
         &config,
@@ -3470,18 +3474,22 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     .await;
 
     assert!(
-        result.is_err(),
-        "dispatch should fail when engine channel is closed"
+        result.is_ok(),
+        "dispatch_user_message returns Ok; the spawned task reports errors via channel"
     );
     assert!(
-        !app.is_loading,
-        "failed dispatch must not leave the composer in a permanent busy state"
+        app.is_loading,
+        "loading state is set immediately in the sync prepare phase"
     );
-    assert!(app.last_send_at.is_none());
-    assert!(app.dispatch_started_at.is_none());
+
+    // Wait for the spawned task to report the error.
+    let err_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("spawned dispatch should report error within timeout")
+        .expect("channel should receive error message");
     assert!(
-        app.pending_turn_route.is_none(),
-        "failed dispatch must not leave stale route telemetry"
+        err_msg.contains("Dispatch failed"),
+        "error message should indicate dispatch failure: {err_msg}"
     );
 }
 
@@ -3840,7 +3848,12 @@ async fn dispatch_user_message_keeps_auto_review_separate_from_bypass() {
     assert_eq!(pending_route.1, app.model);
     assert!(!pending_route.2);
 
-    match engine.rx_op.recv().await.expect("send message op") {
+    // #4605: dispatch spawns the async phase; the Op arrives from the spawned task.
+    let op = tokio::time::timeout(std::time::Duration::from_secs(2), engine.rx_op.recv())
+        .await
+        .expect("spawned dispatch should deliver Op within timeout")
+        .expect("send message op");
+    match op {
         crate::core::ops::Op::SendMessage {
             mode,
             auto_approve,

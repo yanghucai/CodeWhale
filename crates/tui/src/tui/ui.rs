@@ -50,11 +50,13 @@ use crate::client::{
 };
 use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
+use crate::compaction::CompactionConfig;
 use crate::config::{
     ApiProvider, Config, ProviderConfig, ProvidersConfig, StatusItem, UpdateConfig,
     save_provider_auth_mode_for_at,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
+use codewhale_config::route::RouteLimits;
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
 use crate::core::ops::{Op, ProviderRuntimeStatus, USER_SHELL_TOOL_ID_PREFIX};
@@ -1998,7 +2000,23 @@ async fn run_event_loop(
 
     let mut pending_subagent_list_refresh = false;
 
+    // #4605: channel for spawned dispatch tasks to report errors back to the
+    // event loop without blocking the render thread on network calls.
+    let (dispatch_error_tx, mut dispatch_error_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
+    app.dispatch_error_tx = Some(dispatch_error_tx);
+
     loop {
+        // Drain dispatch errors from spawned send tasks (#4605).
+        while let Ok(err_msg) = dispatch_error_rx.try_recv() {
+            app.is_loading = false;
+            app.dispatch_started_at = None;
+            app.last_send_at = None;
+            app.pending_turn_route = None;
+            app.status_message = Some(err_msg);
+            app.needs_redraw = true;
+        }
+
         // Drain the version-check handle once; re-assign None so we
         // don't poll it again.
         let mut done = false;
@@ -7215,24 +7233,11 @@ async fn dispatch_user_message(
     if let Some(note) = paused_note.as_deref() {
         content.push_str(note);
     }
-    let auto_selection = if auto_router::should_resolve_auto_model_selection(app) {
-        match auto_router::resolve_auto_model_selection(app, config, &message, &content).await {
-            Ok(selection) => Some(selection),
-            Err(err) => {
-                app.is_loading = false;
-                app.dispatch_started_at = None;
-                app.last_send_at = None;
-                app.status_message = Some(format!("Auto model route unavailable: {err}"));
-                return Err(err);
-            }
-        }
-    } else {
-        None
-    };
-    let effective_provider = auto_selection
-        .as_ref()
-        .map(|selection| selection.provider)
-        .unwrap_or(app.api_provider);
+
+    // --- Sync prepare: add message to history and scroll immediately so the
+    // user sees their message and the spinner without waiting on network I/O
+    // (#4605). The async dispatch (auto-model resolution, compaction, engine
+    // send) is spawned below. ---
     let message_index = app.api_messages.len();
     app.system_prompt = Some(build_app_system_prompt(app, config));
     app.add_message(HistoryCell::User {
@@ -7249,11 +7254,6 @@ async fn dispatch_user_message(
         }],
     });
     maybe_warn_context_pressure(app);
-    if should_auto_compact_before_send(app) {
-        app.status_message =
-            Some("Context threshold reached; compacting before send...".to_string());
-        let _ = engine_handle.send(Op::CompactContext).await;
-    }
     app.session.last_prompt_tokens = None;
     app.session.last_completion_tokens = None;
     app.session.last_output_throughput = None;
@@ -7261,25 +7261,176 @@ async fn dispatch_user_message(
     app.session.last_prompt_cache_miss_tokens = None;
     app.session.last_reasoning_replay_tokens = None;
     // Persist immediately so abrupt termination can recover this in-flight turn.
-    // Offloaded to the persistence actor.
     if let Ok(manager) = SessionManager::default_location()
         && let Ok(session) = build_session_snapshot(app, &manager)
     {
         persistence_actor::persist(PersistRequest::Checkpoint(session));
     }
 
-    let effective_model = if app.auto_model {
+    // #4605: Force a redraw so the event loop paints the loading state and
+    // user message immediately, before the spawned async dispatch runs.
+    app.needs_redraw = true;
+    // Set route telemetry optimistically; the TurnStarted event will update
+    // it with the actual auto-routed provider/model when applicable.
+    app.pending_turn_route = Some((app.api_provider, app.model.clone(), app.auto_model));
+
+    // Extract all values needed by the spawned async dispatch phase.
+    let should_auto_resolve = auto_router::should_resolve_auto_model_selection(app);
+    let should_compact = should_auto_compact_before_send(app);
+    let auto_router_context = auto_router::recent_auto_router_context(&app.api_messages);
+    let mode_setting = app.mode.as_setting().to_string();
+    let routing_mode = if app.auto_model { "auto" } else { "fixed" }.to_string();
+    let effort_setting = app
+        .reasoning_effort
+        .as_setting_for_provider(app.api_provider)
+        .to_string();
+    let config_clone = config.clone();
+    let engine = engine_handle.clone();
+    let dispatch_error_tx = app.dispatch_error_tx.clone();
+    let message_display = message.display.clone();
+    let app_model = app.model.clone();
+    let auto_model = app.auto_model;
+    let api_provider = app.api_provider;
+    let mode = app.mode;
+    let route_limits = app.active_route_limits;
+    let compaction = Box::new(app.compaction_config());
+    let goal_objective = app.hunt.quarry.clone();
+    let goal_token_budget = app.hunt.token_budget;
+    let goal_status = app.hunt.verdict.goal_status();
+    let reasoning_effort = app.reasoning_effort;
+    let allow_shell = app.allow_shell;
+    let trust_mode = app.trust_mode;
+    let auto_approve = app_auto_approve_enabled(app);
+    let approval_mode = app.approval_mode;
+    let translation_enabled = app.translation_enabled;
+    let show_thinking = app.show_thinking;
+    let allowed_tools = app.active_allowed_tools.clone();
+    let hook_executor = app.runtime_services.hook_executor.clone();
+    let verbosity = app.verbosity.clone();
+
+    // #4605: Spawn the async dispatch phase so the event loop can draw
+    // immediately. Auto-model resolution (network call), compaction (LLM
+    // call), and engine send all run off the render thread.
+    tokio::spawn(async move {
+        let result = spawned_dispatch_execute(
+            &engine,
+            &config_clone,
+            content,
+            message_display,
+            should_auto_resolve,
+            should_compact,
+            auto_router_context,
+            mode_setting,
+            routing_mode,
+            effort_setting,
+            api_provider,
+            app_model,
+            auto_model,
+            mode,
+            route_limits,
+            compaction,
+            goal_objective,
+            goal_token_budget,
+            goal_status,
+            reasoning_effort,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+            translation_enabled,
+            show_thinking,
+            allowed_tools,
+            hook_executor,
+            verbosity,
+        )
+        .await;
+        if let Err(err) = result
+            && let Some(tx) = dispatch_error_tx
+        {
+            let _ = tx.send(format!("Dispatch failed: {err}"));
+        }
+    });
+
+    Ok(())
+}
+
+/// Async dispatch execution spawned off the render thread (#4605).
+/// Resolves auto-model routing, runs compaction if needed, and sends
+/// the message to the engine. Errors are reported back via the dispatch
+/// error channel.
+#[allow(clippy::too_many_arguments)]
+async fn spawned_dispatch_execute(
+    engine: &EngineHandle,
+    config: &Config,
+    content: String,
+    message_display: String,
+    should_auto_resolve: bool,
+    should_compact: bool,
+    auto_router_context: String,
+    mode_setting: String,
+    routing_mode: String,
+    effort_setting: String,
+    api_provider: ApiProvider,
+    app_model: String,
+    auto_model: bool,
+    mode: AppMode,
+    route_limits: Option<RouteLimits>,
+    compaction: Box<CompactionConfig>,
+    goal_objective: Option<String>,
+    goal_token_budget: Option<u32>,
+    goal_status: GoalStatus,
+    reasoning_effort: ReasoningEffort,
+    allow_shell: bool,
+    trust_mode: bool,
+    auto_approve: bool,
+    approval_mode: crate::tui::approval::ApprovalMode,
+    translation_enabled: bool,
+    show_thinking: bool,
+    allowed_tools: Option<Vec<String>>,
+    hook_executor: Option<std::sync::Arc<HookExecutor>>,
+    verbosity: Option<String>,
+) -> Result<()> {
+    let auto_selection = if should_auto_resolve {
+        match crate::model_routing::resolve_auto_route_with_inventory_for_session(
+            config,
+            &message_display,
+            &auto_router_context,
+            &mode_setting,
+            &routing_mode,
+            &effort_setting,
+        )
+        .await
+        {
+            Ok(selection) => Some(selection),
+            Err(err) => {
+                return Err(anyhow::anyhow!("Auto model route unavailable: {err}"));
+            }
+        }
+    } else {
+        None
+    };
+
+    let effective_provider = auto_selection
+        .as_ref()
+        .map(|selection| selection.provider)
+        .unwrap_or(api_provider);
+
+    if should_compact {
+        let _ = engine.send(Op::CompactContext).await;
+    }
+
+    let effective_model = if auto_model {
         auto_selection
             .as_ref()
             .map(|selection| selection.model.clone())
             .unwrap_or_else(|| {
-                crate::model_routing::auto_model_heuristic(&message.display, &app.model)
+                crate::model_routing::auto_model_heuristic(&message_display, &app_model)
             })
     } else {
-        app.model.clone()
+        app_model.clone()
     };
 
-    let auto_controls_reasoning = app.auto_model || app.reasoning_effort == ReasoningEffort::Auto;
+    let auto_controls_reasoning = auto_model || reasoning_effort == ReasoningEffort::Auto;
     let effective_reasoning_effort = if auto_controls_reasoning {
         let effort = auto_selection
             .as_ref()
@@ -7287,75 +7438,45 @@ async fn dispatch_user_message(
             .unwrap_or_else(|| {
                 auto_router::normalize_auto_routed_effort(crate::auto_reasoning::select(
                     false,
-                    &message.display,
+                    &message_display,
                 ))
             });
-        app.last_effective_reasoning_effort = Some(effort);
         effort
             .api_value_for_provider(effective_provider)
             .map(str::to_string)
     } else {
-        app.last_effective_reasoning_effort = None;
-        app.reasoning_effort
+        reasoning_effort
             .api_value_for_provider(effective_provider)
             .map(str::to_string)
     };
 
-    if let Some(selection) = auto_selection.as_ref() {
-        if app.auto_model {
-            app.last_effective_model = Some(effective_model.clone());
-            let mut status = format!(
-                "Auto model selected: {} / {effective_model} via {}",
-                selection.provider.display_name(),
-                selection.source.label()
-            );
-            if let Some(effort) = app.last_effective_reasoning_effort {
-                status.push_str(&format!(
-                    "; thinking auto: {}",
-                    effort.display_label_for_provider(effective_provider)
-                ));
-            }
-            app.status_message = Some(status);
-        }
-    } else {
-        app.last_effective_model = None;
-    }
-
-    app.pending_turn_route = Some((effective_provider, effective_model.clone(), app.auto_model));
-    if let Err(err) = engine_handle
+    engine
         .send(Op::SendMessage {
             content,
-            mode: app.mode,
+            mode,
             provider: Some(effective_provider),
             model: effective_model,
-            route_limits: app.active_route_limits,
-            compaction: Box::new(app.compaction_config()),
-            goal_objective: app.hunt.quarry.clone(),
-            goal_token_budget: app.hunt.token_budget,
-            goal_status: app.hunt.verdict.goal_status(),
+            route_limits,
+            compaction,
+            goal_objective,
+            goal_token_budget,
+            goal_status,
             reasoning_effort: effective_reasoning_effort,
             reasoning_effort_auto: auto_controls_reasoning,
-            auto_model: app.auto_model,
-            allow_shell: app.allow_shell,
-            trust_mode: app.trust_mode,
-            auto_approve: app_auto_approve_enabled(app),
-            approval_mode: app.approval_mode,
-            translation_enabled: app.translation_enabled,
-            show_thinking: app.show_thinking,
-            allowed_tools: app.active_allowed_tools.clone(),
+            auto_model,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+            translation_enabled,
+            show_thinking,
+            allowed_tools,
             dynamic_tools: Vec::new(),
-            hook_executor: app.runtime_services.hook_executor.clone(),
-            verbosity: app.verbosity.clone(),
+            hook_executor,
+            verbosity,
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
         })
-        .await
-    {
-        app.is_loading = false;
-        app.dispatch_started_at = None;
-        app.last_send_at = None;
-        app.pending_turn_route = None;
-        return Err(err);
-    }
+        .await?;
 
     Ok(())
 }
