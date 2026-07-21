@@ -7,6 +7,10 @@ use super::turn_loop::{
 };
 use crate::config::ApiProvider;
 use crate::models::{SystemBlock, Usage};
+use crate::prompts::{
+    PromptSessionContext, system_prompt_flat_text,
+    system_prompt_for_mode_with_context_skills_and_session,
+};
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
 use crate::tools::spec::ToolCapability;
@@ -5349,6 +5353,44 @@ fn print_agent_tool_catalog_metrics() {
             "active_tokens_est": active_json.len().div_ceil(4),
             "reduction_percent": reduction_percent,
             "active_tool_names": active_catalog.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+        })
+    );
+}
+
+#[test]
+#[ignore = "one-shot metric for scripts/measure-runtime-contract.py"]
+#[allow(clippy::print_stdout)]
+fn print_agent_runtime_contract_metrics() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let session_context = PromptSessionContext::default();
+    let prompt = system_prompt_for_mode_with_context_skills_and_session(
+        &workspace,
+        None,
+        None,
+        None,
+        session_context,
+    );
+    let flat_prompt = system_prompt_flat_text(&prompt);
+    let prompt_bytes = flat_prompt.len();
+    let prompt_tokens_est = prompt_bytes.div_ceil(4);
+
+    // Mode runtime instructions are delivered as per-turn metadata; measure
+    // them separately so prompt-size work does not forget the volatile surface.
+    let mode_bytes = crate::prompts::AGENT_MODE.len();
+    let mode_tokens_est = mode_bytes.div_ceil(4);
+
+    println!(
+        "RUNTIME_CONTRACT_METRICS {}",
+        serde_json::json!({
+            "system_prompt_bytes": prompt_bytes,
+            "system_prompt_tokens_est": prompt_tokens_est,
+            "system_prompt_blocks": match prompt {
+                crate::models::SystemPrompt::Blocks(blocks) => blocks.len(),
+                _ => 1,
+            },
+            "agent_mode_instructions_bytes": mode_bytes,
+            "agent_mode_instructions_tokens_est": mode_tokens_est,
         })
     );
 }
