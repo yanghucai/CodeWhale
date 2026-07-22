@@ -161,7 +161,7 @@ impl UserCommandRegistry {
             .map(|(metadata, _, _)| metadata.name.clone())
             .collect::<HashSet<_>>();
 
-        for (metadata, errors, path) in parsed_commands {
+        for (mut metadata, errors, path) in parsed_commands {
             for error in &errors {
                 self.record_load_error(error.path.clone(), error.message.clone());
             }
@@ -186,6 +186,7 @@ impl UserCommandRegistry {
                     .or_insert(error.message);
             }
 
+            let mut accepted_aliases = Vec::with_capacity(metadata.aliases.len());
             for alias in &metadata.aliases {
                 let alias = alias.to_ascii_lowercase();
                 if canonical_names.contains(&alias) {
@@ -208,8 +209,13 @@ impl UserCommandRegistry {
                     );
                     continue;
                 }
-                self.aliases.insert(alias, metadata.name.clone());
+                self.aliases.insert(alias.clone(), metadata.name.clone());
+                accepted_aliases.push(alias);
             }
+            // Discovery surfaces consume metadata directly. Keep it aligned
+            // with the dispatch map so a rejected alias is never advertised
+            // by help, command palettes, or slash completion.
+            metadata.aliases = accepted_aliases;
 
             self.commands.insert(metadata.name.clone(), metadata);
         }
@@ -920,6 +926,11 @@ mod tests {
         let command = registry.get("shared").expect("alias resolves");
         assert_eq!(command.name, "first");
         assert_eq!(command.body, "first body");
+        assert_eq!(command.aliases, ["shared"]);
+        assert!(
+            registry.get("second").unwrap().aliases.is_empty(),
+            "the losing command must not advertise an alias it does not own"
+        );
         assert!(
             registry.load_errors().iter().any(|error| error
                 .message
@@ -946,6 +957,10 @@ mod tests {
         let command = registry.get("beta").expect("canonical command resolves");
         assert_eq!(command.name, "beta");
         assert_eq!(command.body, "beta body");
+        assert!(
+            registry.get("alpha").unwrap().aliases.is_empty(),
+            "a canonical-name collision must be absent from alias metadata"
+        );
         assert!(
             registry.load_errors().iter().any(|error| error
                 .message

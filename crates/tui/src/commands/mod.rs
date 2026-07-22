@@ -520,6 +520,12 @@ mod tests {
             "---\ndescription: User canzha workflow\nusage: /review <task>\nalias: canzha\n---\ncustom canzha $ARGUMENTS",
         )
         .unwrap();
+        std::fs::write(
+            commands_dir.join("alpha.md"),
+            "---\nalias: beta\n---\nalpha body",
+        )
+        .unwrap();
+        std::fs::write(commands_dir.join("beta.md"), "beta body").unwrap();
 
         let mut app = create_test_app();
         app.workspace = temp.path().to_path_buf();
@@ -584,6 +590,20 @@ mod tests {
         let debt_typo = execute("/detb", &mut app);
         let debt_typo_message = debt_typo.message.expect("typo should return guidance");
         assert!(debt_typo_message.contains("/debt"), "{debt_typo_message}");
+
+        let alpha_help = execute("/help alpha", &mut app);
+        assert!(!alpha_help.is_error);
+        let alpha_message = alpha_help.message.expect("alpha help text");
+        assert!(!alpha_message.contains("beta"), "{alpha_message}");
+
+        let beta_help = execute("/help beta", &mut app);
+        assert!(!beta_help.is_error);
+        assert!(
+            beta_help
+                .message
+                .expect("beta help text")
+                .starts_with("beta\n")
+        );
     }
 
     #[test]

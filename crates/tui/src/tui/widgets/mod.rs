@@ -5289,6 +5289,38 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_omits_rejected_user_alias_collisions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("alpha.md"),
+            "---\ndescription: Alpha command\nalias: beta\n---\nalpha",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("beta.md"),
+            "---\ndescription: Beta command\n---\nbeta",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/bet",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(hints.iter().any(|hint| hint.name == "/beta"));
+        assert!(
+            !hints.iter().any(|hint| hint.name == "/alpha"),
+            "a command must not match through an alias rejected by the registry"
+        );
+    }
+
+    #[test]
     fn slash_completion_hints_keep_builtin_canonical_when_only_builtin_alias_is_shadowed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
