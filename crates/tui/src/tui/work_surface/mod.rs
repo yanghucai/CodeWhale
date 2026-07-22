@@ -9,6 +9,7 @@ mod model;
 mod render;
 
 pub use input::{handle_key, handle_mouse};
+pub(crate) use interaction::agent_details_closed;
 pub use model::{WorkSurfacePlacement, WorkSurfaceState};
 pub use render::{height, render, split_chat};
 
@@ -26,8 +27,13 @@ mod tests {
         AgentWorkerStatus, SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType,
     };
     use crate::tools::todo::TodoStatus;
-    use crate::tui::app::{App, SidebarRowAction, ToolDetailRecord, TuiOptions};
-    use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+    use crate::tui::app::{
+        AgentCurrentActivity, AgentCurrentActivityStatus, App, SidebarRowAction, ToolDetailRecord,
+        TuiOptions,
+    };
+    use crate::tui::history::{
+        FileMutationReceipt, GenericToolCell, HistoryCell, PatchSummaryCell, ToolCell, ToolStatus,
+    };
     use crate::work_graph::{
         AcceptanceRequirement, ChangeCtx, EdgeKind, EvidenceKindTag, NodeKind, NodeState,
         OperationBinding, OperationOwnerSnapshot, OwnerState, Provenance, WorkEdge, WorkEdgeId,
@@ -217,6 +223,136 @@ mod tests {
     }
 
     #[test]
+    fn coordination_projection_is_one_selectable_work_row_with_shared_details() {
+        use crate::tools::subagent::CoordinationDetailProjection;
+        use crate::tools::subagent::coord::{
+            CoordinationDetailMetrics, DecisionRecord, DecisionStatus,
+        };
+
+        let mut app = app();
+        app.coordination_detail = Some(CoordinationDetailProjection {
+            schema_version: 1,
+            sequence: 7,
+            decisions: vec![DecisionRecord {
+                decision_id: "decision-work".to_string(),
+                subject: "coordination row".to_string(),
+                status: DecisionStatus::Accepted,
+                owner: "release-owner".to_string(),
+                scope: Vec::new(),
+                constraints: vec!["PRIVATE-TRANSCRIPT-MARKER".to_string()],
+                evidence_handles: Vec::new(),
+                version: 2,
+                sequence: 7,
+            }],
+            write_claims: Vec::new(),
+            reconciliations: Vec::new(),
+            context_projections: Vec::new(),
+            contentions: Vec::new(),
+            metrics: CoordinationDetailMetrics {
+                hottest_paths: Vec::new(),
+                package_or_module_growth: None,
+                route_or_cost: None,
+                note: "No active claims".to_string(),
+            },
+            bounded: true,
+            limit: 24,
+        });
+
+        let rows = super::model::project(&mut app);
+        assert_eq!(
+            rows[0].label,
+            "Work · 0 active · 0 needs input · 0 ready · 1 recent"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "coordination")
+            .expect("coordination Work row");
+        assert_eq!(row.label, "Coordination Work");
+        assert_eq!(row.detail, "1 decisions · 0 contentions · 0 reconciled");
+        let Some(SidebarRowAction::InspectWork { title, body, .. }) = row.primary_action.as_ref()
+        else {
+            panic!("coordination row must open the shared Work inspector");
+        };
+        assert_eq!(title, "Coordination Work");
+        assert!(body.contains("decision-work · coordination row"), "{body}");
+        assert!(
+            body.contains("status accepted · owner release-owner · version 2"),
+            "{body}"
+        );
+        assert!(!body.contains("PRIVATE-TRANSCRIPT-MARKER"), "{body}");
+
+        let narrow = render_text(&mut app, 32, 4);
+        assert!(narrow.contains("Coordination Work"), "{narrow}");
+        let _ = super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        let action = super::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("Work surface handled Enter")
+            .expect("coordination inspector action");
+        assert!(matches!(action, SidebarRowAction::InspectWork { .. }));
+    }
+
+    #[test]
+    fn current_blocked_contention_uses_attention_bucket_mark_and_tone() {
+        use crate::tools::subagent::CoordinationDetailProjection;
+        use crate::tools::subagent::coord::{
+            CoordinationDetailMetrics, PersistedWriteClaim, WriteContentionDisposition,
+            WriteContentionReceipt, WriteScopeClaim,
+        };
+
+        let mut app = app();
+        app.coordination_detail = Some(CoordinationDetailProjection {
+            schema_version: 1,
+            sequence: 2,
+            decisions: Vec::new(),
+            write_claims: vec![PersistedWriteClaim {
+                claim: WriteScopeClaim {
+                    owner: "worker-a".to_string(),
+                    roots: vec!["crates/tui".to_string()],
+                    exact_files: Vec::new(),
+                    contracts: vec!["ui-contract".to_string()],
+                },
+                sequence: 1,
+                isolated_worktree: false,
+            }],
+            reconciliations: Vec::new(),
+            context_projections: Vec::new(),
+            contentions: vec![WriteContentionReceipt {
+                claimant: "worker-b".to_string(),
+                conflicting_owner: "worker-a".to_string(),
+                roots: vec!["crates/tui".to_string()],
+                exact_files: Vec::new(),
+                contracts: vec!["ui-contract".to_string()],
+                disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
+                resolution_sequence: None,
+                sequence: 2,
+            }],
+            metrics: CoordinationDetailMetrics {
+                hottest_paths: Vec::new(),
+                package_or_module_growth: None,
+                route_or_cost: None,
+                note: "No authoritative metric source".to_string(),
+            },
+            bounded: true,
+            limit: 24,
+        });
+
+        let rows = super::model::project(&mut app);
+        assert_eq!(
+            rows[0].label,
+            "Work · 0 active · 1 needs input · 0 ready · 0 recent"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "coordination")
+            .expect("blocked coordination Work row");
+        assert_eq!(row.mark, crate::tui::glyphs::ATTENTION);
+        assert_eq!(row.tone, super::model::WorkTone::Attention);
+        assert_eq!(row.detail, "0 decisions · 1 contentions · 0 reconciled");
+    }
+
+    #[test]
     fn todos_share_one_ordered_work_projection_without_a_second_heading() {
         let mut app = app();
         {
@@ -342,6 +478,12 @@ mod tests {
         app.agent_progress_meta.insert(
             "agent_worker".to_string(),
             crate::tui::app::AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::RunningTool,
+                    None,
+                    Some("File.apply_patch".to_string()),
+                    Some(2),
+                )),
                 current_tool: Some("apply_patch".to_string()),
                 files_touched: 2,
                 ..crate::tui::app::AgentProgressMeta::default()
@@ -355,7 +497,8 @@ mod tests {
             .expect("agent work row");
         assert_eq!(row.label, "Agent Blue Whale · worker");
         assert!(row.detail.contains("Wire settled file activity"));
-        assert!(row.detail.contains("using apply_patch"));
+        assert!(row.detail.contains("using File.apply_patch"));
+        assert!(row.detail.contains("step 2"));
         assert!(row.detail.contains("2 files changed"));
         assert_eq!(
             row.primary_action,
@@ -366,15 +509,165 @@ mod tests {
     }
 
     #[test]
-    fn active_session_without_work_renders_truthful_empty_state() {
+    fn progress_only_work_rows_use_typed_activity_not_display_substrings() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.agent_progress.insert(
+            "agent_progress_only".to_string(),
+            "queued waiting failed completed".to_string(),
+        );
+
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_progress_only")
+            .expect("progress-only work row");
+        assert_eq!(row.detail, "running");
+
+        app.agent_progress_meta.insert(
+            "agent_progress_only".to_string(),
+            crate::tui::app::AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::Waiting,
+                    Some("approval required".to_string()),
+                    None,
+                    Some(5),
+                )),
+                ..crate::tui::app::AgentProgressMeta::default()
+            },
+        );
+
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_progress_only")
+            .expect("typed progress-only work row");
+        assert!(row.detail.contains("waiting for input"), "{}", row.detail);
+        assert!(row.detail.contains("approval required"), "{}", row.detail);
+        assert!(row.detail.contains("step 5"), "{}", row.detail);
+    }
+
+    #[test]
+    fn agent_details_keyboard_mouse_and_return_selection_converge() {
+        fn add_worker(app: &mut App) {
+            app.current_session_id = Some(SESSION.to_string());
+            app.subagent_cache.push(SubAgentResult {
+                name: "agent_converge".to_string(),
+                agent_id: "agent_converge".to_string(),
+                context_mode: "fresh".to_string(),
+                fork_context: false,
+                workspace: None,
+                git_branch: Some("codex/details".to_string()),
+                agent_type: SubAgentType::Implementer,
+                assignment: SubAgentAssignment {
+                    objective: "Verify keyboard and mouse convergence".to_string(),
+                    role: Some("worker".to_string()),
+                },
+                model: "test-model".to_string(),
+                nickname: Some("Blue Whale".to_string()),
+                status: SubAgentStatus::Running,
+                worker_status: Some(AgentWorkerStatus::Running),
+                parent_run_id: None,
+                spawn_depth: 1,
+                result: None,
+                steps_taken: 1,
+                checkpoint: None,
+                needs_input: None,
+                duration_ms: 100,
+                from_prior_session: false,
+            });
+        }
+
+        let mut keyboard = app();
+        add_worker(&mut keyboard);
+        let _ = render_text(&mut keyboard, 100, 6);
+        let _ = super::handle_key(
+            &mut keyboard,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        let keyboard_action = super::handle_key(
+            &mut keyboard,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .expect("Work key handled")
+        .expect("agent details action");
+        let keyboard_selection = keyboard.work_surface.selected.clone();
+
+        let mut mouse = app();
+        add_worker(&mut mouse);
+        let _ = render_text(&mut mouse, 100, 6);
+        let row_y = mouse
+            .work_surface
+            .hitboxes
+            .iter()
+            .find(|hit| hit.id.0 == "worker:agent_converge")
+            .expect("agent hitbox")
+            .row_y;
+        let mouse_action = super::handle_mouse(
+            &mut mouse,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: row_y,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .action
+        .expect("mouse agent details action");
+        assert_eq!(mouse_action, keyboard_action);
+        assert_eq!(mouse.work_surface.selected, keyboard_selection);
+
+        crate::tui::mouse_ui::apply_sidebar_row_action(&mut mouse, mouse_action);
+        let selected_before_close = mouse.work_surface.selected.clone();
+        let events = mouse
+            .view_stack
+            .handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let [crate::tui::views::ViewEvent::AgentDetailsClosed { agent_id }] = events.as_slice()
+        else {
+            panic!("Left should close Agent Details with a receipt: {events:?}");
+        };
+        super::interaction::agent_details_closed(&mut mouse, agent_id);
+        assert_eq!(mouse.work_surface.selected, selected_before_close);
+        assert!(mouse.work_surface.opened.is_none());
+    }
+
+    #[test]
+    fn active_session_without_work_keeps_surface_invisible() {
         let mut app = app();
         app.current_session_id = Some(SESSION.to_string());
 
         let rows = super::model::project(&mut app);
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Work · empty");
-        assert!(!rows[0].selectable);
+        assert!(rows.is_empty());
+        assert_eq!(super::height(&mut app, 120, 32, false), 0);
+    }
+
+    #[test]
+    fn empty_work_stays_hidden_after_cached_session_state_is_cleared() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.work_surface.cached_graph = Some(operation_graph(NodeState::Active));
+
+        let rows = super::model::project(&mut app);
+
+        assert!(rows.is_empty());
+        assert!(app.work_surface.cached_graph.is_none());
+    }
+
+    #[test]
+    fn empty_work_reserves_no_side_rail() {
+        for placement in [
+            super::WorkSurfacePlacement::Left,
+            super::WorkSurfacePlacement::Right,
+        ] {
+            let mut app = app();
+            app.current_session_id = Some(SESSION.to_string());
+            app.work_surface.placement = placement;
+            let area = ratatui::layout::Rect::new(0, 0, 120, 32);
+
+            assert_eq!(super::height(&mut app, area.width, area.height, false), 0);
+            assert_eq!(super::split_chat(&mut app, area, false), (area, None));
+        }
     }
 
     #[test]
@@ -596,6 +889,47 @@ mod tests {
         assert!(hover.is_truncated);
         assert!(hover.full_text.contains("deliberately long graph-owned"));
         assert!(hover.stop_action.is_none());
+    }
+
+    #[test]
+    fn narrow_file_activity_prioritizes_the_canonical_aggregate_label() {
+        let mut app = app();
+        app.workspace = PathBuf::from("/workspace/project");
+        let result = crate::tools::spec::ToolResult::success("ok").with_metadata(
+            serde_json::json!({
+                "mutation": {
+                    "diff": "--- a/update.rs\n+++ b/update.rs\n@@ -1 +1 @@\n-old\n+new\n--- /dev/null\n+++ b/create.rs\n@@ -0,0 +1 @@\n+created\n--- a/delete.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-deleted\n",
+                    "files": [
+                        { "path": "update.rs", "outcome": "updated" },
+                        { "path": "create.rs", "outcome": "created" },
+                        { "path": "delete.rs", "outcome": "deleted" }
+                    ],
+                    "renames": [{ "from": "old.rs", "to": "new.rs" }]
+                }
+            }),
+        );
+        let receipt = FileMutationReceipt::from_success(&app.workspace, &result).expect("receipt");
+        app.add_message(HistoryCell::Tool(ToolCell::PatchSummary(
+            PatchSummaryCell {
+                path: "4 files".to_string(),
+                summary: "ok".to_string(),
+                status: ToolStatus::Success,
+                error: None,
+                receipt: Some(receipt),
+            },
+        )));
+        app.tool_details_by_cell.insert(
+            0,
+            ToolDetailRecord {
+                tool_id: "file-multi".to_string(),
+                tool_name: "File".to_string(),
+                input: serde_json::json!({"action": "patch"}),
+                output: Some("ok".to_string()),
+            },
+        );
+
+        let text = render_text(&mut app, 80, 6);
+        assert!(text.contains("Wrote 4 files"), "{text}");
     }
 
     #[test]

@@ -10,19 +10,12 @@
 //! would blow the prompt budget the moment a user has half a dozen
 //! skills installed.
 //!
-//! Two paths exist for the model to actually read a native skill:
-//!
-//! 1. The existing progressive-disclosure pattern: model spots a
-//!    skill in the catalogue, calls `read_file <path>` from the
-//!    listing.
-//! 2. (this tool) `load_skill name=<id>` — single call, name-based
-//!    lookup, also enumerates the sibling files in the skill's
-//!    directory so the model sees the companion resources without
-//!    a separate `list_dir`.
-//!
-//! Both are valid for native skills. Reviewed plugin skills are exposed only
-//! through this tool's content-bound in-memory snapshot; their mutable source
-//! paths and companion files are deliberately not returned.
+//! `load_skill name=<id>` is the canonical progressive-disclosure path. It
+//! performs a name-based host lookup, so native global skills work without
+//! widening the model's workspace file authority, and it enumerates companion
+//! files without a separate `list_dir`. Reviewed plugin skills are exposed
+//! only through this tool's content-bound in-memory snapshot; their mutable
+//! source paths and companion files are deliberately not returned.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -559,6 +552,46 @@ mod tests {
             msg.contains("claude-only") && msg.contains("codewhale-only"),
             "error should name the missing skill and available strict catalog: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_loads_configured_external_skill_without_workspace_trust() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let home = tmp.path().join("home");
+        let global_skills = home.join(".codewhale/skills");
+        fs::create_dir_all(&workspace).unwrap();
+        write_skill(
+            &global_skills,
+            "global-helper",
+            "Global helper",
+            "Global body marker.",
+        );
+
+        // Keep this test independent of the process-native home directory:
+        // `dirs::home_dir()` cannot be redirected reliably after process start
+        // on Windows. The injected-home discovery test in `skills::tests`
+        // separately proves that ~/.codewhale/skills enters the default catalog.
+        let context = ToolContext::new(&workspace).with_skills_config(global_skills.clone(), false);
+        assert!(!context.trust_mode);
+        assert!(
+            context
+                .resolve_path(
+                    global_skills
+                        .join("global-helper/SKILL.md")
+                        .to_str()
+                        .unwrap()
+                )
+                .is_err(),
+            "ordinary file tools must retain the workspace boundary"
+        );
+
+        let result = LoadSkillTool
+            .execute(json!({"name": "global-helper"}), &context)
+            .await
+            .expect("load_skill host lookup should open a configured external skill root");
+        assert!(result.success);
+        assert!(result.content.contains("Global body marker."));
     }
 
     #[tokio::test]

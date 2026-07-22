@@ -1,10 +1,10 @@
-<!-- source: README.md sha256:f76ebd048ff1 -->
+<!-- source: README.md sha256:a14f7d3aa7d1 -->
 # Codewhale
 
-**Un runtime. Todos los modelos. Tu máquina.**
+**Un runtime. Modelos alojados y locales compatibles. Tu máquina.**
 
-Codewhale es un agente de código para tu terminal. Funciona con cualquier
-modelo; los modelos abiertos primero. Le das un proveedor, un modelo y una
+Codewhale es un agente de código para tu terminal. Funciona con modelos
+alojados y locales compatibles; los modelos abiertos primero. Le das un proveedor, un modelo y una
 tarea: lee tu código, edita archivos, ejecuta comandos, verifica su trabajo y
 se detiene cuando la tarea queda lista o te necesita. Cambia de modelo a
 mitad de tarea con `/model`. Usa la TUI para el trabajo interactivo y
@@ -17,10 +17,12 @@ mitad de tarea con `/model`. Usa la TUI para el trabajo interactivo y
   vienen de la ruta real. Un precio desconocido se muestra como desconocido,
   nunca como $0.
 - **Seguro por construcción.** El modo Plan es de solo lectura. Las
-  aprobaciones controlan cada llamada riesgosa. El sandbox del sistema
-  operativo resiste — Seatbelt, Landlock, seccomp, bwrap. El
-  `constitution.json` de un repo se compila en bloqueos de escritura que ni
-  siquiera Full Access puede saltarse.
+  aprobaciones controlan cada llamada riesgosa. Codewhale solo informa un
+  sandbox de comandos del sistema operativo cuando realmente envuelve el
+  comando: Seatbelt en macOS cuando está disponible y bubblewrap opcional en
+  Linux cuando está instalado. Windows actualmente informa que no hay
+  sandbox. El `constitution.json` de un repo se compila en bloqueos de
+  escritura que ni siquiera Full Access puede saltarse.
 - **Trabajo que sobrevive.** Los fleets registran cada paso en un libro mayor
   de solo agregado; `fleet resume` retoma donde te detuviste. Cada turno deja
   un recibo que puedes inspeccionar.
@@ -57,10 +59,10 @@ codewhale web                            # local browser client on 127.0.0.1
 ```
 
 En la TUI: `/model` cambia proveedor y modelo juntos, `/fleet` ejecuta un
-equipo de workers, `/restore` deshace un turno, `Tab` cicla entre
-Plan / Act / Operate, `Shift+Tab` cicla la postura de aprobación
-Ask / Auto-Review / Full Access, y `!` ejecuta un comando de shell por la ruta
-normal de aprobación.
+equipo de workers y `/restore` deshace un turno. Cuando el compositor está
+inactivo, `Tab` cicla entre Plan / Act / Operate y `Shift+Tab` cicla la postura
+de permiso Ask / Auto-Review / Full Access. `!` ejecuta un comando de shell por
+la ruta normal de aprobación.
 
 ## Para saber más
 

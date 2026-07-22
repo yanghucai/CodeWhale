@@ -775,6 +775,51 @@ pub(super) fn api_url_with_suffix(base_url: &str, path: &str, path_suffix: Optio
     format!("{}/{}", versioned.trim_end_matches('/'), path)
 }
 
+/// Route strict DeepSeek tool requests through the beta Chat Completions
+/// surface while keeping every ordinary request on the canonical `/v1` path.
+///
+/// DeepSeek requires its `/beta` base URL when a function opts into
+/// `strict: true`. The configured route URL remains semantic here because
+/// unit tests may replace only the transport origin with a local capture
+/// server.
+///
+/// Source: <https://api-docs.deepseek.com/guides/tool_calls/> (verified 2026-07-22).
+fn chat_completions_url(
+    transport_base_url: &str,
+    route_base_url: &str,
+    provider: ApiProvider,
+    path_suffix: Option<&str>,
+    body: &Value,
+) -> String {
+    let uses_deepseek_beta = matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        && is_official_deepseek_beta_base_url(route_base_url)
+        && body_uses_strict_tools(body)
+        && path_suffix.is_none();
+    let path = if uses_deepseek_beta {
+        "beta/chat/completions"
+    } else {
+        "chat/completions"
+    };
+    api_url_with_suffix(transport_base_url, path, path_suffix)
+}
+
+fn is_official_deepseek_beta_base_url(base_url: &str) -> bool {
+    matches!(
+        base_url.trim_end_matches('/').to_ascii_lowercase().as_str(),
+        "https://api.deepseek.com/beta" | "https://api.deepseeki.com/beta"
+    )
+}
+
+fn body_uses_strict_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.pointer("/function/strict").and_then(Value::as_bool) == Some(true))
+        })
+}
+
 fn normalize_audio_format(format: &str) -> String {
     let normalized = format.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -1302,8 +1347,23 @@ pub async fn verify_provider_api_key(
         .map_err(|err| format!("request failed: {err:#}"))?;
     let status = response.status();
     if status.is_success() {
-        // Consume the body so the connection returns to the pool.
-        let _ = response.text().await;
+        // TelecomJS verification already returns the key-scoped model roster.
+        // Publish it before returning so the guided model picker can render the
+        // live choices in this session instead of requiring a restart. A valid
+        // 2xx response remains sufficient to verify the key even if the body is
+        // malformed; in that case failure-preserving catalog semantics keep the
+        // existing/static rows.
+        let body = response.text().await.unwrap_or_default();
+        if provider == ApiProvider::Telecomjs
+            && let Ok(offerings) = telecomjs_catalog_offerings_from_body(
+                &body,
+                provider.as_str(),
+                &base_url_fingerprint(base_url),
+                now_unix(),
+            )
+        {
+            crate::provider_lake::merge_live_offerings(offerings);
+        }
         Ok(())
     } else {
         let body = response.text().await.unwrap_or_default();
@@ -1591,6 +1651,8 @@ impl DeepSeekClient {
                     openrouter_to_catalog_offering(item, &provider, &fingerprint, fetched_at)
                 })
                 .collect()
+        } else if provider == "telecomjs" {
+            telecomjs_catalog_offerings_from_body(&body, &provider, &fingerprint, fetched_at)?
         } else {
             let models = apply_provider_model_cutline(
                 self.api_provider,
@@ -1657,6 +1719,60 @@ impl DeepSeekClient {
                 CatalogStatus::Failed { reason }
             }
         }
+    }
+
+    /// Best-effort background refresh of the active provider's own `/v1/models`
+    /// catalog, merging results into the provider lake (#3385).
+    ///
+    /// Unlike [`models_dev_live::spawn_background_refresh`] (which fetches the
+    /// cross-provider Models.dev catalog), this calls the provider's own
+    /// `/v1/models` endpoint and merges the results into the existing live
+    /// snapshot via [`provider_lake::merge_live_offerings`], preserving rows
+    /// from other sources.
+    ///
+    /// Currently activated for providers whose model list is not covered by the
+    /// Models.dev catalog (e.g. TelecomJS TokenHub). The refresh is non-fatal:
+    /// on failure, existing/bundled rows remain available.
+    pub fn spawn_active_provider_catalog_refresh(config: &Config) {
+        let provider = config.api_provider();
+        // Only refresh for providers that serve their own model list and are
+        // not already covered by the Models.dev catalog.
+        if !matches!(provider, ApiProvider::Telecomjs) {
+            return;
+        }
+
+        let client = match DeepSeekClient::new(config) {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::debug!(
+                    target: "provider_catalog",
+                    error = %err,
+                    "skipping provider catalog refresh: client creation failed"
+                );
+                return;
+            }
+        };
+
+        tokio::spawn(async move {
+            match client.fetch_catalog_delta().await {
+                Ok(delta) => {
+                    let count = delta.offerings.len();
+                    crate::provider_lake::merge_live_offerings(delta.offerings);
+                    tracing::debug!(
+                        target: "provider_catalog",
+                        offering_count = count,
+                        "provider catalog refresh merged {count} offerings into provider lake"
+                    );
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        target: "provider_catalog",
+                        error = ?err,
+                        "provider catalog refresh failed; keeping existing rows"
+                    );
+                }
+            }
+        });
     }
 
     /// Generate speech with Xiaomi MiMo TTS models.
@@ -2115,6 +2231,80 @@ fn apply_provider_model_cutline(
     models
 }
 
+/// Convert TelecomJS's bare `/models` response into truthful provider-scoped
+/// catalog rows. Matching model ids on other providers prove no capabilities,
+/// limits, or prices; only an explicit same-provider bundled row may enrich a
+/// live offering.
+fn telecomjs_catalog_offerings_from_body(
+    body: &str,
+    provider: &str,
+    fingerprint: &str,
+    fetched_at: u64,
+) -> Result<Vec<CatalogOffering>, CatalogRefreshError> {
+    let models = parse_models_response(body).map_err(|_| CatalogRefreshError::InvalidResponse)?;
+    if models.is_empty() {
+        return Err(CatalogRefreshError::EmptyList);
+    }
+
+    let bundled = codewhale_config::catalog::bundled_catalog_offerings();
+    let default_model_id = codewhale_config::ProviderKind::Telecomjs
+        .provider()
+        .default_model();
+    Ok(models
+        .into_iter()
+        .map(|model| {
+            let is_default = model.id.eq_ignore_ascii_case(default_model_id);
+            let same_provider_match = bundled.iter().find(|offering| {
+                offering.provider.eq_ignore_ascii_case(provider)
+                    && offering.wire_model_id.eq_ignore_ascii_case(&model.id)
+            });
+            if let Some(matched) = same_provider_match {
+                CatalogOffering {
+                    provider: provider.to_string(),
+                    wire_model_id: model.id,
+                    canonical_model: matched.canonical_model.clone(),
+                    endpoint_key: "chat".to_string(),
+                    default_for_provider: is_default,
+                    family: matched.family.clone(),
+                    limit: matched.limit.clone(),
+                    cost: matched.cost.clone(),
+                    modalities: matched.modalities.clone(),
+                    attachment: matched.attachment,
+                    reasoning: matched.reasoning,
+                    tool_call: matched.tool_call,
+                    structured_output: matched.structured_output,
+                    reasoning_options: matched.reasoning_options.clone(),
+                    source: CatalogSource::Live {
+                        base_url_fingerprint: fingerprint.to_string(),
+                        fetched_at,
+                    },
+                }
+            } else {
+                CatalogOffering {
+                    provider: provider.to_string(),
+                    wire_model_id: model.id,
+                    canonical_model: None,
+                    endpoint_key: "chat".to_string(),
+                    default_for_provider: is_default,
+                    family: None,
+                    limit: None,
+                    cost: None,
+                    modalities: None,
+                    attachment: None,
+                    reasoning: None,
+                    tool_call: None,
+                    structured_output: None,
+                    reasoning_options: Vec::new(),
+                    source: CatalogSource::Live {
+                        base_url_fingerprint: fingerprint.to_string(),
+                        fetched_at,
+                    },
+                }
+            }
+        })
+        .collect())
+}
+
 /// Parse an OpenRouter `/models` response, preserving server-side ordering and
 /// capturing full capability metadata (#3385).
 fn parse_openrouter_models_response(
@@ -2133,13 +2323,15 @@ fn parse_openrouter_models_response(
 
 fn publish_provider_lake_snapshot(cache: &ProviderCatalogCache) {
     // Publish fresh *and* stale/prior rows so pickers keep live catalog coverage
-    // after TTL expiry or a failed refresh (#4139). Empty caches clear the live
-    // layer and fall back to the bundled snapshot.
+    // after TTL expiry or a failed refresh (#4139). An empty cache publishes
+    // nothing: it must not erase a provider-scoped layer populated by another
+    // refresh path.
     let offerings = cache.all_visible_offerings(now_unix());
-    if offerings.is_empty() {
-        crate::provider_lake::clear_live_snapshot();
-    } else {
-        crate::provider_lake::set_live_snapshot(CatalogSnapshot { offerings });
+    if !offerings.is_empty() {
+        crate::provider_lake::set_live_snapshot(
+            CatalogSnapshot { offerings },
+            crate::provider_lake::LiveSource::PerProvider,
+        );
     }
 }
 
@@ -2301,6 +2493,17 @@ pub(super) fn apply_reasoning_effort(
             | ApiProvider::Zai => {
                 body["thinking"] = json!({ "type": "disabled" });
             }
+            // TelecomJS TokenHub: the gateway's OpenAI Chat Completions API
+            // (POST /v1/chat/completions) does not document `reasoning_effort`
+            // or `thinking` as supported parameters. The `thinking` field is
+            // only available on the Anthropic Messages API (POST /v1/messages)
+            // with a different shape ({"type":"enabled","budget_tokens":N}).
+            // Since CodeWhale routes TelecomJS through the Chat Completions
+            // path, we must NOT inject these fields — the gateway may silently
+            // ignore them or reject the request, and not every gateway model
+            // (qwen-max, deepseek-chat, gpt-4o, claude, etc.) accepts the same
+            // reasoning dialect (#4188 review: verify against actual behavior).
+            ApiProvider::Telecomjs => {}
             ApiProvider::OpenaiCodex => {
                 // OpenAI Codex uses Responses API — thinking handled differently
             }
@@ -2368,6 +2571,9 @@ pub(super) fn apply_reasoning_effort(
                 body["reasoning_effort"] = json!("high");
                 body["thinking"] = json!({ "type": "enabled" });
             }
+            // TelecomJS: see comment in the "off" branch above — the gateway's
+            // Chat Completions API does not support reasoning_effort or thinking.
+            ApiProvider::Telecomjs => {}
             // OpenRouter/Novita/Together: pass through the actual user-chosen value.
             // OpenRouter's unified scale is none/minimal/low/medium/high/xhigh;
             // DeepSeek models hosted there accept those directly.
@@ -2462,6 +2668,9 @@ pub(super) fn apply_reasoning_effort(
                 body["reasoning_effort"] = json!("max");
                 body["thinking"] = json!({ "type": "enabled" });
             }
+            // TelecomJS: see comment in the "off" branch above — the gateway's
+            // Chat Completions API does not support reasoning_effort or thinking.
+            ApiProvider::Telecomjs => {}
             ApiProvider::Openrouter | ApiProvider::Novita | ApiProvider::Together => {
                 body["reasoning_effort"] = json!("xhigh");
                 body["thinking"] = json!({ "type": "enabled" });
@@ -2694,7 +2903,7 @@ mod tests {
         tool_to_chat_for_base_url,
     };
     use crate::client::responses::build_responses_body;
-    use crate::config::{ProviderConfig, ProvidersConfig};
+    use crate::config::{DEFAULT_TELECOMJS_MODEL, ProviderConfig, ProvidersConfig};
     use crate::models::{
         ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, Tool,
     };
@@ -2812,6 +3021,136 @@ mod tests {
         assert_eq!(client.base_url, route_base_url);
         client.test_chat_transport_base_url = Some(transport_base_url);
         client
+    }
+
+    fn deepseek_request_boundary_client(
+        route_base_url: &str,
+        transport_base_url: String,
+    ) -> DeepSeekClient {
+        let mut client = DeepSeekClient::new(&Config {
+            provider: Some("deepseek".to_string()),
+            api_key: Some("deepseek-request-boundary-key".to_string()),
+            base_url: Some(route_base_url.to_string()),
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            ..Config::default()
+        })
+        .expect("DeepSeek request-boundary client");
+        client.test_chat_transport_base_url = Some(transport_base_url);
+        client
+    }
+
+    async fn capture_deepseek_chat_request(
+        route_base_url: &str,
+        strict: bool,
+        streaming: bool,
+    ) -> (String, Value) {
+        let server = MockServer::start().await;
+        let response = if streaming {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: [DONE]\n\n")
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-deepseek-request-boundary",
+                "object": "chat.completion",
+                "model": "deepseek-v4-pro",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }))
+        };
+        Mock::given(method("POST"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut tool = test_tool("lookup");
+        if !strict {
+            tool.strict = None;
+        }
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "provider-free DeepSeek route fixture".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: 64,
+            system: None,
+            tools: Some(vec![tool]),
+            tool_choice: Some(json!(if strict { "required" } else { "auto" })),
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("off".to_string()),
+            stream: Some(streaming),
+            temperature: None,
+            top_p: None,
+        };
+        let client = deepseek_request_boundary_client(route_base_url, server.uri());
+
+        if streaming {
+            let mut stream = client
+                .create_message_stream(request)
+                .await
+                .expect("streaming request succeeds");
+            while let Some(event) = stream.next().await {
+                event.expect("captured SSE response remains valid");
+            }
+        } else {
+            client
+                .create_message(request)
+                .await
+                .expect("non-streaming request succeeds");
+        }
+
+        let requests = server.received_requests().await.expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        let path = requests[0].url.path().to_string();
+        let body = serde_json::from_slice(&requests[0].body).expect("captured request JSON");
+        (path, body)
+    }
+
+    async fn assert_deepseek_strict_request_route_boundary(streaming: bool) {
+        for (route_base_url, strict, expected_path, expected_wire_strict) in [
+            (
+                "https://api.deepseek.com/beta",
+                false,
+                "/v1/chat/completions",
+                None,
+            ),
+            (
+                "https://api.deepseek.com/beta",
+                true,
+                "/beta/chat/completions",
+                Some(true),
+            ),
+            (
+                "https://api.deepseek.com/v1",
+                true,
+                "/v1/chat/completions",
+                None,
+            ),
+        ] {
+            let (captured_path, body) =
+                capture_deepseek_chat_request(route_base_url, strict, streaming).await;
+            assert_eq!(captured_path, expected_path, "{route_base_url} {body}");
+            assert_eq!(
+                body.pointer("/tools/0/function/strict")
+                    .and_then(Value::as_bool),
+                expected_wire_strict,
+                "{route_base_url} {body}"
+            );
+        }
     }
 
     fn k3_request_fixture(model: &str, effort: Option<&str>, stream: bool) -> MessageRequest {
@@ -3282,6 +3621,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_message_routes_only_strict_deepseek_tools_to_beta() {
+        assert_deepseek_strict_request_route_boundary(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_routes_only_strict_deepseek_tools_to_beta() {
+        assert_deepseek_strict_request_route_boundary(true).await;
+    }
+
+    #[tokio::test]
     async fn create_message_request_replays_kimi_code_history_for_raw_off() {
         assert_kimi_code_raw_off_replays_tool_history(false).await;
     }
@@ -3704,6 +4053,12 @@ mod tests {
         let mut spilled = crate::tools::spec::ToolResult::success(raw.clone());
         let path = crate::tools::truncate::apply_spillover(&mut spilled, "call-local-secret")
             .expect("turn-loop spillover");
+        crate::tools::truncate::publish_legacy_spillover_ownership(
+            &path,
+            "workspace",
+            raw.as_bytes(),
+        )
+        .expect("publish compatibility ownership proof");
         assert_eq!(path.parent(), Some(spillover_root.as_path()));
         assert!(
             std::fs::read_to_string(&path)
@@ -3740,7 +4095,7 @@ mod tests {
     }
 
     #[test]
-    fn sha_spillover_persists_only_sanitized_tool_result() {
+    fn wire_adapter_does_not_persist_sessionless_sha_spillover() {
         let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -3763,7 +4118,7 @@ mod tests {
             CONFIG_SECRET_SENTINELS[6],
             "tail ".repeat(80)
         );
-        assert!(raw.len() > 1024, "fixture must enter SHA persistence path");
+        assert!(raw.len() > 1024, "fixture must enter wire dedup size class");
         let raw_sha = crate::hashing::sha256_hex(raw.as_bytes());
         let prepared = client.prepare_model_bound_request(request_with_tool_result(raw));
         let sanitized = tool_result_content(&prepared).to_string();
@@ -3775,11 +4130,10 @@ mod tests {
 
         let sanitized_path = crate::tools::truncate::sha_spillover_path(&sanitized_sha)
             .expect("sanitized spillover path");
-        let persisted = std::fs::read_to_string(&sanitized_path)
-            .expect("sanitized tool output should be persisted");
-        assert_eq!(persisted, sanitized);
-        assert!(!persisted.contains(CONFIG_SECRET_SENTINELS[6]));
-        assert!(persisted.contains(codewhale_config::persistence::REDACTED));
+        assert!(
+            !sanitized_path.exists(),
+            "sessionless wire fallback must not create an ownerless SHA artifact"
+        );
 
         let raw_path =
             crate::tools::truncate::sha_spillover_path(&raw_sha).expect("raw spillover path");
@@ -3787,6 +4141,7 @@ mod tests {
             !raw_path.exists(),
             "unsanitized tool output must never be persisted by the wire adapter"
         );
+        assert!(!serialized.contains("retrieve_tool_result ref=sha:"));
     }
 
     fn deepseek_anthropic_client(server: &MockServer) -> DeepSeekClient {
@@ -5381,6 +5736,31 @@ mod tests {
         assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
     }
 
+    /// TelecomJS TokenHub: the gateway's OpenAI Chat Completions API does NOT
+    /// support `reasoning_effort` or `thinking` fields (#4188 review). Verify
+    /// that no reasoning fields are injected for any effort level, since not
+    /// every gateway model (qwen-max, deepseek-chat, gpt-4o, claude, etc.)
+    /// accepts the same reasoning dialect.
+    #[test]
+    fn reasoning_effort_telecomjs_does_not_inject_reasoning_fields() {
+        for effort in &["off", "low", "medium", "high", "max", "xhigh"] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(effort), ApiProvider::Telecomjs);
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "TelecomJS must not inject reasoning_effort for effort={effort}: {body}"
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "TelecomJS must not inject thinking for effort={effort}: {body}"
+            );
+            assert!(
+                body.get("think").is_none(),
+                "TelecomJS must not inject think for effort={effort}: {body}"
+            );
+        }
+    }
+
     #[test]
     fn moonshot_uses_codewhale_user_agent_not_kimi_cli_identity() {
         let user_agent = client_user_agent(ApiProvider::Moonshot);
@@ -6222,6 +6602,23 @@ mod tests {
         .expect("OpenCode Go client")
     }
 
+    fn telecomjs_client_for(server: &MockServer) -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        DeepSeekClient::new(&Config {
+            provider: Some("telecomjs".to_string()),
+            providers: Some(ProvidersConfig {
+                telecomjs: ProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    base_url: Some(server.uri()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("TelecomJS client")
+    }
+
     async fn mount_models_json(server: &MockServer, status: u16, body: serde_json::Value) {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -6333,6 +6730,71 @@ mod tests {
                 .iter()
                 .all(|offering| offering.endpoint_key == "chat")
         );
+    }
+
+    #[tokio::test]
+    async fn telecomjs_live_catalog_keeps_cross_provider_metadata_unknown() {
+        let server = MockServer::start().await;
+        let ambiguous_id = codewhale_config::catalog::bundled_catalog_offerings()
+            .into_iter()
+            .find(|offering| {
+                !offering.provider.eq_ignore_ascii_case("telecomjs")
+                    && !offering
+                        .wire_model_id
+                        .eq_ignore_ascii_case(DEFAULT_TELECOMJS_MODEL)
+                    && (offering.canonical_model.is_some()
+                        || offering.family.is_some()
+                        || offering.limit.is_some()
+                        || offering.cost.is_some()
+                        || offering.reasoning.is_some()
+                        || offering.tool_call.is_some())
+            })
+            .expect("bundled catalog should contain a metadata-bearing non-TelecomJS row")
+            .wire_model_id;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": ambiguous_id.clone()},
+                    {"id": DEFAULT_TELECOMJS_MODEL}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let delta = telecomjs_client_for(&server)
+            .fetch_catalog_delta()
+            .await
+            .expect("TelecomJS catalog delta");
+        assert_eq!(delta.provider, "telecomjs");
+        assert_eq!(delta.offerings.len(), 2);
+
+        let ambiguous = delta
+            .offerings
+            .iter()
+            .find(|offering| offering.wire_model_id == ambiguous_id)
+            .expect("ambiguous cross-provider id");
+        assert!(!ambiguous.default_for_provider);
+        assert_eq!(ambiguous.endpoint_key, "chat");
+        assert_eq!(ambiguous.canonical_model, None);
+        assert_eq!(ambiguous.family, None);
+        assert_eq!(ambiguous.limit, None);
+        assert_eq!(ambiguous.cost, None);
+        assert_eq!(ambiguous.modalities, None);
+        assert_eq!(ambiguous.attachment, None);
+        assert_eq!(ambiguous.reasoning, None);
+        assert_eq!(ambiguous.tool_call, None);
+        assert_eq!(ambiguous.structured_output, None);
+        assert!(ambiguous.reasoning_options.is_empty());
+        assert!(matches!(ambiguous.source, CatalogSource::Live { .. }));
+
+        let default = delta
+            .offerings
+            .iter()
+            .find(|offering| offering.wire_model_id == DEFAULT_TELECOMJS_MODEL)
+            .expect("TelecomJS default row");
+        assert!(default.default_for_provider);
     }
 
     #[tokio::test]

@@ -7,6 +7,10 @@ use super::turn_loop::{
 };
 use crate::config::ApiProvider;
 use crate::models::{SystemBlock, Usage};
+use crate::prompts::{
+    PromptSessionContext, system_prompt_flat_text,
+    system_prompt_for_mode_with_context_skills_and_session,
+};
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
 use crate::tools::spec::ToolCapability;
@@ -3992,6 +3996,29 @@ fn exec_shell_ask_rule_decision_prompts_for_matching_auto_command() {
 }
 
 #[test]
+fn canonical_bash_run_honors_legacy_typed_ask_rules() {
+    let config = EngineConfig {
+        exec_policy_engine: ask_rule_engine("cargo test"),
+        ..EngineConfig::default()
+    };
+
+    let decision = exec_shell_ask_rule_decision(
+        &config,
+        "Bash",
+        &json!({"action": "run", "command": "cargo test --workspace"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=exec_shell command=cargo test' requires approval.".to_string()
+        ))
+    );
+}
+
+#[test]
 fn exec_shell_ask_rule_decision_blocks_matching_never_command() {
     let config = EngineConfig {
         exec_policy_engine: ask_rule_engine("cargo test"),
@@ -4052,6 +4079,29 @@ fn file_ask_rule_decision_prompts_for_matching_read_path() {
         Some(ToolAskRuleDecision::Prompt(
             "Typed ask rule 'tool=read_file path=secrets/api_key.txt' requires approval."
                 .to_string()
+        ))
+    );
+}
+
+#[test]
+fn canonical_file_action_honors_legacy_path_ask_rules() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("write_file", "src/lib.rs"),
+        ..EngineConfig::default()
+    };
+
+    let decision = file_tool_ask_rule_decision(
+        &config,
+        "File",
+        &json!({"action": "write", "path": "src/lib.rs", "content": "new\n"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=write_file path=src/lib.rs' requires approval.".to_string()
         ))
     );
 }
@@ -4887,39 +4937,79 @@ fn core_native_tools_stay_loaded_in_yolo_mode() {
     // #4625: `Bash` is the model-facing shell tool; legacy exec_shell names
     // are hidden compat aliases whose defer state no longer matters.
     assert!(!should_default_defer_tool("Bash", &always_load));
-    // git_blame remains deferred (read-only git history beyond log/show/diff).
+    for canonical in ["File", "Git", "Run"] {
+        assert!(!should_default_defer_tool(canonical, &always_load));
+    }
+    // Legacy spellings remain registered for replay but are no longer eager.
     assert!(should_default_defer_tool("git_blame", &always_load));
+}
+
+#[test]
+fn default_active_contract_keeps_remember_and_synthetic_tool_search_eager() {
+    const EXPECTED_NATIVE: [&str; 9] = [
+        "Bash",
+        "File",
+        "Git",
+        "Run",
+        "agent",
+        "remember",
+        "tasks",
+        "update_plan",
+        "work_update",
+    ];
+    assert_eq!(
+        default_active_native_tool_names(),
+        EXPECTED_NATIVE.as_slice()
+    );
+
+    let always_load = HashSet::new();
+    let mut catalog = build_model_tool_catalog(
+        EXPECTED_NATIVE.into_iter().map(api_tool).collect(),
+        Vec::new(),
+        AppMode::Agent,
+        &always_load,
+    );
+    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    let active = initial_active_tools(&catalog);
+    let expected = EXPECTED_NATIVE
+        .into_iter()
+        .chain([TOOL_SEARCH_NAME])
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+
+    assert_eq!(active, expected);
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|tool| tool.name == TOOL_SEARCH_NAME)
+            .and_then(|tool| tool.defer_loading),
+        Some(false)
+    );
 }
 
 #[test]
 fn non_yolo_mode_retains_default_defer_policy() {
     let always_load = HashSet::new();
-    assert!(!should_default_defer_tool("Bash", &always_load));
-    assert!(!should_default_defer_tool("edit_file", &always_load));
-    assert!(!should_default_defer_tool("apply_patch", &always_load));
-    assert!(!should_default_defer_tool("fetch_url", &always_load));
-    assert!(!should_default_defer_tool("git_diff", &always_load));
-    // #2654: read-only git history joins the active set.
-    assert!(!should_default_defer_tool("git_log", &always_load));
-    assert!(!should_default_defer_tool("git_show", &always_load));
-    assert!(!should_default_defer_tool("git_status", &always_load));
-    assert!(!should_default_defer_tool("run_tests", &always_load));
+    for canonical in ["Bash", "File", "Git", "Run"] {
+        assert!(!should_default_defer_tool(canonical, &always_load));
+    }
     assert!(!should_default_defer_tool("agent", &always_load));
-    assert!(!should_default_defer_tool("read_file", &always_load));
     assert!(!should_default_defer_tool("remember", &always_load));
-    assert!(!should_default_defer_tool(
-        "wait_for_dev_server",
-        &always_load
-    ));
-    assert!(!should_default_defer_tool("web_search", &always_load));
-    assert!(!should_default_defer_tool("write_file", &always_load));
     assert!(should_default_defer_tool(
         REQUEST_USER_INPUT_NAME,
         &always_load
     ));
-    assert!(should_default_defer_tool("task_shell_start", &always_load));
-    assert!(should_default_defer_tool("task_shell_wait", &always_load));
-    assert!(should_default_defer_tool("git_blame", &always_load));
+    for legacy in [
+        "read_file",
+        "edit_file",
+        "apply_patch",
+        "git_status",
+        "git_blame",
+        "run_tests",
+        "web_search",
+    ] {
+        assert!(should_default_defer_tool(legacy, &always_load));
+    }
 }
 
 #[test]
@@ -4962,10 +5052,10 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
     let always_load = HashSet::new();
     let catalog = build_model_tool_catalog(
         vec![
-            api_tool("read_file"),
-            api_tool("write_file"),
+            api_tool("File"),
             api_tool("Bash"),
-            api_tool("edit_file"),
+            api_tool("Git"),
+            api_tool("Run"),
             api_tool("remember"),
             api_tool("project_map"),
         ],
@@ -4981,10 +5071,10 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    assert_eq!(defer_loading("read_file"), Some(false));
-    assert_eq!(defer_loading("write_file"), Some(false));
+    assert_eq!(defer_loading("File"), Some(false));
     assert_eq!(defer_loading("Bash"), Some(false));
-    assert_eq!(defer_loading("edit_file"), Some(false));
+    assert_eq!(defer_loading("Git"), Some(false));
+    assert_eq!(defer_loading("Run"), Some(false));
     assert_eq!(defer_loading("remember"), Some(false));
     assert_eq!(defer_loading("project_map"), Some(true));
     assert_eq!(defer_loading("list_mcp_resources"), Some(false));
@@ -4997,13 +5087,12 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
     let catalog = build_model_tool_catalog_with_surface(
         vec![
             api_tool("agent"),
-            api_tool("grep_files"),
-            api_tool("read_file"),
-            api_tool("run_tests"),
+            api_tool("File"),
+            api_tool("Git"),
+            api_tool("Run"),
             api_tool(TOOL_SEARCH_NAME),
             api_tool("update_plan"),
-            api_tool("web_search"),
-            api_tool("write_file"),
+            api_tool("Web"),
         ],
         vec![api_tool("list_mcp_resources"), api_tool("mcp_server_write")],
         AppMode::Agent,
@@ -5018,15 +5107,14 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    assert_eq!(defer_loading("read_file"), Some(false));
-    assert_eq!(defer_loading("grep_files"), Some(false));
+    assert_eq!(defer_loading("File"), Some(false));
+    assert_eq!(defer_loading("Git"), Some(false));
     assert_eq!(defer_loading("update_plan"), Some(false));
-    assert_eq!(defer_loading("write_file"), Some(false));
     assert_eq!(defer_loading(TOOL_SEARCH_NAME), Some(false));
     assert_eq!(defer_loading("list_mcp_resources"), Some(false));
     assert_eq!(defer_loading("agent"), Some(true));
-    assert_eq!(defer_loading("run_tests"), Some(true));
-    assert_eq!(defer_loading("web_search"), Some(true));
+    assert_eq!(defer_loading("Run"), Some(true));
+    assert_eq!(defer_loading("Web"), Some(true));
     assert_eq!(defer_loading("mcp_server_write"), Some(true));
 }
 
@@ -5034,18 +5122,14 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
 fn capability_full_surface_preserves_default_core_tools() {
     let always_load = HashSet::new();
     let catalog = build_model_tool_catalog_with_surface(
-        vec![
-            api_tool("agent"),
-            api_tool("read_file"),
-            api_tool("run_tests"),
-        ],
+        vec![api_tool("agent"), api_tool("File"), api_tool("Run")],
         Vec::new(),
         AppMode::Agent,
         &always_load,
         crate::model_profile::ToolSurfaceBudget::Full,
     );
 
-    for name in ["agent", "read_file", "run_tests"] {
+    for name in ["agent", "File", "Run"] {
         assert_eq!(
             catalog
                 .iter()
@@ -5061,7 +5145,7 @@ fn capability_full_surface_preserves_default_core_tools() {
 fn plugin_or_benchmark_tools_marked_loaded_stay_active() {
     let always_load = HashSet::new();
     let mut catalog = build_model_tool_catalog(
-        vec![api_tool("KB_search"), api_tool("read_file")],
+        vec![api_tool("KB_search"), api_tool("File")],
         Vec::new(),
         AppMode::Agent,
         &always_load,
@@ -5082,11 +5166,11 @@ fn plugin_or_benchmark_tools_marked_loaded_stay_active() {
         active.contains("KB_search"),
         "plugin/benchmark tools marked loaded must be callable on turn 1"
     );
-    assert!(active.contains("read_file"));
+    assert!(active.contains("File"));
 }
 
 #[test]
-fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
+fn agent_catalog_keeps_canonical_file_tool_loaded() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let registry = engine
         .build_turn_tool_registry_builder(
@@ -5102,39 +5186,34 @@ fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
         AppMode::Agent,
         &always_load,
     );
-    let edit = catalog
+    let file = catalog
         .iter()
-        .find(|tool| tool.name == "edit_file")
-        .expect("edit_file registered");
+        .find(|tool| tool.name == "File")
+        .expect("File registered");
 
-    assert_eq!(edit.defer_loading, Some(false));
-    let required = edit.input_schema["required"]
+    assert_eq!(file.defer_loading, Some(false));
+    let required = file.input_schema["required"]
         .as_array()
-        .expect("edit_file schema should include required fields");
-    assert!(required.iter().any(|field| field.as_str() == Some("path")));
+        .expect("File schema should include required fields");
     assert!(
         required
             .iter()
-            .any(|field| field.as_str() == Some("search"))
-    );
-    assert!(
-        required
-            .iter()
-            .any(|field| field.as_str() == Some("replace"))
+            .any(|field| field.as_str() == Some("action"))
     );
     assert!(!required.iter().any(|field| field.as_str() == Some("fuzz")));
     assert_eq!(
-        edit.input_schema["properties"]["fuzz"]["type"].as_str(),
-        Some("boolean")
+        file.input_schema["properties"]["fuzz"]["oneOf"][0]["type"].as_str(),
+        Some("boolean"),
     );
 
     let active_at_batch_start = initial_active_tools(&catalog);
-    assert!(active_at_batch_start.contains("edit_file"));
+    assert!(active_at_batch_start.contains("File"));
     let mut hydrated_this_batch = HashSet::new();
     assert!(
         maybe_hydrate_requested_deferred_tool(
-            "edit_file",
+            "File",
             &json!({
+                "action": "edit",
                 "path": "src/foo.rs",
                 "search": "before",
                 "replace": "after"
@@ -5144,7 +5223,7 @@ fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
             &mut hydrated_this_batch,
         )
         .is_none(),
-        "loaded edit_file calls without fuzz should execute instead of hydrating the schema"
+        "loaded File calls without fuzz should execute instead of hydrating the schema"
     );
     assert!(hydrated_this_batch.is_empty());
 }
@@ -5178,9 +5257,7 @@ fn agent_catalog_advertises_and_searches_core_action_tools() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<HashSet<_>>();
-    // #4625: the model-facing shell tool is `Bash`; `exec_shell` remains a
-    // hidden compat alias and must NOT appear in the advertised catalog.
-    for tool_name in ["Bash", "write_file", "edit_file", "apply_patch"] {
+    for tool_name in ["Bash", "File", "Git", "Run"] {
         assert!(
             names.contains(tool_name),
             "{tool_name} must be advertised in Agent mode"
@@ -5238,32 +5315,48 @@ fn catalog_consistency_self_check_flags_registered_core_tool_missing_from_catalo
     );
 }
 
-#[test]
-fn tool_search_reports_known_core_action_tool_when_current_catalog_omits_it() {
+fn assert_exec_shell_is_not_discoverable(match_kind: &str) {
     let catalog = vec![api_tool("read_file")];
     let mut active = initial_active_tools(&catalog);
 
     let result = execute_tool_search(
         TOOL_SEARCH_NAME,
-        &json!({ "query": "exec_shell" }),
+        &json!({ "query": "exec_shell", "match": match_kind }),
         &catalog,
         &mut active,
     )
     .expect("tool search succeeds");
 
     assert!(!active.contains("exec_shell"));
-    let unavailable = result.metadata.as_ref().unwrap()["unavailable_tool_references"]
+    let metadata = result.metadata.as_ref().expect("search metadata");
+    let references = metadata["tool_references"]
+        .as_array()
+        .expect("tool references are an array");
+    assert!(
+        references
+            .iter()
+            .all(|reference| reference.as_str() != Some("exec_shell")),
+        "legacy shell alias must not surface via {match_kind}: {references:?}"
+    );
+    let unavailable = metadata["unavailable_tool_references"]
         .as_array()
         .expect("unavailable references are an array");
     assert!(
-        unavailable.iter().any(|reference| {
-            reference["tool_name"].as_str() == Some("exec_shell")
-                && reference["reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("allow_shell = true"))
-        }),
-        "known-but-omitted core action tool should surface with a reason: {unavailable:?}"
+        unavailable
+            .iter()
+            .all(|reference| reference["tool_name"].as_str() != Some("exec_shell")),
+        "legacy shell alias must not surface as an unavailable fallback via {match_kind}: {unavailable:?}"
     );
+}
+
+#[test]
+fn regex_tool_search_does_not_discover_hidden_exec_shell_alias() {
+    assert_exec_shell_is_not_discoverable("regex");
+}
+
+#[test]
+fn bm25_tool_search_does_not_discover_hidden_exec_shell_alias() {
+    assert_exec_shell_is_not_discoverable("bm25");
 }
 
 #[test]
@@ -5310,6 +5403,9 @@ fn print_agent_tool_catalog_metrics() {
     );
     let registry = crate::tools::ToolRegistryBuilder::new()
         .with_agent_tools(true)
+        // Exercise the complete default-active policy. Production registers
+        // this opt-in tool only when user memory is enabled.
+        .with_remember_tool()
         .with_todo_tool(new_shared_todo_list())
         .with_plan_tool(new_shared_plan_state())
         .with_review_tool(None, DEFAULT_TEXT_MODEL.to_string())
@@ -5349,6 +5445,44 @@ fn print_agent_tool_catalog_metrics() {
             "active_tokens_est": active_json.len().div_ceil(4),
             "reduction_percent": reduction_percent,
             "active_tool_names": active_catalog.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+        })
+    );
+}
+
+#[test]
+#[ignore = "one-shot metric for scripts/measure-runtime-contract.py"]
+#[allow(clippy::print_stdout)]
+fn print_agent_runtime_contract_metrics() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let session_context = PromptSessionContext::default();
+    let prompt = system_prompt_for_mode_with_context_skills_and_session(
+        &workspace,
+        None,
+        None,
+        None,
+        session_context,
+    );
+    let flat_prompt = system_prompt_flat_text(&prompt);
+    let prompt_bytes = flat_prompt.len();
+    let prompt_tokens_est = prompt_bytes.div_ceil(4);
+
+    // Mode runtime instructions are delivered as per-turn metadata; measure
+    // them separately so prompt-size work does not forget the volatile surface.
+    let mode_bytes = crate::prompts::AGENT_MODE.len();
+    let mode_tokens_est = mode_bytes.div_ceil(4);
+
+    println!(
+        "RUNTIME_CONTRACT_METRICS {}",
+        serde_json::json!({
+            "system_prompt_bytes": prompt_bytes,
+            "system_prompt_tokens_est": prompt_tokens_est,
+            "system_prompt_blocks": match prompt {
+                crate::models::SystemPrompt::Blocks(blocks) => blocks.len(),
+                _ => 1,
+            },
+            "agent_mode_instructions_bytes": mode_bytes,
+            "agent_mode_instructions_tokens_est": mode_tokens_est,
         })
     );
 }
@@ -5471,7 +5605,7 @@ fn deferred_edit_file_first_use_hydrates_schema_without_execution() {
 fn model_tool_catalog_defers_non_core_native_tools_in_yolo_mode() {
     let always_load = HashSet::new();
     let catalog = build_model_tool_catalog(
-        vec![api_tool("read_file"), api_tool("project_map")],
+        vec![api_tool("File"), api_tool("project_map")],
         vec![api_tool("mcp_server_write")],
         AppMode::Yolo,
         &always_load,
@@ -5484,7 +5618,7 @@ fn model_tool_catalog_defers_non_core_native_tools_in_yolo_mode() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    assert_eq!(defer_loading("read_file"), Some(false));
+    assert_eq!(defer_loading("File"), Some(false));
     assert_eq!(defer_loading("project_map"), Some(true));
     assert_eq!(defer_loading("mcp_server_write"), Some(false));
 }
@@ -5629,7 +5763,7 @@ fn active_tool_list_pushes_deferred_activations_to_the_tail() {
 }
 
 #[test]
-fn deferred_tool_preflight_loads_edit_schema_without_executing_bad_aliases() {
+fn hidden_edit_alias_bypasses_deferred_model_catalog_preflight() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let registry = engine
         .build_turn_tool_registry_builder(
@@ -5647,11 +5781,11 @@ fn deferred_tool_preflight_loads_edit_schema_without_executing_bad_aliases() {
     );
     catalog
         .iter_mut()
-        .find(|tool| tool.name == "edit_file")
-        .expect("edit_file registered")
+        .find(|tool| tool.name == "File")
+        .expect("File registered")
         .defer_loading = Some(true);
     let mut active = initial_active_tools(&catalog);
-    assert!(!active.contains("edit_file"));
+    assert!(!active.contains("File"));
 
     let result = preflight_requested_deferred_tool(
         "edit_file",
@@ -5662,22 +5796,10 @@ fn deferred_tool_preflight_loads_edit_schema_without_executing_bad_aliases() {
         }),
         &catalog,
         &mut active,
-    )
-    .expect("deferred edit_file should preflight");
-
-    assert!(active.contains("edit_file"));
-    assert!(result.success);
-    assert!(result.content.contains("Tool `edit_file` was deferred"));
-    assert!(result.content.contains("The tool was not executed"));
-    assert!(result.content.contains("path: string required"));
-    assert!(result.content.contains("search: string required"));
-    assert!(result.content.contains("replace: string required"));
-    assert!(result.content.contains("old_string -> search"));
-    assert!(result.content.contains("new_string -> replace"));
-    assert_eq!(
-        result.metadata.as_ref().unwrap()["deferred_tool_loaded"],
-        json!(true)
     );
+
+    assert!(result.is_none());
+    assert!(!active.contains("File"));
 }
 
 #[test]
@@ -7442,6 +7564,7 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
 
     assert!(registry.contains("read_file"));
     assert!(registry.contains("list_dir"));
+    assert!(registry.contains("File"));
     assert!(!registry.contains("write_file"));
     assert!(!registry.contains("edit_file"));
     assert!(!registry.contains("exec_shell"));
@@ -9115,7 +9238,8 @@ fn subagent_results_are_summarized_before_parent_context_insertion() {
     assert!(context.len() < output.content.len());
     assert!(context.contains("self-report"));
     assert!(context.contains("verify side effects"));
-    assert!(context.contains("read_file") && context.contains("list_dir"));
+    assert!(context.contains("`File` actions like `read` or `list`"));
+    assert!(!context.contains("read_file") && !context.contains("list_dir"));
     assert!(context.contains("handle_read"));
 }
 
@@ -9808,11 +9932,7 @@ fn turn_metadata_includes_plan_mode_policy() {
     );
     assert!(text.contains("##### Mode: Plan"), "got: {text}");
     assert!(
-        text.contains("All writes and patches are blocked"),
-        "got: {text}"
-    );
-    assert!(
-        text.contains("Shell and code execution are unavailable"),
+        text.contains("All writes, patches, shell commands, and code execution"),
         "got: {text}"
     );
 }
@@ -11664,6 +11784,40 @@ async fn post_edit_hook_skips_unknown_tool_names() {
 // ── #3802: non-blocking send for ListSubAgents refresh events ─────────────
 
 #[test]
+fn agent_list_event_carries_the_typed_coordination_projection() {
+    use crate::tools::subagent::coord::{DecisionRecord, DecisionStatus};
+
+    let mut manager = SubAgentManager::new(PathBuf::from("."), 1);
+    manager
+        .record_coordination_decision(DecisionRecord {
+            decision_id: "decision-event".to_string(),
+            subject: "typed event".to_string(),
+            status: DecisionStatus::Accepted,
+            owner: "root".to_string(),
+            scope: Vec::new(),
+            constraints: Vec::new(),
+            evidence_handles: Vec::new(),
+            version: 1,
+            sequence: 0,
+        })
+        .expect("record decision");
+
+    let Event::AgentList {
+        agents,
+        coordination,
+    } = agent_list_event(&manager)
+    else {
+        panic!("expected AgentList event");
+    };
+    assert!(agents.is_empty());
+    assert_eq!(coordination.decisions.len(), 1);
+    assert_eq!(coordination.decisions[0].decision_id, "decision-event");
+    assert_eq!(coordination.decisions[0].status, DecisionStatus::Accepted);
+    assert!(coordination.bounded);
+    assert_eq!(coordination.limit, 24);
+}
+
+#[test]
 fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
     use tokio::sync::mpsc;
 
@@ -11768,7 +11922,11 @@ async fn list_subagents_event_try_send_does_not_block_when_event_channel_full() 
     // Reproduce the handler pattern: try_send an AgentList event.
     // This must return Err immediately — the handler should never hang.
     let agents = vec![];
-    let result = tx_event.try_send(Event::AgentList { agents });
+    let result = tx_event.try_send(Event::AgentList {
+        agents,
+        coordination: crate::tools::subagent::SubAgentManager::new(PathBuf::from("."), 1)
+            .coordination_detail_projection(None, 24),
+    });
     assert!(
         result.is_err(),
         "try_send should fail when event channel is full (backpressure avoided)"

@@ -1,9 +1,9 @@
 # Codewhale
 
-**One runtime. Every model. Your machine.**
+**One runtime. Supported hosted and local models. Your machine.**
 
-Codewhale is a coding agent for your terminal. It works with any model;
-open models first. Give it a provider, a model, and a task: it reads your
+Codewhale is a coding agent for your terminal. It works with supported hosted
+and local models; open models first. Give it a provider, a model, and a task: it reads your
 code, edits files, runs commands, checks its work, and stops when the job
 is done or it needs you. Switch models mid-task with `/model`. Use the TUI
 for interactive work, `codewhale exec` for scripts and CI. Rust, MIT,
@@ -15,9 +15,11 @@ runs on your machine.
   and one toolset. Context budgets and prices come from the real route. An
   unknown price shows as unknown, never as $0.
 - **Safe by construction.** Plan mode is read-only. Approvals gate every
-  risky call. The OS sandbox holds — Seatbelt, Landlock, seccomp, bwrap.
-  A repo's `constitution.json` compiles into write holds that even Full
-  Access cannot skip.
+  risky call. Codewhale reports an OS command sandbox only when it actually
+  wraps the command: Seatbelt on macOS when available, and opt-in bubblewrap
+  on Linux when installed. Windows currently reports none. A repo's
+  `constitution.json` compiles into write holds that even Full Access cannot
+  skip.
 - **Work that survives.** Fleets record every step in an append-only
   ledger; `fleet resume` picks up where you stopped. Every turn leaves a
   receipt you can inspect.
@@ -54,9 +56,10 @@ codewhale web                            # local browser client on 127.0.0.1
 ```
 
 In the TUI: `/model` switches provider and model together, `/fleet` runs a
-team of workers, `/restore` undoes a turn, `Tab` cycles Plan / Act / Operate,
-`Shift+Tab` cycles the Ask / Auto-Review / Full Access approval posture, and
-`!` runs a shell command through the normal approval path.
+team of workers, and `/restore` undoes a turn. When the composer is idle, `Tab`
+cycles Plan / Act / Operate and `Shift+Tab` cycles the Ask / Auto-Review / Full
+Access permission posture. `!` runs a shell command through the normal approval
+path.
 
 ## Learn more
 

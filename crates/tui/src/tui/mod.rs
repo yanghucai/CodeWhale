@@ -12,6 +12,7 @@
 // === Submodules ===
 
 pub mod active_cell;
+pub(crate) mod agent_details;
 pub mod app;
 pub mod approval;
 pub mod auto_review;
@@ -25,6 +26,7 @@ pub mod composer_chrome;
 pub mod composer_ui;
 pub mod context_inspector;
 pub mod context_menu;
+pub(crate) mod coordination_detail;
 pub mod diff_render;
 pub mod event_broker;
 pub mod external_editor;

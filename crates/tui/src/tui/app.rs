@@ -31,11 +31,11 @@ use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::resource_telemetry::TokenThroughput;
 use crate::session_manager::{SessionContextReference, SessionMetadata, SessionWorkState};
-use crate::settings::Settings;
+use crate::settings::{InlineDiffMode, Settings};
 use crate::tools::plan::{PlanState, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::new_shared_shell_manager;
 use crate::tools::spec::RuntimeToolServices;
-use crate::tools::subagent::SubAgentResult;
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentResult};
 use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
@@ -43,6 +43,7 @@ use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::file_mention::ContextReference;
 use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
 use crate::tui::hotbar::HotbarActionRegistry;
+use crate::tui::motion::MotionPolicy;
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
 use crate::tui::scrolling::{MouseScrollState, TranscriptLineMeta, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelection};
@@ -506,15 +507,126 @@ pub struct ProviderPickerMemory {
     pub selected_provider_id: Option<String>,
 }
 
+/// Bounded status vocabulary for the per-agent current-activity projection.
+///
+/// This is presentation state derived from structured worker/mailbox events;
+/// renderers map these variants to labels but never infer them from strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCurrentActivityStatus {
+    Queued,
+    Starting,
+    Running,
+    ModelWait,
+    RunningTool,
+    Waiting,
+    Done,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+impl From<AgentWorkerStatus> for AgentCurrentActivityStatus {
+    fn from(status: AgentWorkerStatus) -> Self {
+        match status {
+            AgentWorkerStatus::Queued => Self::Queued,
+            AgentWorkerStatus::Starting => Self::Starting,
+            AgentWorkerStatus::Running => Self::Running,
+            AgentWorkerStatus::WaitingForUser => Self::Waiting,
+            AgentWorkerStatus::ModelWait => Self::ModelWait,
+            AgentWorkerStatus::RunningTool => Self::RunningTool,
+            AgentWorkerStatus::Completed => Self::Done,
+            AgentWorkerStatus::Failed => Self::Failed,
+            AgentWorkerStatus::Cancelled => Self::Canceled,
+            AgentWorkerStatus::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCurrentActivity {
+    pub status: AgentCurrentActivityStatus,
+    /// Safe bounded context, never a raw child transcript or tool result.
+    pub detail: Option<String>,
+    /// Safe display name for the one tool currently executing.
+    pub current_tool: Option<String>,
+    pub step: Option<u32>,
+}
+
+impl AgentCurrentActivity {
+    #[must_use]
+    pub fn bounded(
+        status: AgentCurrentActivityStatus,
+        detail: Option<String>,
+        current_tool: Option<String>,
+        step: Option<u32>,
+    ) -> Self {
+        fn bounded_nonempty(value: Option<String>) -> Option<String> {
+            value
+                .map(|value| bound_agent_activity_text(&value))
+                .filter(|value| !value.trim().is_empty())
+        }
+
+        Self {
+            status,
+            detail: bounded_nonempty(detail),
+            current_tool: bounded_nonempty(current_tool),
+            step,
+        }
+    }
+}
+
+/// Convert untrusted child-agent text into a compact UI-safe projection.
+/// Full transcript artifacts remain the source of truth; only summaries that
+/// can enter the parent transcript/sidebar pass through this seam.
+pub(crate) fn bound_agent_activity_text(value: &str) -> String {
+    let mut visible = String::with_capacity(value.len());
+    crate::tui::osc8::strip_ansi_into(value, &mut visible);
+    let redacted = codewhale_config::persistence::redact_secrets(&visible);
+    crate::tui::history::summarize_tool_output(&redacted)
+}
+
+/// One bounded, structured tool outcome for the Agent Details projection.
+///
+/// This is populated only from `ToolCallCompleted` mailbox envelopes. It is
+/// deliberately not inferred from free-form progress text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecentAction {
+    pub tool: String,
+    pub step: u32,
+    pub ok: bool,
+}
+
+impl AgentRecentAction {
+    #[must_use]
+    pub fn bounded(tool: &str, step: u32, ok: bool) -> Self {
+        Self {
+            tool: bound_agent_activity_text(tool),
+            step,
+            ok,
+        }
+    }
+}
+
+pub(crate) const MAX_AGENT_RECENT_ACTIONS: usize = 3;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProgressMeta {
     pub parent_run_id: Option<String>,
     pub spawn_depth: u32,
+    /// Structured, bounded answer to "what is this agent doing now?".
+    pub current_activity: Option<AgentCurrentActivity>,
     /// Last tool observed running for this child. Cleared by the matching
     /// completion envelope so Work never presents a settled tool as live.
     pub current_tool: Option<String>,
     /// Successful file mutations observed for this child in this session.
     pub files_touched: u32,
+    /// At most three tool outcomes observed through structured lifecycle
+    /// envelopes, oldest to newest.
+    pub recent_actions: VecDeque<AgentRecentAction>,
+    /// Effective route facts observed from a real child token-usage envelope.
+    /// These stay absent until the provider actually reports usage.
+    pub resolved_provider: Option<String>,
+    pub resolved_model: Option<String>,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
@@ -1702,10 +1814,14 @@ pub enum SidebarRowAction {
     ToggleAgentDetails {
         agent_id: String,
     },
-    /// Drill into the child's transcript card (action tree, status, summary)
-    /// in the detail pager — registered on the expanded dossier rows (#2889
-    /// slice, dogfood A3).
+    /// Open the child's bounded, safe status projection. Exact transcript
+    /// evidence is a separate explicit action (#2889).
     OpenAgentDetail {
+        agent_id: String,
+    },
+    /// Open the child's artifact-first exact transcript. This is separate
+    /// from the safe default details projection (#2889).
+    OpenAgentTranscript {
         agent_id: String,
     },
     CancelAgent {
@@ -1729,6 +1845,7 @@ impl SidebarRowAction {
             | Self::HotbarSlot(_)
             | Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
+            | Self::OpenAgentTranscript { .. }
             | Self::CancelAgent { .. }
             | Self::InspectWork { .. } => None,
         }
@@ -1742,6 +1859,7 @@ impl SidebarRowAction {
             Self::CancelAgent { .. } => true,
             Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
+            | Self::OpenAgentTranscript { .. }
             | Self::InspectWork { .. }
             | Self::HotbarSlot(_) => false,
         }
@@ -2116,6 +2234,9 @@ pub struct App {
     pub show_thinking: bool,
     pub verbose_transcript: bool,
     pub show_tool_details: bool,
+    /// Inline presentation mode for successful structured File mutations.
+    /// Exact evidence remains attached to each mutation receipt in all modes.
+    pub inline_diff_mode: InlineDiffMode,
     pub ui_locale: Locale,
     pub cost_currency: CostCurrency,
     /// Route payment truth. Model pricing alone cannot distinguish metered
@@ -2334,6 +2455,10 @@ pub struct App {
     pub todos: SharedTodoList,
     /// Durable runtime services exposed to model-visible task/automation tools.
     pub runtime_services: RuntimeToolServices,
+    /// Latest bounded coordination receipt delivered by the engine. This is
+    /// the same typed projection returned to headless inspection; the TUI does
+    /// not parse tool text to reconstruct it.
+    pub coordination_detail: Option<crate::tools::subagent::CoordinationDetailProjection>,
     /// Last MCP manager/discovery snapshot shown in the UI.
     pub mcp_snapshot: Option<crate::mcp::McpManagerSnapshot>,
     /// Number of MCP servers declared in the user's config at app boot.
@@ -2996,6 +3121,7 @@ impl App {
         let status_indicator = settings.status_indicator.clone();
         let show_thinking = settings.show_thinking;
         let show_tool_details = settings.show_tool_details;
+        let inline_diff_mode = InlineDiffMode::parse(&settings.inline_diffs);
         let ui_locale = resolve_locale(&settings.locale);
         let cost_currency = match (settings.cost_currency.as_str(), ui_locale.tag()) {
             ("usd", "zh-Hans") => CostCurrency::Cny,
@@ -3203,13 +3329,14 @@ impl App {
         let configured_approval_mode = explicit_approval_mode
             .or(saved_permission_posture)
             .unwrap_or_default();
+        let configured_trust_mode = configured_approval_mode == ApprovalMode::Bypass;
         let mode_prefs = ModeSessionPrefs {
             agent_allow_shell: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
                 config.interactive_allow_shell()
             } else {
                 allow_shell
             },
-            agent_trust_mode: false,
+            agent_trust_mode: configured_trust_mode,
             // The YOLO-compat launch elevates the *live* approval mirror to
             // Bypass below; the durable Agent baseline keeps the configured
             // policy so a YOLO -> Agent downshift restores it.
@@ -3399,6 +3526,7 @@ impl App {
             show_thinking,
             verbose_transcript: false,
             show_tool_details,
+            inline_diff_mode,
             ui_locale,
             cost_currency,
             billing_presentation: crate::route_billing::for_route(config, provider),
@@ -3486,7 +3614,7 @@ impl App {
             last_known_work_state: None,
             current_session_metadata: None,
             session_artifacts: Vec::new(),
-            trust_mode: yolo_compat || initial_mode == AppMode::Yolo,
+            trust_mode: yolo_compat || initial_mode == AppMode::Yolo || configured_trust_mode,
             translation_enabled: false,
             status_items: config
                 .tui
@@ -3504,6 +3632,7 @@ impl App {
                 work: Some(work_runtime),
                 ..RuntimeToolServices::default()
             },
+            coordination_detail: None,
             mcp_snapshot: None,
             // Read the MCP config once at boot to know how many servers
             // the user has declared. The footer chip uses this even when
@@ -4078,14 +4207,19 @@ impl App {
         );
     }
 
-    /// Update the durable Act approval choice without changing its saved shell
-    /// or trust choices. Plan remains read-only.
+    /// Update the durable Act approval choice. Entering Full Access enables
+    /// trust mode; leaving it removes that implicit elevation while preserving
+    /// an independently enabled trust baseline in other posture transitions.
+    /// Plan remains read-only.
     pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
-        self.set_agent_runtime_baseline(
-            self.mode_prefs.agent_allow_shell,
-            self.mode_prefs.agent_trust_mode,
-            next,
-        );
+        let trust_mode = if next == ApprovalMode::Bypass {
+            true
+        } else if self.mode_prefs.agent_approval_mode == ApprovalMode::Bypass {
+            false
+        } else {
+            self.mode_prefs.agent_trust_mode
+        };
+        self.set_agent_runtime_baseline(self.mode_prefs.agent_allow_shell, trust_mode, next);
     }
 
     #[must_use]
@@ -4475,6 +4609,50 @@ impl App {
         // one — the cache will reuse those. Callers that mutate a specific
         // cell's content must call `bump_history_cell(idx)` instead.
         self.resync_history_revisions();
+        self.needs_redraw = true;
+    }
+
+    /// Invalidate only transcript rows whose visible liveness marker is
+    /// time-based. Animation redraws must not churn settled history, but they
+    /// do need fresh cache keys for running history and active-cell entries.
+    pub(crate) fn mark_live_motion_updated(&mut self) {
+        self.mark_live_motion_updated_inner(true);
+    }
+
+    /// Invalidate only committed live rows. The translation placeholder path
+    /// already bumps the whole active-cell cache when it changes, so the UI
+    /// uses this narrower path to avoid bumping that revision twice.
+    pub(crate) fn mark_live_history_motion_updated(&mut self) {
+        self.mark_live_motion_updated_inner(false);
+    }
+
+    fn mark_live_motion_updated_inner(&mut self, invalidate_active_cell: bool) {
+        self.resync_history_revisions();
+        let live_history_indices: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| cell.has_live_motion().then_some(index))
+            .collect();
+        for index in live_history_indices {
+            let revision = self.fresh_history_revision();
+            if let Some(slot) = self.history_revisions.get_mut(index) {
+                *slot = revision;
+            }
+        }
+
+        let active_has_live_motion = self
+            .active_cell
+            .as_ref()
+            .is_some_and(|active| active.entries().iter().any(HistoryCell::has_live_motion));
+        if invalidate_active_cell && active_has_live_motion {
+            self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+            if let Some(active) = self.active_cell.as_mut() {
+                active.bump_revision();
+            }
+        }
+
+        self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
     }
 
@@ -4878,14 +5056,33 @@ impl App {
             *streaming = false;
         }
 
-        let drained = active.drain();
         let base_index = self.history.len();
+        // Completed tools are removed from `tool_cells` before the active
+        // group flushes, but `ActiveCell` deliberately keeps the stable
+        // tool-to-entry binding until drain. Capture that binding first so
+        // sequential or parallel tools in one model turn retain distinct raw
+        // detail records instead of all falling back to the first cell.
+        let detail_cell_indices: HashMap<String, usize> = self
+            .active_tool_details
+            .keys()
+            .filter_map(|tool_id| {
+                active
+                    .entry_index_for_tool(tool_id)
+                    .map(|entry_idx| (tool_id.clone(), base_index + entry_idx))
+            })
+            .collect();
+        let drained = active.drain();
 
         let mut details = std::mem::take(&mut self.active_tool_details);
         self.active_tool_entry_completed_at.clear();
         for (tool_id, detail) in details.drain() {
+            let cell_index = detail_cell_indices
+                .get(&tool_id)
+                .copied()
+                .or_else(|| self.tool_cells.get(&tool_id).copied())
+                .unwrap_or(base_index);
             self.tool_details_by_cell
-                .entry(self.tool_cells.get(&tool_id).copied().unwrap_or(base_index))
+                .entry(cell_index)
                 .or_insert(detail);
         }
 
@@ -5243,13 +5440,34 @@ impl App {
             .or_else(|| self.status_toasts.back().cloned())
     }
 
+    /// Resolve one motion policy for every surface that can request or paint
+    /// animation. `fancy_animations = false` is a true still mode even when
+    /// the separate accessibility preference is left at its default.
+    #[must_use]
+    pub(crate) fn motion_policy(&self) -> MotionPolicy {
+        MotionPolicy::from_settings(
+            self.low_motion,
+            self.fancy_animations,
+            self.constrained_frame_rate,
+        )
+    }
+
+    /// Bridge the centralized policy into transcript renderers that still
+    /// accept the legacy boolean motion contract.
+    #[must_use]
+    pub(crate) fn effective_low_motion_for_status(&self) -> bool {
+        self.motion_policy().as_low_motion()
+    }
+
     pub fn transcript_render_options(&self) -> TranscriptRenderOptions {
         TranscriptRenderOptions {
             show_thinking: self.show_thinking,
             verbose: self.verbose_transcript,
             show_tool_details: self.show_tool_details,
+            inline_diff_mode: self.inline_diff_mode,
             calm_mode: self.calm_mode,
-            low_motion: self.low_motion,
+            low_motion: self.effective_low_motion_for_status(),
+            motion_mode: self.motion_policy().mode(),
             spacing: self.transcript_spacing,
         }
     }
@@ -7540,6 +7758,8 @@ pub enum AppAction {
     OpenFeedbackPicker,
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
+    /// Open the `/skills` manager — audit inventory + owned mutations.
+    OpenSkillsManager,
     /// Open the `/fleet` roster — the saved-party view of the agent team.
     OpenFleetRoster,
     /// Open the `/fleet` profile authoring wizard.

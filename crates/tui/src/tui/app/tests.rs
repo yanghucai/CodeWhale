@@ -6,6 +6,7 @@ use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
 use crate::tools::todo::TodoStatus;
 use crate::tui::clipboard::{ClipboardHandler, PastedImage};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+use crate::tui::motion::MotionMode;
 
 fn test_options(yolo: bool) -> TuiOptions {
     TuiOptions {
@@ -30,6 +31,29 @@ fn test_options(yolo: bool) -> TuiOptions {
         yolo,
         resume_session_id: None,
         initial_input: None,
+    }
+}
+
+#[test]
+fn app_motion_policy_and_transcript_bridge_cover_every_settings_mode() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.constrained_frame_rate = false;
+
+    for (low_motion, fancy_animations, expected_mode, static_status) in [
+        (false, true, MotionMode::Full, false),
+        (true, true, MotionMode::Reduced, true),
+        (false, false, MotionMode::Still, true),
+        // The explicit accessibility preference wins when both switches are off.
+        (true, false, MotionMode::Reduced, true),
+    ] {
+        app.low_motion = low_motion;
+        app.fancy_animations = fancy_animations;
+
+        assert_eq!(app.motion_policy().mode(), expected_mode);
+        assert_eq!(app.effective_low_motion_for_status(), static_status);
+        let options = app.transcript_render_options();
+        assert_eq!(options.low_motion, static_status);
+        assert_eq!(options.motion_mode, expected_mode);
     }
 }
 
@@ -2417,10 +2441,12 @@ fn permission_postures_persist_across_restart() {
             assert!(app.cycle_approval_posture());
         }
         assert_eq!(app.approval_mode, expected);
+        assert_eq!(app.trust_mode, expected == ApprovalMode::Bypass);
 
         let restarted = App::new(options, &Config::default());
         assert_eq!(restarted.approval_mode, expected);
         assert_eq!(restarted.mode_prefs.agent_approval_mode, expected);
+        assert_eq!(restarted.trust_mode, expected == ApprovalMode::Bypass);
         drop(config_env);
     }
 }
@@ -2762,6 +2788,96 @@ fn test_mark_history_updated() {
     let initial_version = app.history_version;
     app.mark_history_updated();
     assert!(app.history_version > initial_version);
+}
+
+#[test]
+fn live_motion_invalidation_only_bumps_live_transcript_rows() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.history = vec![
+        HistoryCell::Assistant {
+            content: "settled".to_string(),
+            streaming: false,
+        },
+        HistoryCell::Assistant {
+            content: "streaming".to_string(),
+            streaming: true,
+        },
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Running,
+            input_summary: None,
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "agent".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("action: spawn".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some("done".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+    ];
+    app.resync_history_revisions();
+    let history_before = app.history_revisions.clone();
+
+    let active = app.active_cell.get_or_insert_with(ActiveCell::new);
+    active.push_untracked(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "web_search".to_string(),
+        status: ToolStatus::Running,
+        input_summary: None,
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    })));
+    let app_active_before = app.active_cell_revision;
+    let cell_active_before = app.active_cell.as_ref().expect("active cell").revision();
+
+    app.mark_live_motion_updated();
+
+    assert_eq!(app.history_revisions[0], history_before[0]);
+    assert_ne!(app.history_revisions[1], history_before[1]);
+    assert_ne!(app.history_revisions[2], history_before[2]);
+    assert_eq!(app.history_revisions[3], history_before[3]);
+    assert_eq!(app.history_revisions[4], history_before[4]);
+    assert_ne!(app.active_cell_revision, app_active_before);
+    assert_ne!(
+        app.active_cell.as_ref().expect("active cell").revision(),
+        cell_active_before
+    );
+
+    let history_after_all_live = app.history_revisions.clone();
+    let app_active_after_all_live = app.active_cell_revision;
+    let cell_active_after_all_live = app.active_cell.as_ref().expect("active cell").revision();
+    app.mark_live_history_motion_updated();
+
+    assert_eq!(app.history_revisions[0], history_after_all_live[0]);
+    assert_ne!(app.history_revisions[1], history_after_all_live[1]);
+    assert_ne!(app.history_revisions[2], history_after_all_live[2]);
+    assert_eq!(app.history_revisions[3], history_after_all_live[3]);
+    assert_eq!(app.history_revisions[4], history_after_all_live[4]);
+    assert_eq!(app.active_cell_revision, app_active_after_all_live);
+    assert_eq!(
+        app.active_cell.as_ref().expect("active cell").revision(),
+        cell_active_after_all_live
+    );
 }
 
 #[test]
@@ -4615,6 +4731,40 @@ fn onboarding_provider_copy_is_provider_neutral_in_en() {
     assert!(
         !api_title.to_ascii_lowercase().contains("deepseek"),
         "{api_title}"
+    );
+}
+
+#[test]
+fn agent_current_activity_bounds_redacts_and_strips_control_sequences() {
+    let secret = "sk-activity-secret-1234567890";
+    let raw = format!(
+        "\u{1b}[31mrunning\u{1b}[0m\napi_key={secret}\n\u{1b}]8;;https://example.invalid\u{7}details\u{1b}]8;;\u{7}\u{1}"
+    );
+    let activity = AgentCurrentActivity::bounded(
+        AgentCurrentActivityStatus::Running,
+        Some(raw.clone()),
+        Some(format!("\u{1b}[33mFile.read\u{1b}[0m {secret}")),
+        Some(4),
+    );
+
+    let detail = activity.detail.expect("bounded detail");
+    let tool = activity.current_tool.expect("bounded tool");
+    assert!(detail.contains("running"), "{detail:?}");
+    assert!(detail.contains("api_key=[redacted]"), "{detail:?}");
+    assert!(detail.contains("details"), "{detail:?}");
+    assert!(tool.contains("File.read"), "{tool:?}");
+    assert!(tool.contains("[redacted]"), "{tool:?}");
+    for safe in [&detail, &tool] {
+        assert!(!safe.contains(secret), "{safe:?}");
+        assert!(!safe.contains('\u{1b}'), "{safe:?}");
+        assert!(!safe.contains('\u{1}'), "{safe:?}");
+        assert!(!safe.contains("example.invalid"), "{safe:?}");
+    }
+    assert_eq!(activity.step, Some(4));
+    assert_eq!(
+        raw.matches(secret).count(),
+        1,
+        "source text stays untouched"
     );
 }
 

@@ -94,6 +94,10 @@ impl ToolSpec for ReadFileTool {
         "read_file"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. CodeWhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
@@ -675,6 +679,10 @@ impl ToolSpec for WriteFileTool {
         "write_file"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Write content to a UTF-8 file in the workspace. Use this instead of heredocs (`cat <<EOF > file`) or `echo > file` in `exec_shell` — diffs render inline and approval is handled cleanly. Creates or overwrites; parent directories are auto-created."
     }
@@ -760,7 +768,18 @@ impl ToolSpec for WriteFileTool {
             format!("{body}\n{diag_block}")
         };
 
-        Ok(ToolResult::success(full_body))
+        let outcome = if existed_before { "updated" } else { "created" };
+        // Keep the execution-owned receipt workspace-relative even though the
+        // legacy model-facing output above retains its resolved-path wording.
+        let receipt_diff = make_unified_diff(path_str, &prior_contents, file_content);
+        Ok(ToolResult::success(full_body).with_metadata(json!({
+            "event": "file.mutation",
+            "mutation": {
+                "diff": receipt_diff,
+                "files": [{ "path": path_str, "outcome": outcome }],
+                "renames": []
+            }
+        })))
     }
 }
 
@@ -773,6 +792,10 @@ pub struct EditFileTool;
 impl ToolSpec for EditFileTool {
     fn name(&self) -> &'static str {
         "edit_file"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
@@ -921,7 +944,17 @@ impl ToolSpec for EditFileTool {
             format!("{body}\n{diag_block}")
         };
 
-        Ok(ToolResult::success(full_body))
+        // The structured receipt uses the requested workspace path instead of
+        // the resolved host path retained by the legacy model-facing body.
+        let receipt_diff = make_unified_diff(path_str, &contents, &updated);
+        Ok(ToolResult::success(full_body).with_metadata(json!({
+            "event": "file.mutation",
+            "mutation": {
+                "diff": receipt_diff,
+                "files": [{ "path": path_str, "outcome": "updated" }],
+                "renames": []
+            }
+        })))
     }
 }
 
@@ -1074,6 +1107,10 @@ const LIST_DIR_MAX_ENTRIES: usize = 500;
 impl ToolSpec for ListDirTool {
     fn name(&self) -> &'static str {
         "list_dir"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
@@ -1903,6 +1940,24 @@ mod tests {
             "{}",
             result.content
         );
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "output.txt", "outcome": "created" }])
+        );
+        assert!(
+            mutation["diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("--- a/output.txt")),
+            "{mutation}"
+        );
+        assert!(
+            !mutation["diff"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&tmp.path().display().to_string()),
+            "receipt headers must not expose the resolved host path: {mutation}"
+        );
 
         // Verify file was written
         let written = fs::read_to_string(tmp.path().join("output.txt")).expect("read");
@@ -2047,6 +2102,19 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("+hi world"), "{}", result.content);
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "edit_me.txt", "outcome": "updated" }])
+        );
+        let receipt_diff = mutation["diff"].as_str().expect("receipt diff");
+        assert!(receipt_diff.contains("--- a/edit_me.txt"), "{receipt_diff}");
+        assert!(receipt_diff.contains("-hello world"), "{receipt_diff}");
+        assert!(receipt_diff.contains("+hi world"), "{receipt_diff}");
+        assert!(
+            !receipt_diff.contains(&tmp.path().display().to_string()),
+            "receipt headers must not expose the resolved host path: {receipt_diff}"
+        );
 
         // Verify edit was applied
         let edited = fs::read_to_string(&test_file).expect("read");

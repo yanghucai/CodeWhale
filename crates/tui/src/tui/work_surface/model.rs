@@ -4,9 +4,13 @@ use std::path::{Component, Path};
 
 use ratatui::layout::Rect;
 
+use crate::settings::InlineDiffMode;
+use crate::tools::canonical_action::canonical_action_alias;
 use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus};
-use crate::tui::app::{App, SidebarRowAction};
-use crate::tui::history::{FileActivityKind, FileActivitySummary, HistoryCell};
+use crate::tui::app::{AgentCurrentActivityStatus, App, SidebarRowAction};
+use crate::tui::history::{
+    FileActivityKind, FileActivitySummary, FileMutationReceipt, HistoryCell, ToolCell,
+};
 use crate::work_graph::{
     AcceptanceRequirement, EdgeKind, EvidenceKind, EvidenceKindTag, NodeKind, NodeState,
     OperationBinding, OwnerState, Provenance, WorkGraphSnapshot, WorkNode,
@@ -73,7 +77,6 @@ pub(super) struct WorkHitbox {
 
 #[derive(Debug, Clone)]
 enum WorkSourceState {
-    Empty,
     Error(String),
     Disconnected,
 }
@@ -81,7 +84,6 @@ enum WorkSourceState {
 impl WorkSourceState {
     const fn label(&self) -> &'static str {
         match self {
-            Self::Empty => "empty",
             Self::Error(_) => "error",
             Self::Disconnected => "disconnected",
         }
@@ -89,7 +91,6 @@ impl WorkSourceState {
 
     fn detail(&self) -> &str {
         match self {
-            Self::Empty => "No graph-owned work in the active session",
             Self::Error(error) => error,
             Self::Disconnected => "Work Graph runtime is not attached",
         }
@@ -195,6 +196,7 @@ impl WorkSurfaceState {
 pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
     let active_session = app.current_session_id.is_some();
     let agents = agent_rows(app);
+    let coordination = coordination_row(app);
     let activity = settled_file_activity(app);
     let capture = app.runtime_services.work.as_ref().map(|work| {
         work.try_capture(app.current_session_id.as_deref())
@@ -208,7 +210,7 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
         }
         Some(Ok(None)) => {
             app.work_surface.cached_graph = None;
-            (None, active_session.then_some(WorkSourceState::Empty))
+            (None, None)
         }
         Some(Err(error)) => (
             app.work_surface.cached_graph.clone(),
@@ -221,9 +223,15 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
     };
 
     let rows = match graph {
-        Some(graph) => graph_rows(&graph, source_state.as_ref(), agents, activity),
-        None if !agents.is_empty() || !activity.is_empty() => {
-            ordered_rows(None, source_state.as_ref(), agents, activity)
+        Some(graph) => graph_rows(
+            &graph,
+            source_state.as_ref(),
+            agents,
+            coordination,
+            activity,
+        ),
+        None if !agents.is_empty() || coordination.is_some() || !activity.is_empty() => {
+            ordered_rows(None, source_state.as_ref(), agents, coordination, activity)
         }
         None => source_state.map_or_else(Vec::new, |state| {
             vec![section_heading(
@@ -246,9 +254,10 @@ fn graph_rows(
     snapshot: &WorkGraphSnapshot,
     source_state: Option<&WorkSourceState>,
     agents: Vec<RankedWorkRow>,
+    coordination: Option<RankedWorkRow>,
     activity: SettledFileActivity,
 ) -> Vec<WorkRow> {
-    ordered_rows(Some(snapshot), source_state, agents, activity)
+    ordered_rows(Some(snapshot), source_state, agents, coordination, activity)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +292,8 @@ struct SettledFileActivity {
     list: Vec<String>,
     search: Vec<String>,
     write: Vec<String>,
+    mutations: Vec<FileMutationReceipt>,
+    inline_diff_mode: InlineDiffMode,
 }
 
 impl SettledFileActivity {
@@ -295,8 +306,10 @@ fn ordered_rows(
     snapshot: Option<&WorkGraphSnapshot>,
     source_state: Option<&WorkSourceState>,
     mut ranked: Vec<RankedWorkRow>,
+    coordination: Option<RankedWorkRow>,
     activity: SettledFileActivity,
 ) -> Vec<WorkRow> {
+    ranked.extend(coordination);
     if let Some(snapshot) = snapshot {
         ranked.extend(
             snapshot
@@ -358,6 +371,50 @@ fn ordered_rows(
     rows
 }
 
+fn coordination_row(app: &App) -> Option<RankedWorkRow> {
+    let projection = app.coordination_detail.as_ref()?;
+    if projection.decisions.is_empty()
+        && projection.write_claims.is_empty()
+        && projection.reconciliations.is_empty()
+        && projection.context_projections.is_empty()
+        && projection.contentions.is_empty()
+    {
+        return None;
+    }
+    let attention = crate::tui::coordination_detail::needs_attention(projection);
+    let bucket = if attention {
+        WorkBucket::Attention
+    } else {
+        WorkBucket::Recent
+    };
+    let title = app
+        .tr(crate::localization::MessageId::CoordinationWorkTitle)
+        .into_owned();
+    Some(RankedWorkRow {
+        bucket,
+        // Coordination is a session-wide receipt, before individual workers
+        // within the same bucket but after live/attention priority sorting.
+        order: 100,
+        row: WorkRow {
+            id: WorkRowId("coordination".to_string()),
+            mark: if attention {
+                crate::tui::glyphs::ATTENTION
+            } else {
+                crate::tui::glyphs::DONE
+            },
+            label: title.clone(),
+            detail: crate::tui::coordination_detail::summary(app.ui_locale, projection),
+            tone: bucket_tone(bucket),
+            selectable: true,
+            primary_action: Some(SidebarRowAction::InspectWork {
+                title,
+                body: crate::tui::coordination_detail::format(app.ui_locale, projection),
+                stop_action: None,
+            }),
+        },
+    })
+}
+
 fn node_bucket(node: &WorkNode) -> WorkBucket {
     match node.state {
         NodeState::Initializing | NodeState::Active => WorkBucket::Active,
@@ -386,15 +443,16 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
         .filter(|agent| !agent.from_prior_session)
         .enumerate()
         .map(|(order, agent)| {
-            let status = agent
-                .worker_status
-                .map(worker_status_label)
-                .unwrap_or_else(|| subagent_status_label(&agent.status));
-            let bucket = agent
-                .worker_status
-                .map(worker_status_bucket)
-                .unwrap_or_else(|| subagent_status_bucket(&agent.status));
             let meta = app.agent_progress_meta.get(&agent.agent_id);
+            let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
+            let status = current_activity
+                .map(|activity| current_activity_status_label(activity.status))
+                .or_else(|| agent.worker_status.map(worker_status_label))
+                .unwrap_or_else(|| subagent_status_label(&agent.status));
+            let bucket = current_activity
+                .map(|activity| current_activity_status_bucket(activity.status))
+                .or_else(|| agent.worker_status.map(worker_status_bucket))
+                .unwrap_or_else(|| subagent_status_bucket(&agent.status));
             let role = agent
                 .assignment
                 .role
@@ -411,8 +469,16 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                 status.to_string(),
                 summarize_assignment(&agent.assignment.objective),
             ];
-            if let Some(tool) = meta.and_then(|meta| meta.current_tool.as_deref()) {
+            if let Some(detail) = current_activity.and_then(|activity| activity.detail.as_deref()) {
+                facts.push(detail.to_string());
+            }
+            if let Some(tool) =
+                current_activity.and_then(|activity| activity.current_tool.as_deref())
+            {
                 facts.push(format!("using {tool}"));
+            }
+            if let Some(step) = current_activity.and_then(|activity| activity.step) {
+                facts.push(format!("step {step}"));
             }
             if let Some(files) = meta
                 .map(|meta| meta.files_touched)
@@ -448,22 +514,33 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
         progress_only
             .into_iter()
             .enumerate()
-            .map(|(order, (id, progress))| {
+            .map(|(order, (id, _progress))| {
                 let meta = app.agent_progress_meta.get(id);
-                let waiting = progress.to_ascii_lowercase().contains("waiting");
-                let bucket = if waiting {
-                    WorkBucket::Attention
-                } else {
-                    WorkBucket::Active
-                };
+                let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
+                let status = current_activity
+                    .map(|activity| current_activity_status_label(activity.status))
+                    .unwrap_or("running");
+                let bucket = current_activity
+                    .map(|activity| current_activity_status_bucket(activity.status))
+                    .unwrap_or(WorkBucket::Active);
                 let name = app
                     .agent_label_map
                     .get(id)
                     .cloned()
                     .unwrap_or_else(|| id.clone());
-                let mut facts = vec![progress.clone()];
-                if let Some(tool) = meta.and_then(|meta| meta.current_tool.as_deref()) {
+                let mut facts = vec![status.to_string()];
+                if let Some(detail) =
+                    current_activity.and_then(|activity| activity.detail.as_deref())
+                {
+                    facts.push(detail.to_string());
+                }
+                if let Some(tool) =
+                    current_activity.and_then(|activity| activity.current_tool.as_deref())
+                {
                     facts.push(format!("using {tool}"));
+                }
+                if let Some(step) = current_activity.and_then(|activity| activity.step) {
+                    facts.push(format!("step {step}"));
                 }
                 if let Some(files) = meta
                     .map(|meta| meta.files_touched)
@@ -493,6 +570,37 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
 
 fn summarize_assignment(value: &str) -> String {
     crate::tui::history::summarize_tool_output(value)
+}
+
+fn current_activity_status_bucket(status: AgentCurrentActivityStatus) -> WorkBucket {
+    match status {
+        AgentCurrentActivityStatus::Waiting
+        | AgentCurrentActivityStatus::Interrupted
+        | AgentCurrentActivityStatus::Failed => WorkBucket::Attention,
+        AgentCurrentActivityStatus::Queued => WorkBucket::Ready,
+        AgentCurrentActivityStatus::Done | AgentCurrentActivityStatus::Canceled => {
+            WorkBucket::Recent
+        }
+        AgentCurrentActivityStatus::Starting
+        | AgentCurrentActivityStatus::Running
+        | AgentCurrentActivityStatus::ModelWait
+        | AgentCurrentActivityStatus::RunningTool => WorkBucket::Active,
+    }
+}
+
+fn current_activity_status_label(status: AgentCurrentActivityStatus) -> &'static str {
+    match status {
+        AgentCurrentActivityStatus::Queued => "queued",
+        AgentCurrentActivityStatus::Starting => "starting",
+        AgentCurrentActivityStatus::Running => "running",
+        AgentCurrentActivityStatus::ModelWait => "waiting for model",
+        AgentCurrentActivityStatus::RunningTool => "running tool",
+        AgentCurrentActivityStatus::Waiting => "waiting for input",
+        AgentCurrentActivityStatus::Done => "completed",
+        AgentCurrentActivityStatus::Failed => "failed",
+        AgentCurrentActivityStatus::Canceled => "cancelled",
+        AgentCurrentActivityStatus::Interrupted => "interrupted",
+    }
 }
 
 fn worker_status_bucket(status: AgentWorkerStatus) -> WorkBucket {
@@ -564,7 +672,10 @@ const fn agent_mark(bucket: WorkBucket) -> &'static str {
 }
 
 fn settled_file_activity(app: &App) -> SettledFileActivity {
-    let mut activity = SettledFileActivity::default();
+    let mut activity = SettledFileActivity {
+        inline_diff_mode: app.inline_diff_mode,
+        ..SettledFileActivity::default()
+    };
     let mut seen = HashSet::new();
     for index in 0..app.virtual_cell_count() {
         let Some(HistoryCell::Tool(cell)) = app.cell_at_virtual_index(index) else {
@@ -576,14 +687,32 @@ fn settled_file_activity(app: &App) -> SettledFileActivity {
         let Some(detail) = app.tool_detail_record_for_cell(index) else {
             continue;
         };
-        let Some(kind) = FileActivitySummary::from_tool_name(&detail.tool_name) else {
+        let activity_tool_name = canonical_action_alias(&detail.tool_name, &detail.input);
+        let kind = if matches!(cell, ToolCell::PatchSummary(_)) {
+            Some(FileActivityKind::Write)
+        } else {
+            FileActivitySummary::from_tool_name(activity_tool_name)
+        };
+        let Some(kind) = kind else {
             continue;
         };
         if !seen.insert(detail.tool_id.as_str()) {
             continue;
         }
         activity.summary.record(kind);
-        let target = activity_target(&app.workspace, &detail.tool_name, &detail.input, kind);
+        if kind == FileActivityKind::Write
+            && let ToolCell::PatchSummary(mutation) = cell
+            && let Some(receipt) = mutation.receipt.as_ref()
+        {
+            let additional_files =
+                u32::try_from(receipt.files.len().saturating_sub(1)).unwrap_or(u32::MAX);
+            activity.summary.files_written = activity
+                .summary
+                .files_written
+                .saturating_add(additional_files);
+            activity.mutations.push(receipt.clone());
+        }
+        let target = activity_target(&app.workspace, activity_tool_name, &detail.input, kind);
         let details = match kind {
             FileActivityKind::Read => &mut activity.read,
             FileActivityKind::List => &mut activity.list,
@@ -602,18 +731,29 @@ fn settled_file_activity(app: &App) -> SettledFileActivity {
 
 fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
     let summaries = activity.summary.compact_display();
-    let details = [
-        activity.read,
-        activity.list,
-        activity.search,
-        activity.write,
+    let mutation_detail = activity.mutations.last().map(|receipt| {
+        if activity.inline_diff_mode == InlineDiffMode::Off {
+            receipt.outcome_label()
+        } else {
+            receipt.semantic_summary()
+        }
+    });
+    let mutation_body = settled_mutation_body(&activity.mutations, activity.inline_diff_mode);
+    let categories = [
+        (activity.summary.files_read, activity.read, false),
+        (activity.summary.dirs_listed, activity.list, false),
+        (activity.summary.patterns_searched, activity.search, false),
+        (activity.summary.files_written, activity.write, true),
     ];
-    summaries
+    categories
         .into_iter()
-        .zip(details)
+        .filter(|(count, _, _)| *count > 0)
+        .zip(summaries)
         .enumerate()
-        .map(|(order, (label, details))| {
-            let body = if details.is_empty() {
+        .map(|(order, ((_, details, is_write), label))| {
+            let body = if is_write && !mutation_body.is_empty() {
+                mutation_body.clone()
+            } else if details.is_empty() {
                 "No safe target detail retained".to_string()
             } else {
                 details.join("\n")
@@ -625,10 +765,12 @@ fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
                     id: WorkRowId(format!("activity:{order}")),
                     mark: crate::tui::glyphs::DONE,
                     label: label.clone(),
-                    detail: details
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "settled".to_string()),
+                    detail: if is_write {
+                        mutation_detail.clone().or_else(|| details.first().cloned())
+                    } else {
+                        details.first().cloned()
+                    }
+                    .unwrap_or_else(|| "settled".to_string()),
                     tone: WorkTone::Success,
                     selectable: true,
                     primary_action: Some(SidebarRowAction::InspectWork {
@@ -640,6 +782,33 @@ fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
             }
         })
         .collect()
+}
+
+fn settled_mutation_body(receipts: &[FileMutationReceipt], mode: InlineDiffMode) -> String {
+    let Some(receipt) = receipts.last() else {
+        return String::new();
+    };
+    let details = crate::tui::key_shortcuts::tool_details_shortcut_action_hint(
+        "exact change evidence on the matching File receipt",
+    );
+    let hint = format!("Select the matching File receipt; {details}.");
+    match mode {
+        InlineDiffMode::Off => format!("{}\n\n{hint}", receipt.outcome_label()),
+        InlineDiffMode::Summary => format!("{}\n\n{hint}", receipt.semantic_summary()),
+        InlineDiffMode::Full => {
+            let diff = receipt
+                .display_diff
+                .lines()
+                .take(40)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if diff.trim().is_empty() {
+                format!("{}\n\n{hint}", receipt.semantic_summary())
+            } else {
+                format!("{}\n\n{diff}\n\n{hint}", receipt.semantic_summary())
+            }
+        }
+    }
 }
 
 fn activity_target(
@@ -1158,7 +1327,38 @@ fn section_list(out: &mut String, title: &str, items: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::tools::spec::ToolResult;
+    use crate::tui::app::TuiOptions;
+    use crate::tui::tool_routing::{handle_tool_call_complete, handle_tool_call_started};
     use crate::work_graph::{CompatTodoBinding, OperationBinding, WorkNodeId};
+
+    fn test_app() -> App {
+        App::new(
+            TuiOptions {
+                model: "deepseek-v4-flash".to_string(),
+                workspace: std::path::PathBuf::from("/workspace/project"),
+                config_path: None,
+                config_profile: None,
+                allow_shell: false,
+                use_alt_screen: true,
+                use_mouse_capture: false,
+                use_bracketed_paste: true,
+                max_subagents: 1,
+                skills_dir: std::path::PathBuf::from("."),
+                memory_path: std::path::PathBuf::from("memory.md"),
+                notes_path: std::path::PathBuf::from("notes.txt"),
+                mcp_config_path: std::path::PathBuf::from("mcp.json"),
+                use_memory: false,
+                start_in_agent_mode: true,
+                skip_onboarding: true,
+                yolo: false,
+                resume_session_id: None,
+                initial_input: None,
+            },
+            &Config::default(),
+        )
+    }
 
     fn operation(state: NodeState, suffix: &str) -> WorkNode {
         WorkNode {
@@ -1191,7 +1391,13 @@ mod tests {
             operation(NodeState::Ready, "ready"),
         ];
 
-        let rows = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default());
+        let rows = graph_rows(
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
 
         assert_eq!(
             rows.first().map(|row| row.label.as_str()),
@@ -1229,7 +1435,13 @@ mod tests {
             plan_index: None,
         });
 
-        let rows = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default());
+        let rows = graph_rows(
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
         let labels = rows
             .iter()
             .map(|row| row.label.as_str())
@@ -1274,7 +1486,13 @@ mod tests {
         let mut snapshot = WorkGraphSnapshot::new();
         snapshot.nodes = vec![durable, failed, evidence_pending];
 
-        let rows = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default());
+        let rows = graph_rows(
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
         let labels = rows
             .iter()
             .map(|row| row.label.as_str())
@@ -1301,10 +1519,16 @@ mod tests {
             operation(NodeState::Active, "active"),
         ];
 
-        let labels = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default())
-            .into_iter()
-            .map(|row| row.label)
-            .collect::<Vec<_>>();
+        let labels = graph_rows(
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        )
+        .into_iter()
+        .map(|row| row.label)
+        .collect::<Vec<_>>();
 
         assert_eq!(
             labels,
@@ -1331,5 +1555,166 @@ mod tests {
         );
         assert_eq!(privacy_safe_path(workspace, "../private.txt"), None);
         assert_eq!(safe_pattern("needle\nsecret"), "needle secret");
+    }
+
+    #[test]
+    fn settled_canonical_file_actions_keep_aggregates_and_safe_targets() {
+        let mut app = test_app();
+        let calls = [
+            ("read", serde_json::json!({"path": "src/read.rs"})),
+            ("list", serde_json::json!({"path": "src"})),
+            ("search_name", serde_json::json!({"query": "lib.rs"})),
+            (
+                "search_content",
+                serde_json::json!({"pattern": "needle\nprivate", "path": "src"}),
+            ),
+            (
+                "write",
+                serde_json::json!({"path": "src/new.rs", "content": "new\n"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({
+                    "path": "src/edit.rs",
+                    "search": "old",
+                    "replace": "new"
+                }),
+            ),
+            (
+                "patch",
+                serde_json::json!({
+                    "patch": "diff --git a/src/patch.rs b/src/patch.rs\n--- a/src/patch.rs\n+++ b/src/patch.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                }),
+            ),
+        ];
+
+        for (action, payload) in calls {
+            let id = format!("file-{action}");
+            let mut input = payload;
+            input["action"] = serde_json::json!(action);
+            handle_tool_call_started(&mut app, &id, "File", &input);
+            handle_tool_call_complete(&mut app, &id, "File", &Ok(ToolResult::success("ok")));
+            app.flush_active_cell();
+        }
+
+        let activity = settled_file_activity(&app);
+        assert_eq!(
+            activity.summary,
+            FileActivitySummary {
+                files_read: 1,
+                dirs_listed: 1,
+                patterns_searched: 2,
+                files_written: 3,
+            }
+        );
+        assert_eq!(activity.read, ["src/read.rs"]);
+        assert_eq!(activity.list, ["src"]);
+        assert_eq!(activity.search, ["lib.rs", "needle private"]);
+        assert_eq!(
+            activity.write,
+            ["src/new.rs", "src/edit.rs", "src/patch.rs"]
+        );
+    }
+
+    #[test]
+    fn multifile_receipt_counts_semantic_file_outcomes_in_work_label() {
+        let mut app = test_app();
+        let input = serde_json::json!({
+            "action": "patch",
+            "patch": "--- a/update.rs\n+++ b/update.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        });
+        handle_tool_call_started(&mut app, "file-multi", "File", &input);
+        let result = ToolResult::success("ok").with_metadata(serde_json::json!({
+            "mutation": {
+                "diff": "diff --git a/old.rs b/new.rs\nrename from old.rs\nrename to new.rs\n--- a/update.rs\n+++ b/update.rs\n@@ -1 +1 @@\n-old\n+new\n--- /dev/null\n+++ b/create.rs\n@@ -0,0 +1 @@\n+created\n--- a/delete.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-deleted\n",
+                "files": [
+                    { "path": "update.rs", "outcome": "updated" },
+                    { "path": "create.rs", "outcome": "created" },
+                    { "path": "delete.rs", "outcome": "deleted" }
+                ],
+                "renames": [{ "from": "old.rs", "to": "new.rs" }]
+            }
+        }));
+        handle_tool_call_complete(&mut app, "file-multi", "File", &Ok(result));
+        app.flush_active_cell();
+
+        let activity = settled_file_activity(&app);
+        assert_eq!(activity.summary.files_written, 4);
+        let write_row = activity_rows(activity)
+            .into_iter()
+            .find(|row| row.row.label.starts_with("Wrote"))
+            .expect("write row");
+        assert_eq!(write_row.row.label, "Wrote 4 files");
+        assert_eq!(
+            write_row.row.detail,
+            "4 files · 1 created · 1 updated · 1 deleted · 1 renamed · +2 -2"
+        );
+    }
+
+    fn mutation_activity(mode: InlineDiffMode) -> SettledFileActivity {
+        let result = ToolResult::success("ok").with_metadata(serde_json::json!({
+            "mutation": {
+                "diff": "--- /Users/alice/private.rs\n+++ /Users/alice/private.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                "files": [{
+                    "path": "/Users/alice/private.rs",
+                    "outcome": "updated"
+                }],
+                "renames": []
+            }
+        }));
+        let receipt = FileMutationReceipt::from_success(Path::new("/workspace/project"), &result)
+            .expect("receipt");
+        SettledFileActivity {
+            summary: FileActivitySummary {
+                files_written: 1,
+                ..FileActivitySummary::default()
+            },
+            write: vec!["src/public.rs".to_string()],
+            mutations: vec![receipt],
+            inline_diff_mode: mode,
+            ..SettledFileActivity::default()
+        }
+    }
+
+    fn mutation_activity_body(mode: InlineDiffMode) -> (String, String, String) {
+        let row = activity_rows(mutation_activity(mode))
+            .into_iter()
+            .next()
+            .expect("activity row")
+            .row;
+        let SidebarRowAction::InspectWork { body, .. } =
+            row.primary_action.expect("inspect action")
+        else {
+            panic!("write row must open Work inspection")
+        };
+        (row.label, row.detail, body)
+    }
+
+    #[test]
+    fn work_mutation_rows_keep_labels_privacy_and_all_inline_modes() {
+        let (label, detail, full) = mutation_activity_body(InlineDiffMode::Full);
+        assert_eq!(label, "Wrote 1 files");
+        assert_eq!(detail, "Updated <external file> · +1 -1");
+        assert!(full.contains("-old"), "{full}");
+        assert!(full.contains("+new"), "{full}");
+        assert!(!full.contains("alice"), "{full}");
+        assert!(full.contains("exact change evidence"), "{full}");
+
+        let (_, _, summary) = mutation_activity_body(InlineDiffMode::Summary);
+        assert!(
+            summary.contains("Updated <external file> · +1 -1"),
+            "{summary}"
+        );
+        assert!(!summary.contains("-old"), "{summary}");
+        assert!(!summary.contains("+new"), "{summary}");
+        assert!(!summary.contains("alice"), "{summary}");
+
+        let (_, detail, off) = mutation_activity_body(InlineDiffMode::Off);
+        assert_eq!(detail, "Updated <external file>");
+        assert!(off.contains("Updated <external file>"), "{off}");
+        assert!(!off.contains("+1 -1"), "{off}");
+        assert!(!off.contains("-old"), "{off}");
+        assert!(!off.contains("alice"), "{off}");
+        assert!(off.contains("exact change evidence"), "{off}");
     }
 }

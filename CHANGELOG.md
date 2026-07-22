@@ -7,13 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.1] - 2026-07-20
+## [0.9.1] - Unreleased candidate
 
-Codewhale v0.9.1 ships a first-class local web client over the Runtime API,
-first-class OpenCode Go and restored xAI device login on the provider surface,
+The Codewhale v0.9.1 source candidate includes a first-class local web client over the Runtime API,
+first-class OpenCode Go and TelecomJS TokenHub providers and restored xAI device login,
 calendar-correct hourly automations, a buildable OpenHarmony workflow-js
 target, and hardening for Auto routing, remote-terminal clipboard transport,
-restart recovery, and the community site's content boundaries.
+restart recovery, and a coherent TUI, Work, evidence, and public release
+surface.
 
 ### Added
 
@@ -34,7 +35,14 @@ restart recovery, and the community site's content boundaries.
   of this narrow route until Codewhale supports per-model wire selection
   (#1481 by @seanthefuturegorilla; implementation harvested from PR #773 by
   @zhangweiii and PR #1050 by @sternelee).
-- Publish native Windows ARM64 `codewhale`, `codew`, and `codewhale-tui`
+- Add TelecomJS TokenHub as a first-class Chat Completions provider with
+  `[providers.telecomjs]`, `TELECOMJS_API_KEY`, and a key-scoped live
+  `/v1/models` refresh. Models.dev and provider-specific catalogs remain in
+  separate source partitions so either refresh order preserves both; refreshes
+  do not delete the other source's rows, matching model ids from unrelated
+  providers do not fabricate metadata, and chat requests omit unsupported
+  reasoning fields (PR #4370 by @baendlorel; harvested with co-authorship).
+- Prepare native Windows ARM64 `codewhale`, `codew`, and `codewhale-tui`
   binaries, npm selection, updater support, and standard/portable release
   archives. Build and smoke them on GitHub's native Windows 11 ARM runner,
   and move Linux ARM64 release builds to the native Ubuntu ARM runner to
@@ -43,6 +51,20 @@ restart recovery, and the community site's content boundaries.
   role vocabulary with alias parser and `SubAgentType` mapping (#3934).
 - `load_skill` tool now supports listing: omit `name` or pass `"list"` to
   see all available skills without loading one (#4651).
+- Add a unified `/skills` manager with one precedence-aware root catalog,
+  bounded duplicate/shadow/conflict auditing, package provenance, and
+  validated install, update, remove, and trust mutations (PR #4679 by
+  @SamhandsomeLee).
+- Add a safe Agent Details view and bounded, structured `current_activity` to
+  the single Work projection, sourced from worker events instead of renderer
+  string inference. Rows stay compact, exact evidence is opt-in, and raw child
+  output never enters the parent transcript (#2889 and #4636; design direction
+  by @aboimpinto, preserved from #2694).
+- Make exact results and delegated coordination durable: non-inline tool output
+  becomes immutable session-owned evidence behind bounded receipts; File
+  mutations add configurable success-only diffs; and decisions and write
+  contention survive restart with typed neutral-fan-in records (#4619, #4636,
+  #4647).
 - Runtime API provider registry and atomic provider-switch endpoints
   (`GET /v1/providers`, `GET /v1/providers/{id}/models`,
   `POST /v1/providers/{id}/switch`) so the web GUI renders a dynamic
@@ -56,6 +78,18 @@ restart recovery, and the community site's content boundaries.
 
 ### Changed
 
+- Simplify the model-facing runtime around stable action tools (`File`, `Git`,
+  `Run`, deferred `Web`, and durable task and automation families), with legacy
+  spellings hidden for replay. Fresh sessions no longer reserve a Work surface
+  before real work exists (PR #4675).
+- Give the terminal shell one deliberate visual language: cool Plan → Act →
+  Operate and warm Ask → Auto-Review → Full Access ramps match between header
+  and split composer edges; transcript rhythm groups related activity; a
+  refined whale keeps the empty state calm; and one-cell live motion with
+  truthful labels distinguishes reasoning, reading, tool use, and verification
+  without exposing private reasoning text. Reduced-motion and animation-off
+  settings freeze it, while ASCII-safe terminals retain the signal (#4676,
+  #4677).
 - Unified shell tool: the model now sees a single `Bash` tool with an `action`
   parameter (run/wait/interact/cancel). Legacy `exec_shell*` names remain as
   hidden compat aliases for transcript replay, and the tool-search catalog
@@ -86,6 +120,11 @@ restart recovery, and the community site's content boundaries.
 
 ### Fixed
 
+- Default canonical `Bash` runs with no explicit `cwd` to the active
+  `ToolContext.workspace`, including an isolated sub-agent worktree, instead of
+  falling through to the shared shell manager's parent workspace. The regression
+  test detects the selected workspace through marker files so it remains
+  meaningful across PowerShell path spellings (#4674, PR #4673 by @fleitz).
 - Generate QuickJS bindings for `aarch64-unknown-linux-ohos` with the native
   SDK's libclang and sysroot, carry the OHOS target and sysroot through final
   linking, and keep unsupported persistent PTY dependencies out of the target
@@ -133,6 +172,9 @@ restart recovery, and the community site's content boundaries.
   instead of tinting it green-grey through the default underwater Ombre
   treatment, while retaining foreground ambient life (#4457 by
   @AiurArtanis; PR #4471 by @nightt5879).
+- Register `/slop` and `/canzha` as compatibility aliases of `/debt`, while
+  keeping user-command ownership truthful across dispatch, help, slash
+  completion, alias copy, and typo suggestions (PR #4680 by @nightt5879).
 - Fail closed on legacy Kimi CLI credential imports: remove Codewhale's
   hard-coded first-party-client impersonation and refresh request, never
   auto-enable or rewrite imported credentials, and label the compatibility
@@ -234,9 +276,21 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   and idle-timeout progress telemetry (PR #4657).
 - [@gaord](https://github.com/gaord) — Runtime API provider registry and
   atomic provider-switch endpoints (PR #4658).
-- [@SamhandsomeLee](https://github.com/SamhandsomeLee) — Enter-send lag
-  diagnosis and fix direction for #4605 (PR #4654; landed via the release
-  lane async-dispatch split).
+- [@SamhandsomeLee](https://github.com/SamhandsomeLee) — the unified `/skills`
+  root catalog, audit/provenance model, validated mutations, manager UI, and
+  acceptance coverage (PR #4679), plus Enter-send lag diagnosis and fix
+  direction for #4605 (PR #4654; landed via the release-lane async-dispatch
+  split).
+- [@aboimpinto](https://github.com/aboimpinto) — the Layer 5.1 user-command
+  registry boundary from PR #3278; the exact authored evidence commit from PR
+  #4046, preserved intact in the integration graph; and the #2870 follow-up
+  audit whose metadata and malformed-sibling gaps shaped the final corrections.
+  Paulo also provided the structured, redacted Agent Details and
+  `current_activity` direction preserved from #2694/#2889 and the real-PTY
+  lifecycle acceptance direction from #2886.
+- [@baendlorel](https://github.com/baendlorel) — TelecomJS TokenHub provider
+  support and key-scoped live-catalog direction from PR #4370, harvested into
+  the current provider architecture with co-authorship preserved.
 - [@zhangweiii](https://github.com/zhangweiii) and
   [@sternelee](https://github.com/sternelee) — the original first-class
   OpenCode Go implementations (PRs #773 and #1050), harvested into the
@@ -244,8 +298,9 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
 - [@seanthefuturegorilla](https://github.com/seanthefuturegorilla) — the
   canonical OpenCode Go/Zen provider request and acceptance direction
   (#1481).
-- [@nightt5879](https://github.com/nightt5879) — the Solarized Light
-  background preservation fix (PR #4471).
+- [@nightt5879](https://github.com/nightt5879) — `/debt` compatibility aliases
+  with dispatch-consistent user-command shadowing across discovery surfaces
+  (PR #4680), plus the Solarized Light background preservation fix (PR #4471).
 - [@AiurArtanis](https://github.com/AiurArtanis) — the Solarized Light
   regression report and reproduction (#4457).
 - [@shenjackyuanjie](https://github.com/shenjackyuanjie) — the HarmonyOS
@@ -265,6 +320,9 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   contract (PRs #4475 and #4476).
 - [@dmitri-0](https://github.com/dmitri-0) — configurable cache-hit visibility
   in the phase strip (PR #4474).
+- [@fleitz](https://github.com/fleitz) — the canonical `Bash` no-`cwd`
+  workspace fix and regression test that keep isolated sub-agent commands in
+  their own worktree (PR #4673, closing #4674).
 - [@SparkofSpike](https://github.com/SparkofSpike) — the Windows Ctrl+O
   reproduction that exposed pre-pager result truncation and conflicting composer
   shortcut routing (#4482), and the exact Vim-space regression reproduction
@@ -3900,8 +3958,8 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.9.1...HEAD
-[0.9.1]: https://github.com/Hmbown/CodeWhale/compare/v0.9.0...v0.9.1
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.9.0...HEAD
+[0.9.1]: https://github.com/Hmbown/CodeWhale/compare/v0.9.0...main
 [0.8.68]: https://github.com/Hmbown/CodeWhale/compare/v0.8.67...v0.8.68
 [0.8.67]: https://github.com/Hmbown/CodeWhale/compare/v0.8.66...v0.8.67
 [0.8.66]: https://github.com/Hmbown/CodeWhale/compare/v0.8.65...v0.8.66

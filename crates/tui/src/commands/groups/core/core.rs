@@ -17,6 +17,14 @@ use super::CommandResult;
 /// Show help information
 pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
     if let Some(topic) = topic {
+        let user_commands = crate::commands::user_registry::with_registry_for_workspace(
+            Some(&app.workspace),
+            Clone::clone,
+        );
+        if let Some(command) = user_commands.get(topic) {
+            return CommandResult::message(user_command_help(app.ui_locale, command));
+        }
+
         // Show help for specific command
         if let Some(cmd) = crate::commands::get_command_info(topic) {
             let mut help = format!(
@@ -26,12 +34,18 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
                 tr(app.ui_locale, MessageId::HelpUsageLabel),
                 cmd.usage
             );
-            if !cmd.aliases.is_empty() {
+            let visible_aliases = cmd
+                .aliases
+                .iter()
+                .filter(|alias| user_commands.get(alias).is_none())
+                .copied()
+                .collect::<Vec<_>>();
+            if !visible_aliases.is_empty() {
                 let _ = write!(
                     help,
                     "\n  {} {}",
                     tr(app.ui_locale, MessageId::HelpAliasesLabel),
-                    cmd.aliases.join(", ")
+                    visible_aliases.join(", ")
                 );
             }
             return CommandResult::message(help);
@@ -43,9 +57,44 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
     // Show help overlay
     if app.view_stack.top_kind() != Some(ModalKind::Help) {
-        app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+        let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace);
+        app.view_stack.push(help);
     }
     CommandResult::ok()
+}
+
+fn user_command_help(
+    locale: Locale,
+    command: &crate::commands::user_registry::UserCommandMetadata,
+) -> String {
+    let mut help = command.name.clone();
+    if let Some(description) = command
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+    {
+        let _ = write!(help, "\n\n  {description}");
+    }
+
+    let usage = command
+        .display_usage()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("/{}", command.name));
+    let _ = write!(
+        help,
+        "\n\n  {} {}",
+        tr(locale, MessageId::HelpUsageLabel),
+        usage
+    );
+    if !command.aliases.is_empty() {
+        let _ = write!(
+            help,
+            "\n  {} {}",
+            tr(locale, MessageId::HelpAliasesLabel),
+            command.aliases.join(", ")
+        );
+    }
+    help
 }
 
 /// Clear conversation history

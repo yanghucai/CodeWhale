@@ -58,8 +58,8 @@ use crate::tools::spec::{
 };
 use crate::tools::subagent::{
     Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext,
-    SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
-    agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
+    SubAgentManager, SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking,
+    SubAgentType, agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
     new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
@@ -83,6 +83,13 @@ use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
 
 const ENGINE_OP_CHANNEL_CAPACITY: usize = 32;
 const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
+
+fn agent_list_event(manager: &SubAgentManager) -> Event {
+    Event::AgentList {
+        agents: manager.list(),
+        coordination: manager.coordination_detail_projection(None, 24),
+    }
+}
 
 /// Snapshot of parent state that can be passed to forked sub-agents without
 /// rewriting the parent transcript.
@@ -439,9 +446,8 @@ pub struct EngineConfig {
     /// Native tools that should stay in the model-visible catalog even when
     /// they are outside the small default core surface (#2076).
     pub tools_always_load: HashSet<String>,
-    /// When true and `/usr/bin/bwrap` is present on Linux, route exec_shell
-    /// through bubblewrap instead of relying solely on Landlock (#2184).
-    #[allow(dead_code)] // Wired through ShellManager in follow-up PR
+    /// When true and `/usr/bin/bwrap` is executable on Linux, route exec_shell
+    /// through bubblewrap (#2184).
     pub prefer_bwrap: bool,
     /// Tool override and plugin configuration (`[tools]` table in config.toml).
     /// Applied to the per-turn tool registry after built-in tools are registered.
@@ -1165,6 +1171,10 @@ impl Engine {
             .shell_manager
             .clone()
             .unwrap_or_else(|| new_shared_shell_manager(config.workspace.clone()));
+        match shell_manager.lock() {
+            Ok(mut manager) => manager.set_prefer_bwrap(config.prefer_bwrap),
+            Err(poisoned) => poisoned.into_inner().set_prefer_bwrap(config.prefer_bwrap),
+        }
         let file_read_tracker = new_shared_file_read_tracker();
         // Create Flash seam manager for layered context (#159). v0.7.5 keeps
         // this opt-in until the prefix-cache audit proves when seam production
@@ -2069,17 +2079,18 @@ impl Engine {
                                 crate::tools::subagent::SUBAGENT_LIST_CLEANUP_MIN_INTERVAL,
                             )
                         };
-                        let agents = if due {
+                        let event = if due {
                             let mut manager = self.subagent_manager.write().await;
                             manager.cleanup(Duration::from_secs(60 * 60));
-                            manager.list()
+                            agent_list_event(&manager)
                         } else {
-                            self.subagent_manager.read().await.list()
+                            let manager = self.subagent_manager.read().await;
+                            agent_list_event(&manager)
                         };
                         // #3802: use non-blocking send — this is a refresh event
                         // that can safely be dropped when the channel is full.
                         // The next drain cycle will re-request the list.
-                        if let Err(_e) = self.tx_event.try_send(Event::AgentList { agents }) {
+                        if let Err(_e) = self.tx_event.try_send(event) {
                             tracing::debug!(
                                 "Event channel full; dropping ListSubAgents refresh (will retry next drain)"
                             );
@@ -2089,14 +2100,13 @@ impl Engine {
                         let result = {
                             let mut manager = self.subagent_manager.write().await;
                             match manager.cancel_agent(&agent_id) {
-                                Ok(_) => Ok(manager.list()),
+                                Ok(_) => Ok(agent_list_event(&manager)),
                                 Err(err) => Err(err),
                             }
                         };
                         match result {
-                            Ok(agents) => {
-                                if let Err(_e) = self.tx_event.try_send(Event::AgentList { agents })
-                                {
+                            Ok(event) => {
+                                if let Err(_e) = self.tx_event.try_send(event) {
                                     tracing::debug!(
                                         "Event channel full; dropping CancelSubAgent refresh"
                                     );
@@ -4762,11 +4772,20 @@ pub(super) fn exec_shell_ask_rule_decision(
     workspace: &Path,
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> Option<ToolAskRuleDecision> {
-    if tool_name != "exec_shell" {
+    let policy_tool_name =
+        crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
+    if policy_tool_name != "exec_shell" {
         return None;
     }
     let command = tool_input.get("command").and_then(Value::as_str)?;
-    tool_ask_rule_decision_for_context(config, tool_name, command, None, workspace, approval_mode)
+    tool_ask_rule_decision_for_context(
+        config,
+        policy_tool_name,
+        command,
+        None,
+        workspace,
+        approval_mode,
+    )
 }
 
 pub(super) fn file_tool_ask_rule_decision(
@@ -4776,11 +4795,13 @@ pub(super) fn file_tool_ask_rule_decision(
     workspace: &Path,
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> Option<ToolAskRuleDecision> {
-    let paths = file_tool_permission_paths(tool_name, tool_input)?;
+    let policy_tool_name =
+        crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
+    let paths = file_tool_permission_paths(policy_tool_name, tool_input)?;
     if paths.is_empty() {
         return tool_ask_rule_decision_for_context(
             config,
-            tool_name,
+            policy_tool_name,
             "",
             None,
             workspace,
@@ -4792,7 +4813,7 @@ pub(super) fn file_tool_ask_rule_decision(
     for path in paths {
         match tool_ask_rule_decision_for_context(
             config,
-            tool_name,
+            policy_tool_name,
             "",
             Some(&path),
             workspace,
